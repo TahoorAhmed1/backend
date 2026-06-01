@@ -1,0 +1,5 @@
+.gitOrg
+.gitDev
+.env
+.env.development
+/node_modules
