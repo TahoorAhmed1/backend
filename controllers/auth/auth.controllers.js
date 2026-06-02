@@ -16,7 +16,6 @@ const register = async (req, res, next) => {
   try {
     const { email, password, name } = req.body;
 
-
     const existingUser = await prisma.user.findUnique({
       where: { email },
     });
@@ -28,7 +27,6 @@ const register = async (req, res, next) => {
 
     const hashedPassword = await hashPassword(password);
 
-
     const user = await prisma.user.create({
       data: {
         email,
@@ -37,7 +35,7 @@ const register = async (req, res, next) => {
       },
     });
 
-    const token = createToken({ userId: user.id });
+    const token = createToken({ userId: user.id, role: user.user_role });
 
     const response = createSuccessResponse(
       { user, token },
@@ -69,8 +67,7 @@ const login = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-
-    const token = createToken({ userId: user.id });
+    const token = createToken({ userId: user.id, role: user.user_role });
 
     const response = createSuccessResponse(
       { user, token },
@@ -102,9 +99,26 @@ const getMe = async (req, res, next) => {
     next(error);
   }
 };
+const userList = async (req, res, next) => {
+  try {
+
+    const user = await prisma.user.findUnique({
+      where: {
+        role: "user"
+      },
+    });
+
+
+    const response = okResponse(user);
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
 
 module.exports = {
   register,
   login,
   getMe,
+  userList
 };

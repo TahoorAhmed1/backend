@@ -18,7 +18,7 @@ const restrictToAdmins = (req, res, next) => {
     const response = forbiddenResponse("Invalid token.");
     return res.status(response.status.code).json(response);
   }
-  if (decodedData?.role === "admin") {
+  if (decodedData?.user_role === "admin") {
     next();
   } else {
     const response = forbiddenResponse("User is not authorized.");

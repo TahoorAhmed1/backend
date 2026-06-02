@@ -19,7 +19,7 @@ const {
 
 router.use(verifyUserByToken);
 
-router.get("/", validateRequest(queryTaskSchema, "query"), getTasks);
+router.get("/", getTasks);
 
 router.get("/:taskId", getTaskById);
 

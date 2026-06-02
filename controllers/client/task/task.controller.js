@@ -8,15 +8,20 @@ const {
 } = require("../../../constants/responses");
 
 const createTask = async (req, res, next) => {
-  const { userId } = req.user;
-  const { title, description } = req.body;
+  const { userId, role } = req.user;
+  const { title, description, userId: assignToUserId } = req.body;
 
   try {
+    if (role !== "admin") {
+      return res.status(403).json(badRequestResponse("Only admins can create tasks."));
+    }
+
     const task = await prisma.task.create({
       data: {
         title,
-        description: description || null,
-        userId,
+        description: description ?? null,
+        userId: assignToUserId || null,  // Assign to user on creation
+        createdBy: userId,                // Track which admin created the task
         status: "todo",
         updatedBy: userId,
       },
@@ -36,34 +41,26 @@ const createTask = async (req, res, next) => {
 };
 
 const getTasks = async (req, res, next) => {
-  const { userId } = req.user;
-  const { status, limit = 10, offset = 0 } = req.query;
+  const { userId, role } = req.user;
 
   try {
-    const where = { userId };
-
-    if (status) {
-      where.status = status;
+    const where = {};
+    if (role !== "admin") {
+      where.userId = userId;
     }
+
+
 
     const tasks = await prisma.task.findMany({
       where,
-      take: parseInt(limit),
-      skip: parseInt(offset),
-      orderBy: {
-        createdAt: "desc",
-      },
+
+      orderBy: { createdAt: "desc" },
     });
 
-    const total = await prisma.task.count({ where });
 
     const response = okResponse({
       tasks,
-      pagination: {
-        total,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-      },
+
     });
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -72,7 +69,7 @@ const getTasks = async (req, res, next) => {
 };
 
 const getTaskById = async (req, res, next) => {
-  const { userId } = req.user;
+  const { userId, role } = req.user;
   const { taskId } = req.params;
 
   try {
@@ -80,7 +77,8 @@ const getTaskById = async (req, res, next) => {
       where: { id: parseInt(taskId) },
     });
 
-    if (!task || task.userId !== userId) {
+    // Admins can view any task, users can only view their assigned tasks
+    if (!task || (role !== "admin" && task.userId !== userId)) {
       return res.status(404).json(badRequestResponse("Task not found."));
     }
 
@@ -92,23 +90,34 @@ const getTaskById = async (req, res, next) => {
 };
 
 const updateTask = async (req, res, next) => {
-  const { userId } = req.user;
+  const { userId, role } = req.user;
   const { taskId } = req.params;
-  const { title, description, status } = req.body;
+  const { title, description, status, userId: assignToUserId } = req.body;
 
   try {
     const task = await prisma.task.findUnique({
       where: { id: parseInt(taskId) },
     });
 
-    if (!task || task.userId !== userId) {
+    if (!task) {
       return res.status(404).json(badRequestResponse("Task not found."));
+    }
+
+    // Authorization: only admins can update any task, users can only update their own
+    if (role !== "admin" && task.userId !== userId) {
+      return res.status(403).json(badRequestResponse("Unauthorized to update this task."));
     }
 
     const updateData = {};
     if (title !== undefined) updateData.title = title;
     if (description !== undefined) updateData.description = description;
     if (status !== undefined) updateData.status = status;
+
+    // Only admins can assign tasks to users
+    if (assignToUserId !== undefined && role === "admin") {
+      updateData.userId = assignToUserId;
+    }
+
     updateData.updatedBy = userId;
 
     const updatedTask = await prisma.task.update({
@@ -133,7 +142,7 @@ const updateTask = async (req, res, next) => {
 };
 
 const deleteTask = async (req, res, next) => {
-  const { userId } = req.user;
+  const { userId, role } = req.user;
   const { taskId } = req.params;
 
   try {
@@ -141,8 +150,13 @@ const deleteTask = async (req, res, next) => {
       where: { id: parseInt(taskId) },
     });
 
-    if (!task || task.userId !== userId) {
+    if (!task) {
       return res.status(404).json(badRequestResponse("Task not found."));
+    }
+
+    // Only admins can delete tasks
+    if (role !== "admin") {
+      return res.status(403).json(badRequestResponse("Only admins can delete tasks."));
     }
 
     await prisma.task.delete({
