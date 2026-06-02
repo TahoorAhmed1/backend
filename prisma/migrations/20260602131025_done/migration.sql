@@ -2,7 +2,7 @@
 CREATE TABLE "user" (
     "id" TEXT NOT NULL,
     "email" TEXT NOT NULL,
-    "user_role" TEXT NOT NULL DEFAULT 'user',
+    "userRole" TEXT,
     "password" TEXT NOT NULL,
     "name" TEXT,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,

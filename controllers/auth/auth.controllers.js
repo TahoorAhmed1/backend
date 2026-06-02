@@ -1,4 +1,4 @@
-const { prisma } = require("../../configs/prisma");
+const { prisma } = require("../../lib/prisma");
 const {
   badRequestResponse,
   createSuccessResponse,
@@ -14,7 +14,7 @@ const {
 
 const register = async (req, res, next) => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name ,userRole} = req.body;
 
     const existingUser = await prisma.user.findUnique({
       where: { email },
@@ -32,10 +32,11 @@ const register = async (req, res, next) => {
         email,
         password: hashedPassword,
         name: name || null,
+        userRole: userRole ||   "user",
       },
     });
 
-    const token = createToken({ userId: user.id, role: user.user_role });
+    const token = createToken({ userId: user.id, userRole: user.userRole });
 
     const response = createSuccessResponse(
       { user, token },
@@ -67,7 +68,7 @@ const login = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    const token = createToken({ userId: user.id, role: user.user_role });
+    const token = createToken({ userId: user.id, userRole: user.userRole });
 
     const response = createSuccessResponse(
       { user, token },
@@ -104,7 +105,7 @@ const userList = async (req, res, next) => {
 
     const user = await prisma.user.findUnique({
       where: {
-        role: "user"
+        userRole: "user"
       },
     });
 

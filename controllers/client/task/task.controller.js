@@ -1,4 +1,4 @@
-const { prisma } = require("../../../configs/prisma");
+const { prisma } = require("../../../lib/prisma");
 const {
   createSuccessResponse,
   okResponse,
@@ -8,11 +8,11 @@ const {
 } = require("../../../constants/responses");
 
 const createTask = async (req, res, next) => {
-  const { userId, role } = req.user;
+  const { userId, userRole } = req.user;
   const { title, description, userId: assignToUserId } = req.body;
 
   try {
-    if (role !== "admin") {
+    if (userRole !== "admin") {
       return res.status(403).json(badRequestResponse("Only admins can create tasks."));
     }
 
@@ -41,11 +41,11 @@ const createTask = async (req, res, next) => {
 };
 
 const getTasks = async (req, res, next) => {
-  const { userId, role } = req.user;
+  const { userId, userRole } = req.user;
 
   try {
     const where = {};
-    if (role !== "admin") {
+    if (userRole !== "admin") {
       where.userId = userId;
     }
 
@@ -69,7 +69,7 @@ const getTasks = async (req, res, next) => {
 };
 
 const getTaskById = async (req, res, next) => {
-  const { userId, role } = req.user;
+  const { userId, userRole } = req.user;
   const { taskId } = req.params;
 
   try {
@@ -78,7 +78,7 @@ const getTaskById = async (req, res, next) => {
     });
 
     // Admins can view any task, users can only view their assigned tasks
-    if (!task || (role !== "admin" && task.userId !== userId)) {
+    if (!task || (userRole !== "admin" && task.userId !== userId)) {
       return res.status(404).json(badRequestResponse("Task not found."));
     }
 
@@ -90,7 +90,7 @@ const getTaskById = async (req, res, next) => {
 };
 
 const updateTask = async (req, res, next) => {
-  const { userId, role } = req.user;
+  const { userId, userRole } = req.user;
   const { taskId } = req.params;
   const { title, description, status, userId: assignToUserId } = req.body;
 
@@ -104,7 +104,7 @@ const updateTask = async (req, res, next) => {
     }
 
     // Authorization: only admins can update any task, users can only update their own
-    if (role !== "admin" && task.userId !== userId) {
+    if (userRole !== "admin" && task.userId !== userId) {
       return res.status(403).json(badRequestResponse("Unauthorized to update this task."));
     }
 
@@ -114,7 +114,7 @@ const updateTask = async (req, res, next) => {
     if (status !== undefined) updateData.status = status;
 
     // Only admins can assign tasks to users
-    if (assignToUserId !== undefined && role === "admin") {
+    if (assignToUserId !== undefined && userRole === "admin") {
       updateData.userId = assignToUserId;
     }
 
@@ -142,7 +142,7 @@ const updateTask = async (req, res, next) => {
 };
 
 const deleteTask = async (req, res, next) => {
-  const { userId, role } = req.user;
+  const { userId, userRole } = req.user;
   const { taskId } = req.params;
 
   try {
@@ -155,7 +155,7 @@ const deleteTask = async (req, res, next) => {
     }
 
     // Only admins can delete tasks
-    if (role !== "admin") {
+    if (userRole !== "admin") {
       return res.status(403).json(badRequestResponse("Only admins can delete tasks."));
     }
 

@@ -1,5 +1,5 @@
 const { logger } = require("../configs/logger");
-const { handlePrismaError } = require("../configs/prisma");
+const { handlePrismaError } = require("../lib/prisma");
 const { serverErrorResponse } = require("../constants/responses");
 
 const errorHandler = (error, request, response, next) => {
