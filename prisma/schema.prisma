@@ -1,38 +1,76 @@
 generator client {
-  provider = "prisma-client"
-  output   = "../generated/prisma"
+  provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
 }
 
+enum TaskStatus {
+  todo
+  in_progress
+  completed
+  cancelled
+}
+
 model user {
   id         String   @id @default(uuid())
   email      String   @unique
-  userRole  String?
   password   String
   name       String?
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  userRole   String?
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+  createdAt DateTime @default(now()) @map("created_at")
 
   assignedTasks task[] @relation("AssignedTo")
+  createdTasks  task[] @relation("CreatedBy")
+  updatedTasks  task[] @relation("UpdatedBy")
 
-  createdTasks task[] @relation("CreatedBy")
+  taskHistory taskHistory[] @relation("ChangedBy")
 }
 
 model task {
-  id          Int     @id @default(autoincrement())
+  id          Int    @id @default(autoincrement())
   title       String
   description String?
-  status      String  @default("todo")
+
+  status TaskStatus @default(todo)
 
   userId String?
-  user   user?   @relation("AssignedTo", fields: [userId], references: [id], onDelete: SetNull)
+  user   user? @relation("AssignedTo", fields: [userId], references: [id], onDelete: SetNull)
 
   createdBy String
-  admin     user   @relation("CreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+  admin     user @relation("CreatedBy", fields: [createdBy], references: [id], onDelete: Restrict)
+
+  updatedById String?
+  updatedBy   user? @relation("UpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
-  updatedBy String?
+  updatedAt DateTime @updatedAt
+
+  history taskHistory[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model taskHistory {
+  id Int @id @default(autoincrement())
+
+  taskId Int
+  task   task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  changedById String
+  changedBy   user @relation("ChangedBy", fields: [changedById], references: [id], onDelete: Restrict)
+
+  field String
+
+  oldValue String?
+  newValue String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([taskId])
 }

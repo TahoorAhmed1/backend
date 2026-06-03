@@ -385,7 +385,8 @@ type FieldRefInputType<Model, FieldType> = Model extends never ? never : FieldRe
 
 export const ModelName = {
   user: 'user',
-  task: 'task'
+  task: 'task',
+  taskHistory: 'taskHistory'
 } as const
 
 export type ModelName = (typeof ModelName)[keyof typeof ModelName]
@@ -401,7 +402,7 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
     omit: GlobalOmitOptions
   }
   meta: {
-    modelProps: "user" | "task"
+    modelProps: "user" | "task" | "taskHistory"
     txIsolationLevel: TransactionIsolationLevel
   }
   model: {
@@ -553,6 +554,80 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
         }
       }
     }
+    taskHistory: {
+      payload: Prisma.$taskHistoryPayload<ExtArgs>
+      fields: Prisma.taskHistoryFieldRefs
+      operations: {
+        findUnique: {
+          args: Prisma.taskHistoryFindUniqueArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload> | null
+        }
+        findUniqueOrThrow: {
+          args: Prisma.taskHistoryFindUniqueOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        findFirst: {
+          args: Prisma.taskHistoryFindFirstArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload> | null
+        }
+        findFirstOrThrow: {
+          args: Prisma.taskHistoryFindFirstOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        findMany: {
+          args: Prisma.taskHistoryFindManyArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>[]
+        }
+        create: {
+          args: Prisma.taskHistoryCreateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        createMany: {
+          args: Prisma.taskHistoryCreateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        createManyAndReturn: {
+          args: Prisma.taskHistoryCreateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>[]
+        }
+        delete: {
+          args: Prisma.taskHistoryDeleteArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        update: {
+          args: Prisma.taskHistoryUpdateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        deleteMany: {
+          args: Prisma.taskHistoryDeleteManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateMany: {
+          args: Prisma.taskHistoryUpdateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateManyAndReturn: {
+          args: Prisma.taskHistoryUpdateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>[]
+        }
+        upsert: {
+          args: Prisma.taskHistoryUpsertArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$taskHistoryPayload>
+        }
+        aggregate: {
+          args: Prisma.TaskHistoryAggregateArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.AggregateTaskHistory>
+        }
+        groupBy: {
+          args: Prisma.taskHistoryGroupByArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.TaskHistoryGroupByOutputType>[]
+        }
+        count: {
+          args: Prisma.taskHistoryCountArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.TaskHistoryCountAggregateOutputType> | number
+        }
+      }
+    }
   }
 } & {
   other: {
@@ -617,6 +692,19 @@ export const TaskScalarFieldEnum = {
 } as const
 
 export type TaskScalarFieldEnum = (typeof TaskScalarFieldEnum)[keyof typeof TaskScalarFieldEnum]
+
+
+export const TaskHistoryScalarFieldEnum = {
+  id: 'id',
+  taskId: 'taskId',
+  changedById: 'changedById',
+  field: 'field',
+  oldValue: 'oldValue',
+  newValue: 'newValue',
+  createdAt: 'createdAt'
+} as const
+
+export type TaskHistoryScalarFieldEnum = (typeof TaskHistoryScalarFieldEnum)[keyof typeof TaskHistoryScalarFieldEnum]
 
 
 export const SortOrder = {
@@ -816,6 +904,7 @@ export type PrismaClientOptions = ({
 export type GlobalOmitConfig = {
   user?: Prisma.userOmit
   task?: Prisma.taskOmit
+  taskHistory?: Prisma.taskHistoryOmit
 }
 
 /* Types for Logging */

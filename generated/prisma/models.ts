@@ -10,4 +10,5 @@
  */
 export type * from './models/user.ts'
 export type * from './models/task.ts'
+export type * from './models/taskHistory.ts'
 export type * from './commonInputTypes.ts'

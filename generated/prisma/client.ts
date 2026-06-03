@@ -51,3 +51,8 @@ export type user = Prisma.userModel
  * 
  */
 export type task = Prisma.taskModel
+/**
+ * Model taskHistory
+ * 
+ */
+export type taskHistory = Prisma.taskHistoryModel

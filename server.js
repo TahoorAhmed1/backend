@@ -18,10 +18,8 @@ env.config({ path: path.resolve(__dirname, envFile), override: true });
 
 const port = process.env.PORT;
 
-// Create HTTP server for Socket.io
 const server = http.createServer(app);
 
-// Initialize Socket.io
 const io = new Server(server, {
   cors: {
     origin: ["https://tradematch-frontend.vercel.app", "http://localhost:3000", "http://localhost:3001"],
@@ -29,10 +27,8 @@ const io = new Server(server, {
   },
 });
 
-// Attach io to app for access in routes/controllers
 app.set("io", io);
 
-// Socket.io connection handler
 io.on("connection", (socket) => {
   logger.info(`Client connected: ${socket.id}`);
 
