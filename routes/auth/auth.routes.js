@@ -15,11 +15,9 @@ const {
   userList,
 } = require("../../controllers/auth/auth.controllers");
 
-// Public routes
 router.post("/register", validateRequest(userRegisterSchema), register);
 router.post("/login", validateRequest(userLoginSchema), login);
 
-// Protected routes
 router.get("/users", userList);
 router.get("/me", verifyUserByToken, getMe);
 
