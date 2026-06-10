@@ -1,9 +1,5 @@
 const Joi = require("joi");
 
-/**
- * Schema for user registration
- * Required: email, password, name
- */
 const userRegisterSchema = Joi.object({
   query: Joi.object({}),
   params: Joi.object({}),
@@ -15,10 +11,6 @@ const userRegisterSchema = Joi.object({
   }),
 });
 
-/**
- * Schema for user login
- * Required: email, password
- */
 const userLoginSchema = Joi.object({
   query: Joi.object({}),
   params: Joi.object({}),

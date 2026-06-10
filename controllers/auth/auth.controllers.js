@@ -1,10 +1,10 @@
-const { prisma } = require("../../lib/prisma");
+const { prisma } = require("../../../lib/prisma");
 const {
   badRequestResponse,
   createSuccessResponse,
   okResponse,
   unauthorizedResponse,
-} = require("../../constants/responses");
+} = require("../../../constants/responses");
 const {
   hashPassword,
   comparePasswords,

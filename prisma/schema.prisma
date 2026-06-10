@@ -4,24 +4,49 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                         ENUMS                               ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-enum UserRole {
-  SUPER_ADMIN
-  HR_ADMIN
-  SUPERVISOR
-  DRIVER
-  EMPLOYEE
+enum DayOfWeek {
+  MON
+  TUE
+  WED
+  THU
+  FRI
+  SAT
+  SUN
 }
 
-enum Entity {
-  IBEX
-  VW
+enum VehicleStatus {
+  ACTIVE
+  INACTIVE
+  MAINTENANCE
+  BREAKDOWN
+}
+
+enum VehicleType {
+  CAR
+  VAN
+  HIJET
+  KARVAN
+  BUS
+}
+
+enum DriverStatus {
+  AVAILABLE
+  ON_RIDE
+  OFFLINE
+  INACTIVE
+}
+
+enum DriverShiftType {
+  TWELVE_HOUR
+  TWENTY_FOUR_HOUR
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  TERMINATED
 }
 
 enum Gender {
@@ -30,27 +55,27 @@ enum Gender {
   OTHER
 }
 
+enum Entity {
+  IBEX
+  VW
+}
+
+enum OfficeLocation {
+  IBT_1
+  IBT_2
+  IBT_3
+  SKY_TOWER
+}
+
 enum ServiceType {
-  PICK_DROP
+  PICK_AND_DROP
   DROP_ONLY
   PICK_ONLY
 }
 
-enum ShiftType {
-  MORNING
-  EVENING
-  NIGHT
-  CUSTOM
-}
-
-enum WeekDay {
-  MON
-  TUE
-  WED
-  THU
-  FRI
-  SAT
-  SUN
+enum RouteStatus {
+  ACTIVE
+  INACTIVE
 }
 
 enum RideStatus {
@@ -61,23 +86,9 @@ enum RideStatus {
   CANCELLED
 }
 
-enum QrStatus {
+enum VendorStatus {
   ACTIVE
-  EXPIRED
-}
-
-enum AttendanceStatus {
-  PRESENT
-  LATE
-  ABSENT
-  NO_SHOW
-}
-
-enum ComplaintStatus {
-  OPEN
-  IN_PROGRESS
-  RESOLVED
-  DISMISSED
+  INACTIVE
 }
 
 enum ComplaintCategory {
@@ -89,1065 +100,433 @@ enum ComplaintCategory {
   OTHER
 }
 
-enum DriverStatus {
-  AVAILABLE
-  ON_RIDE
-  OFFLINE
-  ON_BREAK
-  INACTIVE
-}
-
-enum DriverShiftType {
-  SHIFT_12_HOUR
-  SHIFT_24_HOUR
-}
-
-enum VehicleStatus {
-  ACTIVE
-  INACTIVE
-  MAINTENANCE
-  BREAKDOWN
-  BLACKLISTED
-}
-
-enum VehicleType {
-  CAR
-  VAN
-  HIJET
-  KARVAN
-  BUS
-}
-
-// ─────────────────────────────────────────────
-//  FIX #1 — VehicleStatus normalization
-//  Raw data has: "In-Acive", "IN- Active",
-//  "Black List", "Released", "In-Acive-2023" etc.
-//  All mapped to INACTIVE / BLACKLISTED / INACTIVE
-//  at seed time via normalizeVehicleStatus()
-// ─────────────────────────────────────────────
-
-enum UploadStatus {
-  PENDING
-  PROCESSING
-  COMPLETED
-  FAILED
-  PARTIAL
-}
-
-enum PickupPolicy {
-  ROUTE_BASED
-  DOOR_TO_DOOR
-  HYBRID
-}
-
-enum PickupMode {
-  ROUTE_BASED
-  PICKUP_POINT
-  DOOR_TO_DOOR
-}
-
-enum NotificationType {
-  ARRIVAL_ALERT
-  RIDE_ASSIGNED
-  RIDE_CANCELLED
-  RIDE_UPDATED
-  EMERGENCY
-  GENERAL
-}
-
-enum ExceptionType {
-  NO_DRIVER_AVAILABLE
-  VEHICLE_BREAKDOWN
-  AREA_NOT_COVERED
-  SHIFT_MISMATCH
-  NO_ROUTE_MAPPED
-  OTHER
-}
-
-enum ExceptionStatus {
+enum ComplaintStatus {
   OPEN
+  IN_PROGRESS
   RESOLVED
-  ESCALATED
+  DISMISSED
 }
 
-enum ExceptionSeverity {
-  LOW
-  MEDIUM
-  HIGH
-  CRITICAL
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+  NO_SHOW
 }
 
-enum FinalScheduleStatus {
+enum ScheduleStatus {
+  ACTIVE
   DRAFT
-  PUBLISHED
-  COMPLETED
   CANCELLED
 }
 
-// ─────────────────────────────────────────────
-//  Coverage status for CT pick/drop areas
-// ─────────────────────────────────────────────
-enum CoverageType {
-  COVERAGE
-  NON_COVERAGE
+enum DayStatus {
+  PICKUP
+  DROP
+  BOTH
+  OFF
+  ABSENT
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                         USERS                               ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model User {
-  id       String   @id @default(uuid())
-  email    String   @unique
-  password String?
-  name     String
-  role     UserRole
-  isActive Boolean  @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  employee Employee?
-  driver   Driver?
-
-  auditLogs          AuditLog[]
-  uploads            ScheduleUpload[]
-  publishedSchedules FinalSchedule[]  @relation("PublishedBy")
-  resolvedExceptions ExceptionLog[]   @relation("ResolvedBy")
-  createdRides       Ride[]           @relation("CreatedBy")
+enum UserRole {
+  ADMIN
+  MANAGER
+  DISPATCHER
+  DRIVER
+  Employee
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                         OFFICE                              ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model Office {
-  id       String  @id @default(uuid())
-  name     String  @unique
-  code     String  @unique
-  address  String?
-  cityId   String?
-  isActive Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  city      City?      @relation(fields: [cityId], references: [id])
-  employees Employee[]
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║           CITY  →  AREA  →  SUBAREA  →  BLOCK               ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model City {
-  id   String @id @default(uuid())
-  name String @unique
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  areas     Area[]
-  routes    Route[]
-  employees Employee[]
-  offices   Office[]
+enum NotificationStatus {
+  UNREAD
+  READ
 }
 
 model Area {
-  id     String @id @default(uuid())
-  cityId String
-  name   String
-
+  id        String   @id @default(uuid())
+  name      String   @unique
+  city      String   @default("Karachi")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  city      City      @relation(fields: [cityId], references: [id])
   subAreas  SubArea[]
   employees Employee[]
-
-  @@unique([cityId, name])
+  routes    Route[]
+  rides     Ride[]
 }
 
 model SubArea {
-  id           String       @id @default(uuid())
-  areaId       String
-  name         String
-  isCovered    Boolean      @default(true)
-  pickupPolicy PickupPolicy @default(ROUTE_BASED)
-  routeCode    String?
-
-  aliases String[] @default([])
-
+  id        String   @id @default(uuid())
+  name      String
+  areaId    String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  area   Area   @relation(fields: [areaId], references: [id])
-  route  Route? @relation(fields: [routeCode], references: [code])
+  area      Area       @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  blocks    Block[]
+  employees Employee[]
+  routes    Route[]
 
-  blocks     Block[]
-  employees  Employee[]
-  routeStops RouteStop[]
-
-  @@unique([areaId, name])
+  @@unique([name, areaId])
+  @@index([areaId])
 }
 
 model Block {
-  id        String  @id @default(uuid())
-  subAreaId String
+  id        String   @id @default(uuid())
   name      String
-  latitude  Float?
-  longitude Float?
-  isActive  Boolean @default(true)
-
-  aliases String[] @default([])
-
+  subAreaId String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  subArea    SubArea    @relation(fields: [subAreaId], references: [id])
-  employees  Employee[]
-  routeStops RouteStop[]
+  subArea   SubArea    @relation(fields: [subAreaId], references: [id], onDelete: Cascade)
+  employees Employee[]
 
-  weeklyDayEntries     WeeklyScheduleDayEntry[]
-  finalScheduleEntries FinalScheduleEntry[]
-
-  @@unique([subAreaId, name])
+  @@unique([name, subAreaId])
 }
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║            DEPARTMENT  /  CAMPAIGN  /  BATCH                ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 model Department {
-  id   String @id @default(uuid())
-  name String @unique
-
+  id        String   @id @default(uuid())
+  name      String   @unique
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   employees Employee[]
 }
-
-model Campaign {
-  id       String  @id @default(uuid())
-  name     String
-  code     String  @unique
-  isActive Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  employees Employee[]
-}
-
-model Batch {
-  id        String    @id @default(uuid())
-  code      String    @unique
-  label     String?
-  startDate DateTime?
-  notes     String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  employees Employee[]
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                       EMPLOYEE                              ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model Employee {
-  id           String  @id @default(uuid())
-  employeeCode String  @unique
-  userId       String? @unique
-
-  departmentId String?
-  campaignId   String?
-  batchId      String?
-
-  cityId    String?
-  areaId    String?
-  subAreaId String?
-  blockId   String?
-
-  officeId String?
-
-  name          String
-  contactNumber String?
-  cnic          String?
-  gender        Gender?
-  designation   String?
-
-  address   String
-  latitude  Float?
-  longitude Float?
-
-  entity      Entity?
-  serviceType ServiceType @default(PICK_DROP)
-
-  kmPerDay   Float?
-  nod        Int?
-  kmPerMonth Float?
-
-  dateOfJoining  DateTime?
-  lastWorkingDay DateTime?
-
-  isActive Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user       User?       @relation(fields: [userId], references: [id])
-  department Department? @relation(fields: [departmentId], references: [id])
-  campaign   Campaign?   @relation(fields: [campaignId], references: [id])
-  batch      Batch?      @relation(fields: [batchId], references: [id])
-  city       City?       @relation(fields: [cityId], references: [id])
-  area       Area?       @relation(fields: [areaId], references: [id])
-  subArea    SubArea?    @relation(fields: [subAreaId], references: [id])
-  block      Block?      @relation(fields: [blockId], references: [id])
-  office     Office?     @relation(fields: [officeId], references: [id])
-
-  weeklyEntries        WeeklyScheduleEntry[]
-  finalScheduleEntries FinalScheduleEntry[]
-  assignments          RideAssignment[]
-  attendances          Attendance[]
-  notifications        Notification[]
-  complaints           Complaint[]
-  exceptions           ExceptionLog[]
-
-  // ─── FIX #4 — cross-reference to route assignments ───────────
-  routeAssignments EmployeeRouteAssignment[]
-  // ─────────────────────────────────────────────────────────────
-
-  // ─── FIX #5 — cross-reference to historical PD records ───────
-  pdHistoricalRecords PdHistoricalRecord[]
-  // ─────────────────────────────────────────────────────────────
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                    VENDOR                                   ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 model Vendor {
-  id             String  @id @default(uuid())
-  name           String  @unique
-  shortName      String?
-  parentVendorId String?
-  contactPerson  String?
-  phone          String?
-  email          String?
-  isActive       Boolean @default(true)
+  id            String       @id @default(uuid())
+  name          String       @unique
+  shortName     String?
+  contactPerson String?
+  phone         String?
+  email         String?
+  status        VendorStatus @default(ACTIVE)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  vehicles        Vehicle[]
+  drivers         Driver[]
+  rides           Ride[]
+}
+
+model Vehicle {
+  id            String        @id @default(uuid())
+  vehicleNumber String        @unique
+  type          VehicleType
+  make          String?
+  model         String?
+  year          String?
+  capacity      Int
+  vendorId      String?
+  status        VehicleStatus @default(ACTIVE)
+  notes         String?
+
+  driverId String? @unique
+  driver   Driver? @relation(fields: [driverId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  parentVendor Vendor?  @relation("VendorHierarchy", fields: [parentVendorId], references: [id])
-  subVendors   Vendor[] @relation("VendorHierarchy")
+  vendor Vendor? @relation(fields: [vendorId], references: [id])
 
-  vehicles Vehicle[]
-  drivers  Driver[]
-  routes   Route[]
+  rides           Ride[]
+  complaints      Complaint[]
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                       DRIVER                                ║
-// ╚══════════════════════════════════════════════════════════════╝
-
 model Driver {
-  id             String          @id @default(uuid())
-  userId         String?         @unique
-  vendorId       String?
-  defaultRouteId String?
-
+  id            String          @id @default(uuid())
   name          String
   phone         String?
   licenseNumber String?
-  cnic          String?
+  cnic          String?         @unique
+  vendorId      String?
+  shiftType     DriverShiftType @default(TWELVE_HOUR)
+  shiftLabel    String?
   status        DriverStatus    @default(AVAILABLE)
-  isActive      Boolean         @default(true)
 
-  shiftType        DriverShiftType @default(SHIFT_12_HOUR)
-  shiftStartMinute Int?
-  shiftEndMinute   Int?
-
+  notes     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user         User?   @relation(fields: [userId], references: [id])
-  vendor       Vendor? @relation(fields: [vendorId], references: [id])
-  defaultRoute Route?  @relation("DriverDefaultRoute", fields: [defaultRouteId], references: [id])
+  userId String? @unique
 
-  // ─── FIX #2 — explicit vehicle assignment (replaces string matching) ───
-  currentVehicleId String?  @unique   // the vehicle this driver is CURRENTLY assigned to
-  currentVehicle   Vehicle? @relation("CurrentDriver", fields: [currentVehicleId], references: [id])
-  // ──────────────────────────────────────────────────────────────────────
+  vendor Vendor? @relation(fields: [vendorId], references: [id])
 
-  primaryVehicles   Vehicle[] @relation("PrimaryDriver")
-  secondaryVehicles Vehicle[] @relation("SecondaryDriver")
+  user User? @relation("DriverUser", fields: [userId], references: [id], onDelete: SetNull)
 
-  rides                Ride[]
-  rideQrCodes          RideQrCode[]
-  complaints           Complaint[]
-  exceptions           ExceptionLog[]
-  finalScheduleEntries FinalScheduleEntry[]
+  vehicle Vehicle?
 
-  // ─── FIX #2 — paired-driver rows: each driver gets his own rows ───────
-  routeAssignmentsAsPrimary   EmployeeRouteAssignment[] @relation("PrimaryDriverAssignment")
-  routeAssignmentsAsSecondary EmployeeRouteAssignment[] @relation("SecondaryDriverAssignment")
-  vehicleRouteAssignments     VehicleRouteAssignment[]
-  // ──────────────────────────────────────────────────────────────────────
+  rides           Ride[]
+  routes          Route[]
+  complaints      Complaint[]
 }
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                      VEHICLE                                ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model Vehicle {
-  id                String        @id @default(uuid())
-  vendorId          String?
-  primaryDriverId   String?       // ─── FIX #6: explicit FK ───
-  secondaryDriverId String?       // ─── FIX #6: explicit FK ───
-  vehicleNumber     String        @unique
-  type              VehicleType
-  make              String?
-  model             String?
-  year              String?
-  capacity          Int           @default(4)
-  status            VehicleStatus @default(ACTIVE)
-  isOperational     Boolean       @default(true)
-  notes             String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  vendor          Vendor? @relation(fields: [vendorId], references: [id])
-  primaryDriver   Driver? @relation("PrimaryDriver",   fields: [primaryDriverId],   references: [id])
-  secondaryDriver Driver? @relation("SecondaryDriver", fields: [secondaryDriverId], references: [id])
-
-  // ─── FIX #6 — reverse side of currentVehicle on Driver ───────────────
-  currentDriver Driver? @relation("CurrentDriver")
-  // ──────────────────────────────────────────────────────────────────────
-
-  rides                Ride[]
-  exceptions           ExceptionLog[]
-  finalScheduleEntries FinalScheduleEntry[]
-
-  // ─── FIX #6 — vehicle→route→driver junction ──────────────────────────
-  vehicleRouteAssignments VehicleRouteAssignment[]
-  // ──────────────────────────────────────────────────────────────────────
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║   FIX #6 — VehicleRouteAssignment                           ║
-// ║                                                             ║
-// ║  Explicitly links a Vehicle to a Route and the Driver       ║
-// ║  who operates that vehicle on that route at a given time.   ║
-// ║  Replaces the implicit string-match approach in the old     ║
-// ║  seed where vehicle→driver linkage required guessing.       ║
-// ║                                                             ║
-// ║  Example: CY-8600 → Route "Akram 0313 | 9AM-5PM" → Akram   ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model VehicleRouteAssignment {
-  id        String @id @default(uuid())
-  vehicleId String
-  routeId   String
-  driverId  String
-
-  assignedAt DateTime  @default(now())
-  releasedAt DateTime? // null = currently active
-
-  shiftTimingLabel String? // e.g. "9:00 AM - 5:00 PM" — display only
-  notes            String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  vehicle Vehicle @relation(fields: [vehicleId], references: [id])
-  route   Route   @relation(fields: [routeId], references: [id])
-  driver  Driver  @relation(fields: [driverId], references: [id])
-
-  @@unique([vehicleId, routeId, driverId, assignedAt])
-  @@index([routeId])
-  @@index([driverId])
-  @@index([vehicleId])
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                       ROUTES                                ║
-// ║                                                             ║
-// ║  FIX #3 — driverId FK added                                 ║
-// ║  FIX #2 — primaryDriverId / secondaryDriverId for paired    ║
-// ║            drivers (e.g. "Asim / Azam" becomes two FKs)     ║
-// ║                                                             ║
-// ║  The route_name in the original seed encoded both the       ║
-// ║  driver name and the shift timing as a single string:       ║
-// ║    "Asim 03006853754 / Azam 03092500123 | 9:00 PM - 6:00 AM"║
-// ║  We now store driver references as proper FKs and keep the  ║
-// ║  raw string in driverLabel for display / legacy lookups.    ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 model Route {
-  id         String  @id @default(uuid())
-  cityId     String?
-  name       String
-  code       String  @unique
-  vendorId   String?
+  id        String @id @default(uuid())
+  routeCode String @unique
+  routeName String
 
-  // FIX #3: proper driver FK (was missing entirely)
-  primaryDriverId   String? // driver who normally runs this route
-  secondaryDriverId String? // relief / paired driver (e.g. "Asim / Azam")
+  areaId         String?
+  subAreaId      String?
+  officeLocation OfficeLocation?
+  serviceType    ServiceType     @default(PICK_AND_DROP)
+  maxCapacity    Int
 
-  // Display / legacy reference — the original combined string
-  // e.g. "Asim 03006853754 / Azam 03092500123"
-  driverLabel  String?
+  shiftTiming     String?
+  pickupStartTime DateTime?
+  dropTime        DateTime?
+  driverId        String?
 
-  shiftTiming  String? // e.g. "9:00 PM - 6:00 AM"
-  startPoint   String?
-  endPoint     String?
-  vehicleType  String? // normalized at app layer; raw from Excel
-  isActive     Boolean @default(true)
+  status RouteStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  city            City?   @relation(fields: [cityId], references: [id])
-  vendor          Vendor? @relation(fields: [vendorId], references: [id])
-  primaryDriver   Driver? @relation("DriverDefaultRoute", fields: [primaryDriverId], references: [id])
-
-  subAreas SubArea[]
-  stops    RouteStop[]
-  rides    Ride[]
-
-  exceptions           ExceptionLog[]
-  finalScheduleEntries FinalScheduleEntry[]
-  weeklyDayEntries     WeeklyScheduleDayEntry[]
-
-  // FIX #6 — vehicle assignments
-  vehicleRouteAssignments VehicleRouteAssignment[]
-
-  // FIX #2 — employee assignments via the fixed junction table
-  employeeRouteAssignments EmployeeRouteAssignment[]
-}
-
-model RouteStop {
-  id        String  @id @default(uuid())
-  routeId   String
-  subAreaId String?
-  blockId   String?
-  label     String
-  sequence  Int
-  latitude  Float?
-  longitude Float?
-
-  createdAt DateTime @default(now())
-
-  route   Route    @relation(fields: [routeId], references: [id])
+  area    Area?    @relation(fields: [areaId], references: [id])
   subArea SubArea? @relation(fields: [subAreaId], references: [id])
-  block   Block?   @relation(fields: [blockId], references: [id])
 
-  @@unique([routeId, sequence])
+  weeklySchedules WeeklySchedule[]
+  rides           Ride[]
+  driver          Driver?          @relation(fields: [driverId], references: [id])
+
+  @@index([areaId])
+  @@index([subAreaId])
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  FIX #2 + FIX #4 — EmployeeRouteAssignment                  ║
-// ║                                                             ║
-// ║  PROBLEM (old seed):                                        ║
-// ║    driver_name stored as raw string:                        ║
-// ║      "Asim 03006853754 / Azam 03092500123"                  ║
-// ║    → can't FK-join to drivers table                         ║
-// ║    → employee_id NULL for ~200 rows (emp not in May master) ║
-// ║                                                             ║
-// ║  FIX:                                                       ║
-// ║    1. primaryDriverId + secondaryDriverId as proper FKs     ║
-// ║    2. employeeId nullable with isUnresolved flag            ║
-// ║       When NULL: rawEmployeeCode holds the original number  ║
-// ║       so the record is not lost and can be reconciled later ║
-// ║    3. driverLabel kept for display (the raw combined string) ║
-// ╚══════════════════════════════════════════════════════════════╝
+model Employee {
+  id           String @id @default(uuid())
+  employeeCode String @unique
+  name         String
 
-model EmployeeRouteAssignment {
-  id         String  @id @default(uuid())
-  routeId    String
+  contactNumber String?
+  cnic          String? @unique
+  gender        Gender?
 
-  // FIX #4: employeeId nullable; isUnresolved flags the ~200 gap rows
-  employeeId     String?
-  rawEmployeeCode String? // original emp code when employee not found in master
-  isUnresolved   Boolean @default(false) // true when employeeId is NULL
+  designation String?
 
-  // FIX #2: paired-driver rows split into two proper FKs
-  primaryDriverId   String?
-  secondaryDriverId String?
-  driverLabel       String? // original combined string, kept for audit
+  entity Entity?
 
-  vendorName        String?
-  campaign          String?
-  shiftTiming       String?
-  vehicleType       String?
-  officeArrivalTime String?
-  dayOff            String?
-  area              String?
-  address           String?
-  driverStatus      String?
-  shiftStatus       String?
-  adminPoc          String?
+  officeLocation OfficeLocation?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  route           Route    @relation(fields: [routeId], references: [id])
-  employee        Employee? @relation(fields: [employeeId], references: [id])
-  primaryDriver   Driver?   @relation("PrimaryDriverAssignment",   fields: [primaryDriverId],   references: [id])
-  secondaryDriver Driver?   @relation("SecondaryDriverAssignment", fields: [secondaryDriverId], references: [id])
-
-  @@index([employeeId])
-  @@index([routeId])
-  @@index([primaryDriverId])
-  @@index([isUnresolved]) // fast query to find all unresolved gaps
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  CT COVERAGE AREAS                                          ║
-// ║  From CT_pick_and_drop_points_Coverage_and_Non_Coverage.xlsx ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model CtCoverageArea {
-  id           String       @id @default(uuid())
-  areaName     String       @unique
-  coverageType CoverageType
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  FIX #5 — PdHistoricalRecord                                ║
-// ║                                                             ║
-// ║  PROBLEM (old seed):                                        ║
-// ║    emp_id stored as raw integer with no FK to employees     ║
-// ║    → cross-month queries require string matching            ║
-// ║                                                             ║
-// ║  FIX:                                                       ║
-// ║    employeeId: proper FK to Employee                        ║
-// ║    rawEmpCode: the original integer preserved for audit     ║
-// ║    isUnresolved: true when employeeId cannot be matched     ║
-// ║       (historical records may predate the employee in the   ║
-// ║        current master — they are NOT deleted, just flagged) ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model PdHistoricalRecord {
-  id          String @id @default(uuid())
-
-  // FIX #5: proper FK
-  employeeId  String?
-  rawEmpCode  String  // original emp_id integer as string — never null
-  isUnresolved Boolean @default(false)
-
-  department  String?
-  location    String?  // office code from the historical file
-  shiftTiming String?
-  entity      String?
-  fullName    String?
-  phone       String?
-  area        String?
-  address     String?
-  dataMonth   String   // "2026-03" format
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  employee Employee? @relation(fields: [employeeId], references: [id])
-
-  @@index([employeeId])
-  @@index([dataMonth])
-  @@index([isUnresolved])
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║              WEEKLY SCHEDULE  (provider upload)             ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model WeeklySchedule {
-  id            String    @id @default(uuid())
-  name          String?
-  effectiveFrom DateTime
-  effectiveTo   DateTime
-  uploadId      String?
-  notes         String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  upload  ScheduleUpload? @relation(fields: [uploadId], references: [id])
-  entries WeeklyScheduleEntry[]
-
-  @@unique([effectiveFrom, effectiveTo])
-  @@index([effectiveFrom, effectiveTo])
-}
-
-model WeeklyScheduleEntry {
-  id               String @id @default(uuid())
-  weeklyScheduleId String
-  employeeId       String
-
-  serviceType  ServiceType?
+  departmentId String?
+  areaId       String?
   subAreaId    String?
   blockId      String?
-  pickupPoint  String?
-  notes        String?
+
+  address String?
+
+  serviceType ServiceType @default(PICK_AND_DROP)
+  shiftTiming String?
+
+  status EmployeeStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  weeklySchedule WeeklySchedule         @relation(fields: [weeklyScheduleId], references: [id], onDelete: Cascade)
-  employee       Employee               @relation(fields: [employeeId], references: [id])
-  dayEntries     WeeklyScheduleDayEntry[]
+  userId String? @unique
 
-  @@unique([weeklyScheduleId, employeeId])
-  @@index([employeeId])
+  department Department? @relation(fields: [departmentId], references: [id])
+  area       Area?       @relation(fields: [areaId], references: [id])
+  subArea    SubArea?    @relation(fields: [subAreaId], references: [id])
+  block      Block?      @relation(fields: [blockId], references: [id])
+
+  user User? @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  weeklySchedules WeeklySchedule[]
+  ridePassengers  RidePassenger[]
+  attendances     Attendance[]
+  complaints      Complaint[]
 }
 
-model WeeklyScheduleDayEntry {
-  id                    String  @id @default(uuid())
-  weeklyScheduleEntryId String
+// =============================================================================
+// WEEKLY SCHEDULE (PLANNING)
+// =============================================================================
 
-  weekDay      WeekDay
-  pickupMinute Int
-  dropMinute   Int
+model WeeklySchedule {
+  id        String   @id @default(uuid())
+  weekStart DateTime
 
+  // 👇 WHO (employee)
+  employeeId String
+
+  // 👇 WHERE (route / area logic)
   routeId String?
-  blockId String?
 
-  shiftLabel String?
-  notes      String?
+  // 👇 SERVICE DETAILS
+  serviceType ServiceType @default(PICK_AND_DROP)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  // 👇 DAYS CONFIGURATION
+  monday    DayStatus @default(BOTH)
+  tuesday   DayStatus @default(BOTH)
+  wednesday DayStatus @default(BOTH)
+  thursday  DayStatus @default(BOTH)
+  friday    DayStatus @default(BOTH)
+  saturday  DayStatus @default(OFF)
+  sunday    DayStatus @default(OFF)
 
-  weeklyScheduleEntry  WeeklyScheduleEntry  @relation(fields: [weeklyScheduleEntryId], references: [id], onDelete: Cascade)
-  route                Route?               @relation(fields: [routeId], references: [id])
-  block                Block?               @relation(fields: [blockId], references: [id])
-  finalScheduleEntries FinalScheduleEntry[]
+  // 👇 TIMINGS (SLA / SHIFT)
+  pickupTime        String?
+  officeArrivalTime String?
+  dropTime          String?
+  shiftTiming       String?
 
-  @@unique([weeklyScheduleEntryId, weekDay])
-  @@index([weekDay])
-  @@index([routeId])
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                  FINAL SCHEDULE                             ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-model FinalSchedule {
-  id            String              @id @default(uuid())
-  scheduleDate  DateTime
-  status        FinalScheduleStatus @default(DRAFT)
-  publishedById String?
-  publishedAt   DateTime?
-  notes         String?
+  // 👇 STATUS CONTROL
+  status   ScheduleStatus @default(ACTIVE)
+  isLocked Boolean        @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  publishedBy User?                @relation("PublishedBy", fields: [publishedById], references: [id])
-  entries     FinalScheduleEntry[]
+  // ================= RELATIONS =================
 
-  @@unique([scheduleDate])
-  @@index([scheduleDate, status])
-}
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  route    Route?   @relation(fields: [routeId], references: [id])
 
-model FinalScheduleEntry {
-  id              String @id @default(uuid())
-  finalScheduleId String
-  employeeId      String
+  // ================= INDEXES =================
 
-  weeklyDayEntryId String?
-
-  vehicleId String?
-  driverId  String?
-  routeId   String?
-  blockId   String?
-  officeId  String?
-
-  pickupMinute Int?
-  dropMinute   Int?
-  shiftLabel   String?
-  pickupPoint  String?
-
-  rideId String?
-  notes  String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  finalSchedule  FinalSchedule          @relation(fields: [finalScheduleId], references: [id], onDelete: Cascade)
-  employee       Employee               @relation(fields: [employeeId], references: [id])
-  weeklyDayEntry WeeklyScheduleDayEntry? @relation(fields: [weeklyDayEntryId], references: [id])
-  vehicle        Vehicle?               @relation(fields: [vehicleId], references: [id])
-  driver         Driver?                @relation(fields: [driverId], references: [id])
-  route          Route?                 @relation(fields: [routeId], references: [id])
-  block          Block?                 @relation(fields: [blockId], references: [id])
-  ride           Ride?                  @relation(fields: [rideId], references: [id])
-
-  @@unique([finalScheduleId, employeeId])
+  @@unique([employeeId, weekStart])
+  @@index([weekStart])
   @@index([employeeId])
-  @@index([rideId])
-  @@index([driverId])
-  @@index([vehicleId])
-  @@index([weeklyDayEntryId])
 }
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║                        RIDES                                ║
-// ╚══════════════════════════════════════════════════════════════╝
+// =============================================================================
+// RIDE (EXECUTION)
+// =============================================================================
 
 model Ride {
-  id          String  @id @default(uuid())
-  routeId     String?
-  driverId    String?
-  vehicleId   String?
-  createdById String?
+  id       String   @id @default(uuid())
+  rideDate DateTime
 
-  scheduledDate  DateTime
-  pickupMode     PickupMode
-  scheduledStart DateTime?
-  scheduledEnd   DateTime?
-  actualStart    DateTime?
-  arrivedAt      DateTime?
-  actualEnd      DateTime?
+  routeId   String
+  driverId  String?
+  vehicleId String?
+  vendorId  String?
+  areaId    String?
 
-  status         RideStatus @default(PENDING)
-  isAutoAssigned Boolean    @default(false)
+  pickupTime String?
+  dropTime   String?
 
-  notes String?
+  status RideStatus @default(PENDING)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  route     Route?   @relation(fields: [routeId], references: [id])
-  driver    Driver?  @relation(fields: [driverId], references: [id])
-  vehicle   Vehicle? @relation(fields: [vehicleId], references: [id])
-  createdBy User?    @relation("CreatedBy", fields: [createdById], references: [id])
+  route   Route    @relation(fields: [routeId], references: [id])
+  driver  Driver?  @relation(fields: [driverId], references: [id])
+  vehicle Vehicle? @relation(fields: [vehicleId], references: [id])
+  vendor  Vendor?  @relation(fields: [vendorId], references: [id])
+  area    Area?    @relation(fields: [areaId], references: [id])
 
-  assignments          RideAssignment[]
-  qrCodes              RideQrCode[]
-  attendances          Attendance[]
-  notifications        Notification[]
-  complaints           Complaint[]
-  exceptions           ExceptionLog[]
-  finalScheduleEntries FinalScheduleEntry[]
-
-  @@index([scheduledDate, status])
-  @@index([driverId, scheduledDate])
-  @@index([vehicleId, scheduledDate])
-}
-
-model RideAssignment {
-  id             String  @id @default(uuid())
-  rideId         String
-  employeeId     String
-  pickupSequence Int?
-  pickupPoint    String?
-  isNoShow       Boolean @default(false)
-  notes          String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  ride     Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
-  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-
-  @@unique([rideId, employeeId])
-  @@index([employeeId])
-}
-
-model RideQrCode {
-  id       String @id @default(uuid())
-  rideId   String
-  driverId String
-
-  token   String   @unique @default(uuid())
-  payload Json
-  status  QrStatus @default(ACTIVE)
-
-  expiresAt   DateTime
-  generatedAt DateTime  @default(now())
-  expiredAt   DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  ride        Ride       @relation(fields: [rideId], references: [id], onDelete: Cascade)
-  driver      Driver     @relation(fields: [driverId], references: [id])
+  passengers  RidePassenger[]
   attendances Attendance[]
+  complaints  Complaint[]
 
-  @@unique([rideId])
-  @@index([token])
-  @@index([status, expiresAt])
 }
 
-model Attendance {
-  id         String           @id @default(uuid())
+// =============================================================================
+// RIDE PASSENGER
+// =============================================================================
+
+model RidePassenger {
+  id         String @id @default(uuid())
   rideId     String
   employeeId String
-  qrCodeId   String?
 
-  status    AttendanceStatus
-  scannedAt DateTime?
-  lateByMin Int?
+  address String?
+  contact String?
 
-  scanLatitude  Float?
-  scanLongitude Float?
-
-  notes String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  ride     Ride        @relation(fields: [rideId], references: [id])
-  employee Employee    @relation(fields: [employeeId], references: [id])
-  qrCode   RideQrCode? @relation(fields: [qrCodeId], references: [id])
+  ride     Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id])
 
   @@unique([rideId, employeeId])
-  @@index([employeeId])
   @@index([rideId])
-  @@index([status])
-  @@index([scannedAt])
 }
 
-model Complaint {
-  id          String            @id @default(uuid())
-  rideId      String?
-  employeeId  String?
-  driverId    String?
-  category    ComplaintCategory @default(OTHER)
-  title       String
-  description String?
-  status      ComplaintStatus   @default(OPEN)
-  resolution  String?
-  resolvedAt  DateTime?
+// =============================================================================
+// ATTENDANCE
+// =============================================================================
+
+model Attendance {
+  id       String   @id @default(uuid())
+  rideDate DateTime
+
+  employeeId String
+  rideId     String?
+
+  arrivalTime  DateTime?
+  delayMinutes Int?
+
+  status AttendanceStatus @default(PRESENT)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  ride     Ride?     @relation(fields: [rideId], references: [id])
-  employee Employee? @relation(fields: [employeeId], references: [id])
-  driver   Driver?   @relation(fields: [driverId], references: [id])
-}
-
-model Notification {
-  id         String           @id @default(uuid())
-  employeeId String
-  rideId     String?
-  type       NotificationType
-  title      String
-  message    String
-  isRead     Boolean          @default(false)
-  sentAt     DateTime         @default(now())
-
-  createdAt DateTime @default(now())
 
   employee Employee @relation(fields: [employeeId], references: [id])
   ride     Ride?    @relation(fields: [rideId], references: [id])
 
-  @@index([employeeId, isRead])
+  @@unique([employeeId, rideDate])
 }
 
-model ExceptionLog {
+// =============================================================================
+// COMPLAINT
+// =============================================================================
+
+model Complaint {
   id         String  @id @default(uuid())
-  rideId     String?
-  routeId    String?
   employeeId String?
   driverId   String?
   vehicleId  String?
+  rideId     String?
 
-  type     ExceptionType
-  severity ExceptionSeverity @default(MEDIUM)
-  status   ExceptionStatus   @default(OPEN)
-  message  String
-  details  Json?
+  category    ComplaintCategory @default(OTHER)
+  title       String
+  description String?
 
-  resolvedById String?
-  resolvedAt   DateTime?
-  resolution   String?
+  status     ComplaintStatus @default(OPEN)
+  resolution String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  ride       Ride?     @relation(fields: [rideId], references: [id])
-  route      Route?    @relation(fields: [routeId], references: [id])
-  employee   Employee? @relation(fields: [employeeId], references: [id])
-  driver     Driver?   @relation(fields: [driverId], references: [id])
-  vehicle    Vehicle?  @relation(fields: [vehicleId], references: [id])
-  resolvedBy User?     @relation("ResolvedBy", fields: [resolvedById], references: [id])
-
-  @@index([type])
-  @@index([status])
-  @@index([severity])
-  @@index([createdAt])
+  employee Employee? @relation(fields: [employeeId], references: [id])
+  driver   Driver?   @relation(fields: [driverId], references: [id])
+  vehicle  Vehicle?  @relation(fields: [vehicleId], references: [id])
+  ride     Ride?     @relation(fields: [rideId], references: [id])
 }
 
-model ScheduleUpload {
-  id            String       @id @default(uuid())
-  uploadedById  String
-  fileName      String
-  status        UploadStatus @default(PENDING)
-  totalRows     Int          @default(0)
-  processedRows Int          @default(0)
-  failedRows    Int          @default(0)
-  skippedRows   Int          @default(0)
-  notes         String?
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String?
+  passwordHash String?
+  role         UserRole @default(Employee)
+  qr_code      String?  @unique
+  isActive     Boolean  @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  uploadedBy      User                  @relation(fields: [uploadedById], references: [id])
-  errors          ScheduleUploadError[]
-  weeklySchedules WeeklySchedule[]
-}
-
-model ScheduleUploadError {
-  id           String @id @default(uuid())
-  uploadId     String
-  rowNumber    Int
-  errorType    String
-  errorMessage String
-  rawData      Json
-
-  createdAt DateTime @default(now())
-
-  upload ScheduleUpload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
-}
-
-model VendorDailySummary {
-  id               String   @id @default(uuid())
-  date             DateTime
-  vendorName       String
-  totalRides       Int      @default(0)
-  completedRides   Int      @default(0)
-  lateRides        Int      @default(0)
-  cancelledRides   Int      @default(0)
-  noShowCount      Int      @default(0)
-  lostHoursMinutes Int      @default(0)
-  usersAffected    Int      @default(0)
-
-  createdAt DateTime @default(now())
-
-  @@unique([date, vendorName])
+  employee Employee? @relation("EmployeeUser")
+  driver   Driver?   @relation("DriverUser")
 }
 
 model AuditLog {
-  id      String @id @default(uuid())
-  userId  String
-  action  String
-  details Json?
-
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  model     String
+  recordId  String?
+  before    Json?
+  after     Json?
+  ipAddress String?
   createdAt DateTime @default(now())
+}
 
-  user User @relation(fields: [userId], references: [id])
-
-  @@index([userId])
-  @@index([action])
-  @@index([createdAt])
+model Notification {
+  id        String             @id @default(uuid())
+  userId    String
+  title     String
+  body      String?
+  status    NotificationStatus @default(UNREAD)
+  link      String?
+  createdAt DateTime           @default(now())
 }
