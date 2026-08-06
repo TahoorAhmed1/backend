@@ -1,20 +1,34 @@
 const { prisma } = require("../../../lib/prisma");
-const { createRecord, getRecords, getRecordById, updateRecord, deleteRecord } = require("../../../utils/crudHelper");
-const { badRequestResponse, okResponse } = require("../../../constants/responses");
+const {
+  createRecord,
+  getRecords,
+  getRecordById,
+  updateRecord,
+  deleteRecord,
+} = require("../../../utils/crudHelper");
+const {
+  badRequestResponse,
+  okResponse,
+} = require("../../../constants/responses");
 
 const createDepartment = async (req, res, next) => {
   try {
     const { name } = req.body;
 
-    const existingDepartment = await prisma.department.findUnique({ where: { name } });
+    const existingDepartment = await prisma.department.findUnique({
+      where: { name },
+    });
     if (existingDepartment) {
-      const response = badRequestResponse("Department with this name already exists.");
+      const response = badRequestResponse(
+        "Department with this name already exists.",
+      );
       return res.status(response.status.code).json(response);
     }
 
     const response = await createRecord(prisma.department, { name });
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };
@@ -22,14 +36,17 @@ const createDepartment = async (req, res, next) => {
 const getAllDepartments = async (req, res, next) => {
   try {
     const { skip = 0, take = 10 } = req.query;
-    const response = await getRecords(prisma.department, {
+    const departments = await prisma.department.findMany({
       skip: parseInt(skip),
       take: parseInt(take),
-      include: {
-        employees: { select: { id: true, employeeCode: true, name: true } },
-      },
+
       orderBy: { createdAt: "desc" },
     });
+    const response = okResponse(
+      departments,
+      "Departments retrieved successfully.",
+    );
+    console.log('response', response)
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -66,9 +83,13 @@ const updateDepartment = async (req, res, next) => {
     }
 
     if (name && name !== department.name) {
-      const existingDepartment = await prisma.department.findUnique({ where: { name } });
+      const existingDepartment = await prisma.department.findUnique({
+        where: { name },
+      });
       if (existingDepartment) {
-        const errorResponse = badRequestResponse("Department with this name already exists.");
+        const errorResponse = badRequestResponse(
+          "Department with this name already exists.",
+        );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
     }
@@ -95,7 +116,9 @@ const deleteDepartment = async (req, res, next) => {
     }
 
     if (department.employees.length > 0) {
-      const errorResponse = badRequestResponse("Cannot delete department with assigned employees.");
+      const errorResponse = badRequestResponse(
+        "Cannot delete department with assigned employees.",
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -112,4 +135,4 @@ module.exports = {
   getDepartmentById,
   updateDepartment,
   deleteDepartment,
-};
+};  

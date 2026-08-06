@@ -121,10 +121,7 @@ const employeeCreateSchema = Joi.object({
     gender: Joi.string().optional().valid("MALE", "FEMALE", "OTHER"),
     designation: Joi.string().optional().allow(null),
     departmentId: Joi.string().uuid().optional().allow(null),
-    entity: Joi.string()
-      .optional()
-      .valid("IBEX", "VW")
-      .allow(null),
+    entity: Joi.string().optional().valid("IBEX", "VW").allow(null),
     officeLocation: Joi.string()
       .optional()
       .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
@@ -158,10 +155,7 @@ const employeeUpdateSchema = Joi.object({
     gender: Joi.string().optional().valid("MALE", "FEMALE", "OTHER"),
     designation: Joi.string().optional().allow(null),
     departmentId: Joi.string().uuid().optional().allow(null),
-    entity: Joi.string()
-      .optional()
-      .valid("IBEX", "VW")
-      .allow(null),
+    entity: Joi.string().optional().valid("IBEX", "VW").allow(null),
     officeLocation: Joi.string()
       .optional()
       .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
@@ -174,9 +168,7 @@ const employeeUpdateSchema = Joi.object({
       .optional()
       .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
     shiftTiming: Joi.string().optional().allow(null),
-    status: Joi.string()
-      .optional()
-      .valid("ACTIVE", "INACTIVE", "TERMINATED"),
+    status: Joi.string().optional().valid("ACTIVE", "INACTIVE", "TERMINATED"),
   }),
 });
 
@@ -232,9 +224,7 @@ const vehicleCreateSchema = Joi.object({
   params: Joi.object({}),
   body: Joi.object({
     vehicleNumber: Joi.string().required().min(5),
-    type: Joi.string()
-      .required()
-      .valid("CAR", "VAN", "HIJET", "KARVAN", "BUS"),
+    type: Joi.string().required().valid("CAR", "VAN", "HIJET", "KARVAN", "BUS"),
     make: Joi.string().optional().allow(null),
     model: Joi.string().optional().allow(null),
     year: Joi.string().optional().allow(null),
@@ -256,9 +246,7 @@ const vehicleUpdateSchema = Joi.object({
   }),
   body: Joi.object({
     vehicleNumber: Joi.string().optional().min(5),
-    type: Joi.string()
-      .optional()
-      .valid("CAR", "VAN", "HIJET", "KARVAN", "BUS"),
+    type: Joi.string().optional().valid("CAR", "VAN", "HIJET", "KARVAN", "BUS"),
     make: Joi.string().optional().allow(null),
     model: Joi.string().optional().allow(null),
     year: Joi.string().optional().allow(null),
@@ -305,9 +293,7 @@ const driverUpdateSchema = Joi.object({
     licenseNumber: Joi.string().optional().allow(null),
     cnic: Joi.string().optional().allow(null),
     vendorId: Joi.string().uuid().optional().allow(null),
-    shiftType: Joi.string()
-      .optional()
-      .valid("TWELVE_HOUR", "TWENTY_FOUR_HOUR"),
+    shiftType: Joi.string().optional().valid("TWELVE_HOUR", "TWENTY_FOUR_HOUR"),
     shiftLabel: Joi.string().optional().allow(null),
     status: Joi.string()
       .optional()
@@ -321,22 +307,33 @@ const routeCreateSchema = Joi.object({
   params: Joi.object({}),
   body: Joi.object({
     routeCode: Joi.string().required().min(2).max(50),
+
     routeName: Joi.string().required().min(2).max(100),
+
     areaId: Joi.string().uuid().optional().allow(null),
+
     subAreaId: Joi.string().uuid().optional().allow(null),
+
     officeLocation: Joi.string()
       .optional()
       .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
       .allow(null),
+
     serviceType: Joi.string()
       .optional()
       .default("PICK_AND_DROP")
       .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
+
     maxCapacity: Joi.number().required().min(1),
-    shiftTiming: Joi.string().optional().allow(null),
-    pickupStartTime: Joi.date().optional().allow(null),
-    dropTime: Joi.date().optional().allow(null),
+
     driverId: Joi.string().uuid().optional().allow(null),
+
+    shiftTiming: Joi.string().optional().allow(null),
+
+    pickupStartTime: Joi.date().optional().allow(null),
+
+    dropTime: Joi.date().optional().allow(null),
+
     status: Joi.string()
       .optional()
       .default("ACTIVE")
@@ -344,31 +341,44 @@ const routeCreateSchema = Joi.object({
   }),
 });
 
-const routeUpdateSchema = Joi.object({
-  query: Joi.object({}),
-  params: Joi.object({
-    id: Joi.string().uuid().required(),
-  }),
-  body: Joi.object({
-    routeCode: Joi.string().optional().min(2).max(50),
-    routeName: Joi.string().optional().min(2).max(100),
-    areaId: Joi.string().uuid().optional().allow(null),
-    subAreaId: Joi.string().uuid().optional().allow(null),
-    officeLocation: Joi.string()
-      .optional()
-      .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
-      .allow(null),
-    serviceType: Joi.string()
-      .optional()
-      .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
-    maxCapacity: Joi.number().optional().min(1),
-    shiftTiming: Joi.string().optional().allow(null),
-    pickupStartTime: Joi.date().optional().allow(null),
-    dropTime: Joi.date().optional().allow(null),
-    driverId: Joi.string().uuid().optional().allow(null),
-    status: Joi.string().optional().valid("ACTIVE", "INACTIVE"),
-  }),
-});
+  const routeUpdateSchema = Joi.object({
+    query: Joi.object({}),
+
+    params: Joi.object({
+      id: Joi.string().uuid().required(),
+    }),
+
+    body: Joi.object({
+      routeCode: Joi.string().optional().min(2).max(50),
+
+      routeName: Joi.string().optional().min(2).max(100),
+
+      areaId: Joi.string().uuid().optional().allow(null),
+
+      subAreaId: Joi.string().uuid().optional().allow(null),
+
+      officeLocation: Joi.string()
+        .optional()
+        .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
+        .allow(null),
+
+      serviceType: Joi.string()
+        .optional()
+        .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
+
+      maxCapacity: Joi.number().optional().min(1),
+
+      driverId: Joi.string().uuid().optional().allow(null),
+
+      shiftTiming: Joi.string().optional().allow(null),
+
+      pickupStartTime: Joi.date().optional().allow(null),
+
+      dropTime: Joi.date().optional().allow(null),
+
+      status: Joi.string().optional().valid("ACTIVE", "INACTIVE"),
+    }),
+  });
 
 const rideCreateSchema = Joi.object({
   query: Joi.object({}),
@@ -437,7 +447,9 @@ const attendanceScanSchema = Joi.object({
     rideId: Joi.string().uuid().optional().allow(null),
     arrivalTime: Joi.date().optional().allow(null),
     delayMinutes: Joi.number().optional().allow(null),
-    status: Joi.string().optional().valid("PRESENT", "LATE", "ABSENT", "NO_SHOW"),
+    status: Joi.string()
+      .optional()
+      .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW"),
   }),
 });
 
@@ -475,7 +487,7 @@ const complaintCreateSchema = Joi.object({
         "ROUTE_ISSUE",
         "TIMING_DELAY",
         "SCHEDULING",
-        "OTHER"
+        "OTHER",
       ),
     title: Joi.string().required().min(2).max(200),
     description: Joi.string().optional().allow(null),
@@ -500,7 +512,7 @@ const complaintUpdateSchema = Joi.object({
         "ROUTE_ISSUE",
         "TIMING_DELAY",
         "SCHEDULING",
-        "OTHER"
+        "OTHER",
       ),
     title: Joi.string().optional().min(2).max(200),
     description: Joi.string().optional().allow(null),
@@ -600,14 +612,11 @@ const weeklyScheduleUpdateSchema = Joi.object({
     shiftTiming: Joi.string().optional().allow(null),
     officeArrivalTime: Joi.string().optional().allow(null),
     dropTime: Joi.string().optional().allow(null),
-    status: Joi.string()
-      .optional()
-      .valid("ACTIVE", "DRAFT", "CANCELLED"),
+    status: Joi.string().optional().valid("ACTIVE", "DRAFT", "CANCELLED"),
   }),
 });
 
 module.exports = {
-  
   areaCreateSchema,
   areaUpdateSchema,
   areaIdSchema,
@@ -620,34 +629,34 @@ module.exports = {
   departmentCreateSchema,
   departmentUpdateSchema,
   departmentIdSchema,
-  
+
   employeeCreateSchema,
   employeeUpdateSchema,
   employeeIdSchema,
-  
+
   vendorCreateSchema,
   vendorUpdateSchema,
   vendorIdSchema,
-  
+
   vehicleCreateSchema,
   vehicleUpdateSchema,
-  
+
   driverCreateSchema,
   driverUpdateSchema,
-  
+
   routeCreateSchema,
   routeUpdateSchema,
-  
+
   rideCreateSchema,
   rideUpdateSchema,
-  
+
   attendanceCreateSchema,
   attendanceScanSchema,
   attendanceUpdateSchema,
-  
+
   complaintCreateSchema,
   complaintUpdateSchema,
-  
+
   weeklyScheduleCreateSchema,
   weeklyScheduleUpdateSchema,
 };

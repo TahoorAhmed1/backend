@@ -1,10 +1,5 @@
-
-
 const { prisma } = require("../../../lib/prisma");
-const {
-  getRecordById,
-  getRecords,
-} = require("../../../utils/crudHelper");
+const { getRecordById, getRecords } = require("../../../utils/crudHelper");
 const {
   badRequestResponse,
   okResponse,
@@ -26,13 +21,14 @@ const createDriver = async (req, res, next) => {
       notes,
     } = req.body;
 
-    
     if (cnic) {
       const existingDriver = await prisma.driver.findUnique({
         where: { cnic },
       });
       if (existingDriver) {
-        const response = badRequestResponse("Driver with this CNIC already exists.");
+        const response = badRequestResponse(
+          "Driver with this CNIC already exists.",
+        );
         return res.status(response.status.code).json(response);
       }
     }
@@ -55,7 +51,10 @@ const createDriver = async (req, res, next) => {
       return createDriverUser(tx, driver);
     });
 
-    const response = createSuccessResponse(driver, "Record created successfully.");
+    const response = createSuccessResponse(
+      driver,
+      "Record created successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -64,13 +63,12 @@ const createDriver = async (req, res, next) => {
 
 const getAllDrivers = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10, status, vendorId } = req.query;
+    const { skip = 0, take = 10, status } = req.query;
 
     const where = {};
     if (status) where.status = status;
-    if (vendorId) where.vendorId = vendorId;
 
-    const options = {
+    const options = { 
       where,
       skip: parseInt(skip),
       take: parseInt(take),
@@ -83,8 +81,10 @@ const getAllDrivers = async (req, res, next) => {
     };
 
     const response = await getRecords(prisma.driver, options);
+    console.log('response', response)
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };
@@ -119,21 +119,19 @@ const updateDriver = async (req, res, next) => {
     const { id } = req.params;
     const updateData = req.body;
 
-    
     const driver = await prisma.driver.findUnique({ where: { id } });
     if (!driver) {
       const errorResponse = badRequestResponse("Driver not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
     if (updateData.cnic && updateData.cnic !== driver.cnic) {
       const existingCnic = await prisma.driver.findUnique({
         where: { cnic: updateData.cnic },
       });
       if (existingCnic) {
         const errorResponse = badRequestResponse(
-          "Driver with this CNIC already exists."
+          "Driver with this CNIC already exists.",
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
@@ -166,7 +164,6 @@ const deleteDriver = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    
     const driver = await prisma.driver.findUnique({
       where: { id },
       include: {
@@ -181,10 +178,9 @@ const deleteDriver = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
     if (driver.rides.length > 0 || driver.routes.length > 0) {
       const errorResponse = badRequestResponse(
-        "Cannot delete driver with active rides or routes."
+        "Cannot delete driver with active rides or routes.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -235,7 +231,7 @@ const getDriverRides = async (req, res, next) => {
           offset: parseInt(skip),
         },
       },
-      "Driver rides retrieved successfully."
+      "Driver rides retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -262,7 +258,7 @@ const getDriverComplaints = async (req, res, next) => {
         driverId: id,
         complaints,
       },
-      "Driver complaints retrieved successfully."
+      "Driver complaints retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);

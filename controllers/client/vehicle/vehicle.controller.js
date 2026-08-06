@@ -52,6 +52,7 @@ const createVehicle = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };

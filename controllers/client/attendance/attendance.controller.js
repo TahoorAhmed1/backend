@@ -95,7 +95,7 @@ const scanAttendanceByQrCode = async (req, res, next) => {
         scannedDriver: {
           id: driverUser.driver.id,
           name: driverUser.driver.name,
-          qr_code: driverUser.qr_code,
+          qrCode: driverUser.qrCode,
         },
       },
       "Attendance scanned successfully."

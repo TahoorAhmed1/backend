@@ -43,7 +43,11 @@ const getAllAreas = async (req, res, next) => {
       skip: parseInt(skip),
       take: parseInt(take),
       include: {
-        subAreas: true,
+        subAreas: {
+          include:{
+ blocks:true
+          }
+        },
         employees: {
           select: { id: true, name: true },
         },

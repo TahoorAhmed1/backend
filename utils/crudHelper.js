@@ -3,6 +3,8 @@ const {
   createSuccessResponse,
   updateSuccessResponse,
   deleteSuccessResponse,
+  badRequestResponse,
+  serverErrorResponse,
 } = require("../constants/responses");
 
 const createRecord = async (prismaModel, data) => {
@@ -10,7 +12,25 @@ const createRecord = async (prismaModel, data) => {
     const record = await prismaModel.create({ data });
     return createSuccessResponse(record, "Record created successfully.");
   } catch (error) {
-    throw error;
+    // Handle Prisma unique constraint error (P2002) and return a bad request response
+    if (
+      error &&
+      error.name === "PrismaClientKnownRequestError" &&
+      error.code === "P2002"
+    ) {
+      let fields = null;
+      if (Array.isArray(error.meta?.target)) fields = error.meta.target;
+      else if (Array.isArray(error.meta?.fields)) fields = error.meta.fields;
+      else if (Array.isArray(error.meta?.driverAdapterError?.cause?.constraint?.fields))
+        fields = error.meta.driverAdapterError.cause.constraint.fields;
+
+      const fieldList = fields ? fields.join(", ") : "field";
+      return badRequestResponse(
+        `Unique constraint failed on the fields: (${fieldList})`
+      );
+    }
+
+    return serverErrorResponse(error?.message || "Internal server error");
   }
 };
 
@@ -72,7 +92,25 @@ const updateRecord = async (prismaModel, id, data, include = {}) => {
 
     return updateSuccessResponse(record, "Record updated successfully.");
   } catch (error) {
-    throw error;
+    // Handle Prisma unique constraint error (P2002) and return a bad request response
+    if (
+      error &&
+      error.name === "PrismaClientKnownRequestError" &&
+      error.code === "P2002"
+    ) {
+      let fields = null;
+      if (Array.isArray(error.meta?.target)) fields = error.meta.target;
+      else if (Array.isArray(error.meta?.fields)) fields = error.meta.fields;
+      else if (Array.isArray(error.meta?.driverAdapterError?.cause?.constraint?.fields))
+        fields = error.meta.driverAdapterError.cause.constraint.fields;
+
+      const fieldList = fields ? fields.join(", ") : "field";
+      return badRequestResponse(
+        `Unique constraint failed on the fields: (${fieldList})`
+      );
+    }
+
+    return serverErrorResponse(error?.message || "Internal server error");
   }
 };
 

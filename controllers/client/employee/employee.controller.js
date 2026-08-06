@@ -84,6 +84,7 @@ const createEmployee = async (req, res, next) => {
     const response = createSuccessResponse(employee, "Record created successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };
@@ -106,9 +107,7 @@ const getAllEmployees = async (req, res, next) => {
         area: { select: { id: true, name: true } },
         subArea: { select: { id: true, name: true } },
         block: { select: { id: true, name: true } },
-        weeklySchedules: true,
-        attendances: true,
-      },
+      },  
       orderBy: { createdAt: "desc" },
     };
 
@@ -119,7 +118,7 @@ const getAllEmployees = async (req, res, next) => {
   }
 };
 
-const getEmployeeById = async (req, res, next) => {
+const getEmployeeById = async (req, res, next) => { 
   try {
     const { id } = req.params;
 
@@ -217,12 +216,7 @@ const deleteEmployee = async (req, res, next) => {
     
     const employee = await prisma.employee.findUnique({
       where: { id },
-      include: {
-        user: true,
-        weeklySchedules: true,
-        attendances: true,
-        rides: true,
-      },
+   
     });
 
     if (!employee) {
@@ -230,8 +224,22 @@ const deleteEmployee = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
-    
+    // prevent FK RESTRICT violations by checking for dependent records
+    const ridePassengerCount = await prisma.ridePassenger.count({ where: { employeeId: id } });
+    const attendanceCount = await prisma.attendance.count({ where: { employeeId: id } });
+    const complaintCount = await prisma.complaint.count({ where: { employeeId: id } });
+
+    const blocking = [];
+    if (ridePassengerCount > 0) blocking.push(`${ridePassengerCount} ride passenger(s)`);
+    if (attendanceCount > 0) blocking.push(`${attendanceCount} attendance record(s)`);
+    if (complaintCount > 0) blocking.push(`${complaintCount} complaint(s)`);
+
+    if (blocking.length > 0) {
+      const errorResponse = badRequestResponse(
+        `Cannot delete employee: referenced by ${blocking.join(", ")}. Remove related records first.`
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
 
     const response = await prisma.$transaction(async (tx) => {
       if (employee.userId) {

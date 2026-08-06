@@ -10,8 +10,62 @@ const {
 } = require("../../../utils/crudHelper");
 const { badRequestResponse, okResponse } = require("../../../constants/responses");
 
+const normalizeRoutePayload = async (payload = {}) => {
+  const normalized = { ...payload };
+
+  // Helper to treat empty strings as absent
+  const cleanString = (v) => (v === undefined || v === null ? "" : String(v).trim());
+
+  const areaVal = cleanString(payload.area);
+  if (areaVal && !payload.areaId) {
+    const area = await prisma.area.findFirst({
+      where: { name: { equals: areaVal, mode: "insensitive" } },
+    });
+    if (area) normalized.areaId = area.id;
+  }
+
+  const subAreaVal = cleanString(payload.subArea);
+  if (subAreaVal && !payload.subAreaId) {
+    const subArea = await prisma.subArea.findFirst({
+      where: {
+        name: { equals: subAreaVal, mode: "insensitive" },
+        ...(normalized.areaId ? { areaId: normalized.areaId } : {}),
+      },
+    });
+    if (subArea) normalized.subAreaId = subArea.id;
+  }
+
+  const locationVal = cleanString(payload.location || payload.officeLocation);
+  if (locationVal) normalized.officeLocation = locationVal;
+
+  const shiftVal = cleanString(payload.shiftTime || payload.shiftTiming);
+  if (shiftVal) normalized.shiftTiming = shiftVal;
+
+  if (payload.capacity !== undefined && payload.capacity !== '' && payload.capacity !== null) {
+    const num = Number(payload.capacity);
+    if (!Number.isNaN(num)) normalized.maxCapacity = num;
+  }
+
+  // Remove UI-only or alias fields so Prisma receives only valid model fields
+  delete normalized.area;
+  delete normalized.subArea;
+  delete normalized.block;
+  delete normalized.location;
+  delete normalized.shiftTime;
+  delete normalized.driver;
+  delete normalized.assignedDriver;
+  delete normalized.vehicle;
+  delete normalized.assignedVehicle;
+  delete normalized.capacity;
+  delete normalized.notes;
+
+  return normalized;
+};
+
 const createRoute = async (req, res, next) => {
   try {
+    const payload = await normalizeRoutePayload(req.body);
+
     const {
       routeCode,
       routeName,
@@ -25,36 +79,95 @@ const createRoute = async (req, res, next) => {
       dropTime,
       driverId,
       status,
-    } = req.body;
+    } = payload;
 
-    
     const existingRoute = await prisma.route.findUnique({
-      where: { routeCode },
+      where: {
+        routeCode,
+      },
     });
 
     if (existingRoute) {
       const response = badRequestResponse(
         "Route with this code already exists."
       );
+
       return res.status(response.status.code).json(response);
     }
 
     const response = await createRecord(prisma.route, {
       routeCode,
       routeName,
-      areaId,
-      subAreaId,
-      officeLocation,
+      areaId: areaId || null,
+      subAreaId: subAreaId || null,
+      officeLocation: officeLocation || null,
       serviceType: serviceType || "PICK_AND_DROP",
       maxCapacity,
-      shiftTiming,
-      pickupStartTime,
-      dropTime,
-      driverId,
+      shiftTiming: shiftTiming || null,
+      pickupStartTime: pickupStartTime || null,
+      dropTime: dropTime || null,
+      driverId: driverId || null,
       status: status || "ACTIVE",
     });
 
     return res.status(response.status.code).json(response);
+
+  } catch (error) {
+    next(error);
+  }
+};
+const updateRoute = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const updateData = await normalizeRoutePayload(req.body);
+
+    const route = await prisma.route.findUnique({
+      where: { id },
+    });
+
+    if (!route) {
+      const response = badRequestResponse("Route not found.");
+      return res.status(response.status.code).json(response);
+    }
+
+
+    if (
+      updateData.routeCode &&
+      updateData.routeCode !== route.routeCode
+    ) {
+      const existingRoute = await prisma.route.findUnique({
+        where: {
+          routeCode: updateData.routeCode,
+        },
+      });
+
+      if (existingRoute) {
+        const response = badRequestResponse(
+          "Route code already exists."
+        );
+
+        return res.status(response.status.code).json(response);
+      }
+    }
+
+
+    const response = await updateRecord(
+      prisma.route,
+      id,
+      {
+        ...updateData,
+        updatedAt: new Date(),
+      },
+      {
+        area: true,
+        subArea: true,
+        driver: true,
+      }
+    );
+
+    return res.status(response.status.code).json(response);
+
   } catch (error) {
     next(error);
   }
@@ -123,40 +236,6 @@ const getRouteById = async (req, res, next) => {
   }
 };
 
-const updateRoute = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const updateData = req.body;
-
-    
-    const route = await prisma.route.findUnique({ where: { id } });
-    if (!route) {
-      const errorResponse = badRequestResponse("Route not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    
-    if (updateData.routeCode && updateData.routeCode !== route.routeCode) {
-      const existingCode = await prisma.route.findUnique({
-        where: { routeCode: updateData.routeCode },
-      });
-      if (existingCode) {
-        const errorResponse = badRequestResponse("Route code already exists.");
-        return res.status(errorResponse.status.code).json(errorResponse);
-      }
-    }
-
-    const response = await updateRecord(prisma.route, id, updateData, {
-      area: true,
-      subArea: true,
-      driver: true,
-    });
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
 
 const deleteRoute = async (req, res, next) => {
   try {

@@ -1,7 +1,4 @@
 -- CreateEnum
-CREATE TYPE "DayOfWeek" AS ENUM ('MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN');
-
--- CreateEnum
 CREATE TYPE "VehicleStatus" AS ENUM ('ACTIVE', 'INACTIVE', 'MAINTENANCE', 'BREAKDOWN');
 
 -- CreateEnum
@@ -53,7 +50,7 @@ CREATE TYPE "ScheduleStatus" AS ENUM ('ACTIVE', 'DRAFT', 'CANCELLED');
 CREATE TYPE "DayStatus" AS ENUM ('PICKUP', 'DROP', 'BOTH', 'OFF', 'ABSENT');
 
 -- CreateEnum
-CREATE TYPE "UserRole" AS ENUM ('ADMIN', 'MANAGER', 'DISPATCHER', 'DRIVER', 'Employee');
+CREATE TYPE "UserRole" AS ENUM ('ADMIN', 'MANAGER', 'DISPATCHER', 'DRIVER', 'EMPLOYEE');
 
 -- CreateEnum
 CREATE TYPE "NotificationStatus" AS ENUM ('UNREAD', 'READ');
@@ -164,11 +161,11 @@ CREATE TABLE "Route" (
     "officeLocation" "OfficeLocation",
     "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "maxCapacity" INTEGER NOT NULL,
+    "driverId" TEXT,
+    "status" "RouteStatus" NOT NULL DEFAULT 'ACTIVE',
     "shiftTiming" TEXT,
     "pickupStartTime" TIMESTAMP(3),
     "dropTime" TIMESTAMP(3),
-    "driverId" TEXT,
-    "status" "RouteStatus" NOT NULL DEFAULT 'ACTIVE',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -207,9 +204,16 @@ CREATE TABLE "WeeklySchedule" (
     "weekStart" TIMESTAMP(3) NOT NULL,
     "employeeId" TEXT NOT NULL,
     "routeId" TEXT,
+    "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "driverId" TEXT,
     "vehicleId" TEXT,
-    "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
+    "vendorId" TEXT,
+    "vehicleEntity" "Entity",
+    "pickupTime" TEXT,
+    "shiftTiming" TEXT,
+    "officeArrivalTime" TEXT,
+    "dropTime" TEXT,
+    "offDay" TEXT,
     "monday" "DayStatus" NOT NULL DEFAULT 'BOTH',
     "tuesday" "DayStatus" NOT NULL DEFAULT 'BOTH',
     "wednesday" "DayStatus" NOT NULL DEFAULT 'BOTH',
@@ -217,11 +221,8 @@ CREATE TABLE "WeeklySchedule" (
     "friday" "DayStatus" NOT NULL DEFAULT 'BOTH',
     "saturday" "DayStatus" NOT NULL DEFAULT 'OFF',
     "sunday" "DayStatus" NOT NULL DEFAULT 'OFF',
-    "pickupTime" TEXT,
-    "shiftTiming" TEXT,
-    "officeArrivalTime" TEXT,
-    "dropTime" TEXT,
     "status" "ScheduleStatus" NOT NULL DEFAULT 'ACTIVE',
+    "isLocked" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -242,7 +243,6 @@ CREATE TABLE "Ride" (
     "status" "RideStatus" NOT NULL DEFAULT 'PENDING',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
-    "employeeId" TEXT,
 
     CONSTRAINT "Ride_pkey" PRIMARY KEY ("id")
 );
@@ -297,7 +297,7 @@ CREATE TABLE "User" (
     "email" TEXT NOT NULL,
     "name" TEXT,
     "passwordHash" TEXT,
-    "role" "UserRole" NOT NULL DEFAULT 'Employee',
+    "role" "UserRole" NOT NULL DEFAULT 'EMPLOYEE',
     "qr_code" TEXT,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -461,6 +461,9 @@ ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_driverId_fkey" FOREI
 ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_vehicleId_fkey" FOREIGN KEY ("vehicleId") REFERENCES "Vehicle"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_vendorId_fkey" FOREIGN KEY ("vendorId") REFERENCES "Vendor"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Ride" ADD CONSTRAINT "Ride_routeId_fkey" FOREIGN KEY ("routeId") REFERENCES "Route"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -474,9 +477,6 @@ ALTER TABLE "Ride" ADD CONSTRAINT "Ride_vendorId_fkey" FOREIGN KEY ("vendorId") 
 
 -- AddForeignKey
 ALTER TABLE "Ride" ADD CONSTRAINT "Ride_areaId_fkey" FOREIGN KEY ("areaId") REFERENCES "Area"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "Ride" ADD CONSTRAINT "Ride_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "Employee"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "RidePassenger" ADD CONSTRAINT "RidePassenger_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;

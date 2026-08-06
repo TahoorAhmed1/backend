@@ -1,7 +1,7 @@
 const { Router } = require("express");
 const router = Router();
-const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
-const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const validateRequest = require("../../middlewares/validateRequestJoi.middleware");
+const verifyUserByToken = require("../../middlewares/verifyUserByToken");
 
 const {
   userRegisterSchema,
@@ -13,7 +13,7 @@ const {
   login,
   getMe,
   userList,
-} = require("../../../controllers/auth/auth.controllers");
+} = require("../../controllers/auth/auth.controllers");
 
 router.post("/register", validateRequest(userRegisterSchema), register);
 router.post("/login", validateRequest(userLoginSchema), login);

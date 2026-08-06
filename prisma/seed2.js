@@ -146,7 +146,7 @@ async function main() {
         name:         d.name,
         passwordHash: driverPw,
         role:         "DRIVER",
-        qr_code:      drvQR(d.cnic),   // ← QR payload stored here
+        qrCode:       drvQR(d.cnic),   // ← QR payload stored here
         isActive:     true,
       },
     });
@@ -204,7 +204,7 @@ async function main() {
   // 10. EMPLOYEE USERS  → then Employees
   //
   //  QR format: EMP-<employeeCode>-<uuid>
-  //  Role     : Employee
+  //  Role     : EMPLOYEE
   //  Flow     : Driver has a handheld scanner (or phone camera).
   //             Employee shows their QR when boarding.
   //             Scanner hits POST /attendance/scan  { qr_code }
@@ -357,7 +357,8 @@ async function main() {
         email:        e.email,
         name:         e.name,
         passwordHash: empPw,
-        role:         "Employee",
+        role:         "EMPLOYEE",
+        qrCode:       empQR(e.employeeCode),
         isActive:     e.status === "ACTIVE",
       },
     });

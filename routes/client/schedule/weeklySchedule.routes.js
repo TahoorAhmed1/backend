@@ -1,10 +1,6 @@
-const { Router } = require("express");
-const router = Router();
-const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
-const {
-  weeklyScheduleCreateSchema,
-  weeklyScheduleUpdateSchema,
-} = require("../../../validations/common");
+const express = require("express");
+const router = express.Router();
+
 const {
   createWeeklySchedule,
   getAllWeeklySchedules,
@@ -13,20 +9,32 @@ const {
   deleteWeeklySchedule,
   getCurrentWeekSchedules,
   getEmployeeScheduleRange,
+  getGroupedSchedules,
+  getScheduleStats,
+  getScheduleTableStats,
+  getScheduleTableGroupedByArea,
+  bulkUploadWeeklySchedule,
+  reassignMismatchedShiftEmployees
 } = require("../../../controllers/client/schedule/weeklySchedule.controller");
+const upload = require("../../../middlewares/upload.middleware");
 
-router.post("/", validateRequest(weeklyScheduleCreateSchema), createWeeklySchedule);
+router.get("/current-week", getCurrentWeekSchedules);
+router.get("/grouped", getGroupedSchedules); 
+router.get("/stats", getScheduleStats); 
+router.get("/employee/:employeeId/range", getEmployeeScheduleRange);
 
 router.get("/", getAllWeeklySchedules);
+router.post("/", createWeeklySchedule);
 
-router.get("/week/current", getCurrentWeekSchedules);
-
-router.get("/employee/:employeeId", getEmployeeScheduleRange);
+router.get("/schedule-table/stats", getScheduleTableStats);
+router.post("/reassignMismatchedShiftEmployees", reassignMismatchedShiftEmployees);
+router.get("/schedule-table/grouped-by-area", getScheduleTableGroupedByArea);
 
 router.get("/:id", getWeeklyScheduleById);
-
-router.put("/:id", validateRequest(weeklyScheduleUpdateSchema), updateWeeklySchedule);
-
+router.patch("/:id", updateWeeklySchedule);
 router.delete("/:id", deleteWeeklySchedule);
+
+router.post("/bulk-upload", upload.single("file"), bulkUploadWeeklySchedule);
+
 
 module.exports = router;

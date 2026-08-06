@@ -16,7 +16,7 @@ const createEmployeeUser = async (tx, employee) => {
     data: {
       email: buildSystemEmail("employee", employee.id),
       name: employee.name,
-      role: "Employee",
+      role: "EMPLOYEE",
       passwordHash: null,
       isActive: true,
     },
@@ -36,7 +36,7 @@ const createDriverUser = async (tx, driver) => {
       name: driver.name,
       role: "DRIVER",
       passwordHash: null,
-      qr_code: buildDriverQrCode(driver.id),
+      qrCode: buildDriverQrCode(driver.id),
       isActive: true,
     },
   });
