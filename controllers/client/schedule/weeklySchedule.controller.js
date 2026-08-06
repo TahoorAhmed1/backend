@@ -23,8 +23,14 @@ const DAY_KEYS = [
 
 const toDateOnly = (d) => {
   const date = new Date(d);
-  date.setHours(0, 0, 0, 0);
-  return date;
+  // Normalize using UTC components, not local time. setHours(0,0,0,0) sets
+  // the hour in the SERVER's local timezone, which silently shifts the
+  // underlying UTC instant whenever the server isn't running in UTC. That
+  // shift compounds every time a date string round-trips through
+  // formatDateOnly -> frontend -> toDateOnly again (e.g. reassign/optimize
+  // calls), eventually landing on a different instant than what's stored,
+  // so exact-match Prisma queries silently return zero rows.
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 };
 
 const formatDateOnly = (d) => new Date(d).toISOString().slice(0, 10);
@@ -36,6 +42,219 @@ const normalizeShift = (value) =>
     .toLowerCase()
     .replace(/\s+/g, "")
     .replace(/-+/g, "-");
+
+// ---------- Shift Time Overlap Detection ----------
+
+/**
+ * "6:00 PM - 3:00 AM" -> { start: 1080, durationMinutes: 540, overnight: true }
+ * start/durationMinutes are in minutes-from-midnight. Returns null if the
+ * string can't be parsed as a "<time> - <time>" range, so callers can fall
+ * back to exact-string comparison for formats we don't recognize.
+ */
+const parseShiftRange = (shiftTiming) => {
+  if (!shiftTiming) return null;
+  const parts = String(shiftTiming).split(/-|to/i).map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+
+  const toMinutes = (t) => {
+    const m = t.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (!m) return null;
+    let h = parseInt(m[1], 10);
+    const min = parseInt(m[2], 10);
+    const ampm = (m[3] || "").toUpperCase();
+    if (ampm === "PM" && h !== 12) h += 12;
+    if (ampm === "AM" && h === 12) h = 0;
+    if (h > 23 || min > 59) return null;
+    return h * 60 + min;
+  };
+
+  const start = toMinutes(parts[0]);
+  const end = toMinutes(parts[1]);
+  if (start === null || end === null) return null;
+
+  const overnight = end <= start;
+  const durationMinutes = overnight ? 24 * 60 - start + end : end - start;
+  return { start, durationMinutes, overnight };
+};
+
+/**
+ * True if two shift ranges share any time on a repeating 24h cycle. Handles
+ * overnight shifts (e.g. "10 PM - 6 AM") by also comparing each range
+ * shifted back a full day, since two overnight shifts can overlap across
+ * the midnight boundary even though their raw start/end minutes don't.
+ */
+const shiftRangesOverlap = (a, b) => {
+  if (!a || !b) return false;
+  const windows = (r) => [
+    [r.start, r.start + r.durationMinutes],
+    [r.start - 1440, r.start - 1440 + r.durationMinutes],
+  ];
+  for (const [s1, e1] of windows(a)) {
+    for (const [s2, e2] of windows(b)) {
+      if (s1 < e2 && s2 < e1) return true;
+    }
+  }
+  return false;
+};
+
+/**
+ * Public entry point: overlap-aware shift comparison instead of the old
+ * exact-string match. Falls back to normalizeShift() equality when either
+ * string can't be parsed as a time range (e.g. a shift label like "Night A"),
+ * so unparseable data doesn't silently stop being compared at all.
+ */
+const shiftTimesOverlap = (shiftA, shiftB) => {
+  const a = parseShiftRange(shiftA);
+  const b = parseShiftRange(shiftB);
+  if (!a || !b) return normalizeShift(shiftA) === normalizeShift(shiftB);
+  return shiftRangesOverlap(a, b);
+};
+
+// ---------- Driver Rest Time / Working Hours ----------
+
+const MIN_REST_MINUTES = 8 * 60; // minimum gap required between two shifts
+const DEFAULT_MAX_DAILY_HOURS = 12;
+const DEFAULT_MAX_WEEKLY_HOURS = 60;
+
+/**
+ * True if the gap between the two (possibly overnight) shift ranges is at
+ * least MIN_REST_MINUTES in EITHER direction around the 24h cycle. If either
+ * range failed to parse, we can't evaluate rest, so we don't block on it —
+ * shiftTimesOverlap()'s exact-match fallback already caught the unambiguous
+ * "identical shift" case by then.
+ */
+const hasMinimumRest = (a, b) => {
+  if (!a || !b) return true;
+  const aEnd = a.start + a.durationMinutes;
+  const bEnd = b.start + b.durationMinutes;
+  const gapAToB = ((b.start - aEnd) % 1440 + 1440) % 1440;
+  const gapBToA = ((a.start - bEnd) % 1440 + 1440) % 1440;
+  return Math.max(gapAToB, gapBToA) >= MIN_REST_MINUTES;
+};
+
+const countWorkingDays = (entry) =>
+  DAY_KEYS.filter((day) => entry[day] && entry[day] !== "OFF").length;
+
+/**
+ * Driver Working Hours Limit: checks a candidate shift against the driver's
+ * configured (or default) daily/weekly caps, counting every OTHER active
+ * assignment already on the books for that driver this week.
+ * Returns { ok: true } or { ok: false, reason }.
+ */
+const checkDriverWorkingHours = async (
+  client,
+  driverId,
+  weekStartDate,
+  candidateShiftTiming,
+  candidateWorkingDays,
+  excludeEmployeeId
+) => {
+  const driver = await client.driver.findUnique({ where: { id: driverId } });
+  if (!driver) return { ok: true };
+
+  const maxDaily = driver.maxDailyHours || DEFAULT_MAX_DAILY_HOURS;
+  const maxWeekly = driver.maxWeeklyHours || DEFAULT_MAX_WEEKLY_HOURS;
+
+  const range = parseShiftRange(candidateShiftTiming);
+  if (!range) return { ok: true }; // can't evaluate unparseable shift text
+
+  const dailyHours = range.durationMinutes / 60;
+  if (dailyHours > maxDaily) {
+    return {
+      ok: false,
+      reason: `Shift is ${dailyHours.toFixed(1)}h, which exceeds this driver's ${maxDaily}h daily limit.`,
+    };
+  }
+
+  const others = await client.weeklySchedule.findMany({
+    where: {
+      driverId,
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
+    },
+  });
+
+  let weeklyMinutes = range.durationMinutes * (candidateWorkingDays || 5);
+  for (const other of others) {
+    const otherRange = parseShiftRange(other.shiftTiming);
+    if (otherRange) weeklyMinutes += otherRange.durationMinutes * countWorkingDays(other);
+  }
+
+  const weeklyHours = weeklyMinutes / 60;
+  if (weeklyHours > maxWeekly) {
+    return {
+      ok: false,
+      reason: `Assigning this driver would total ${weeklyHours.toFixed(1)}h this week, exceeding their ${maxWeekly}h weekly limit.`,
+    };
+  }
+
+  return { ok: true };
+};
+
+// ---------- Historical Assignment Tracking ----------
+
+/**
+ * Writes a row to the existing AuditLog model instead of a bespoke history
+ * table, so every assignment change (create/update/reassign/optimize/delete)
+ * is preserved for reporting even after the live WeeklySchedule row is
+ * overwritten or deleted. `before`/`after` are shallow snapshots of just the
+ * assignment-relevant fields.
+ */
+const recordAssignmentHistory = async (client, action, weeklyScheduleId, before, after, changedBy) => {
+  try {
+    await client.auditLog.create({
+      data: {
+        action,
+        model: "WeeklySchedule",
+        recordId: weeklyScheduleId,
+        before: before ? JSON.parse(JSON.stringify(before)) : undefined,
+        after: after ? JSON.parse(JSON.stringify(after)) : undefined,
+        userId: changedBy || undefined,
+      },
+    });
+  } catch (historyError) {
+    // Never let audit logging break the actual assignment operation.
+  }
+};
+
+// ---------- Exception Queue ----------
+
+/**
+ * Logs an unresolved conflict (no driver, no vehicle, invalid data, a
+ * duplicate employee within the same sheet, etc.) to the review queue
+ * instead of only recording it in the response payload, so it isn't lost
+ * once the HTTP response is gone.
+ */
+const logScheduleException = async (client, { weekStart, employeeCode, rowNumber, reason, rawData }) => {
+  try {
+    await client.scheduleException.create({
+      data: {
+        weekStart,
+        employeeCode: employeeCode || undefined,
+        rowNumber: rowNumber ?? undefined,
+        reason,
+        rawData: rawData ? JSON.parse(JSON.stringify(rawData)) : undefined,
+      },
+    });
+  } catch (exceptionLogError) {
+    // Never let exception logging break the actual upload/reassign.
+  }
+};
+
+// ---------- Concurrency Protection ----------
+
+/**
+ * Postgres advisory lock scoped to a (week, area) pair, held for the
+ * duration of the current transaction. Two concurrent uploads/reassignments
+ * touching the same week+area serialize on this instead of racing each
+ * other's capacity checks and both landing an employee on the same "last"
+ * open seat.
+ */
+const acquireWeekAreaLock = async (client, weekStartDate, areaKey) => {
+  const lockKey = `weekly-schedule::${weekStartDate.toISOString()}::${areaKey || "no-area"}`;
+  await client.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+};
 
 // ---------- Bulk upload (XLSX) helpers ----------
 
@@ -167,6 +386,290 @@ const findOrCreateVehicle = async (vehicleReg) => {
     data: { vehicleNumber: vehicleReg, status: "ACTIVE" },
   });
   return { vehicle, created: true };
+};
+
+const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
+
+/**
+ * Is this driver already committed to a DIFFERENT route for this week?
+ * (Same route/leg reuse is fine — that's not a conflict, it's the same job.)
+ * Returns the conflicting WeeklySchedule row (with its route) or null.
+ */
+const findDriverConflict = async (driverId, weekStartDate, targetRouteId, excludeEmployeeId) => {
+  if (!driverId) return null;
+  return prisma.weeklySchedule.findFirst({
+    where: {
+      driverId,
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      ...(targetRouteId ? { routeId: { not: targetRouteId } } : {}),
+      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
+    },
+    include: { route: true },
+  });
+};
+
+/** Same idea as findDriverConflict, but for a vehicle. */
+const findVehicleConflict = async (vehicleId, weekStartDate, targetRouteId, excludeEmployeeId) => {
+  if (!vehicleId) return null;
+  return prisma.weeklySchedule.findFirst({
+    where: {
+      vehicleId,
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      ...(targetRouteId ? { routeId: { not: targetRouteId } } : {}),
+      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
+    },
+    include: { route: true },
+  });
+};
+
+/**
+ * Picks the "best" driver for a route/week: must be AVAILABLE, and must not
+ * already be booked (via any non-cancelled WeeklySchedule row) on a
+ * DIFFERENT route this same week. Drivers who already drive the target
+ * route are fine and preferred implicitly since they'd already be set on
+ * the route (this is only called when no driver is set yet).
+ */
+const findBestAvailableDriver = async (weekStartDate, targetRouteId, excludeEmployeeId) => {
+  const busy = await prisma.weeklySchedule.findMany({
+    where: {
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      driverId: { not: null },
+      ...(targetRouteId ? { routeId: { not: targetRouteId } } : {}),
+      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
+    },
+    select: { driverId: true },
+    distinct: ["driverId"],
+  });
+  const busyIds = busy.map((b) => b.driverId).filter(Boolean);
+
+  const eligible = await prisma.driver.findMany({
+    where: {
+      status: "AVAILABLE",
+      ...(busyIds.length ? { id: { notIn: busyIds } } : {}),
+    },
+    include: { vehicle: true },
+    orderBy: { createdAt: "asc" },
+  });
+  if (!eligible.length) return null;
+  if (eligible.length === 1) return eligible[0];
+
+  // Smart Driver Balancing: the previous version always returned the
+  // earliest-created AVAILABLE driver, so the same one or two drivers kept
+  // getting every new assignment while the rest sat idle. Instead, count
+  // each eligible driver's current (non-cancelled) route load for this
+  // week and prefer whoever is carrying the fewest assignments right now.
+  // Ties fall back to createdAt order for determinism.
+  const loads = await prisma.weeklySchedule.groupBy({
+    by: ["driverId"],
+    where: {
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      driverId: { in: eligible.map((d) => d.id) },
+    },
+    _count: { _all: true },
+  });
+  const loadMap = new Map(loads.map((l) => [l.driverId, l._count._all]));
+
+  let best = eligible[0];
+  let bestLoad = loadMap.get(best.id) || 0;
+  for (const driver of eligible.slice(1)) {
+    const load = loadMap.get(driver.id) || 0;
+    if (load < bestLoad) {
+      best = driver;
+      bestLoad = load;
+    }
+  }
+  return best;
+};
+
+/**
+ * Picks the "best" vehicle for a route/week: must be ACTIVE, must not
+ * already be booked on a DIFFERENT route this week, and should meet the
+ * route's capacity if we know it. Prefers a type match (e.g. sheet said
+ * "Hiace"/"Van") when a valid VehicleType hint is available, falling back to
+ * any qualifying vehicle otherwise (smallest-capacity-first, so big vehicles
+ * stay free for routes that actually need them).
+ */
+const findBestAvailableVehicle = async (
+  weekStartDate,
+  targetRouteId,
+  minCapacity,
+  vehicleTypeHint,
+  excludeEmployeeId
+) => {
+  const busy = await prisma.weeklySchedule.findMany({
+    where: {
+      weekStart: weekStartDate,
+      status: { not: "CANCELLED" },
+      vehicleId: { not: null },
+      ...(targetRouteId ? { routeId: { not: targetRouteId } } : {}),
+      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
+    },
+    select: { vehicleId: true },
+    distinct: ["vehicleId"],
+  });
+  const busyIds = busy.map((b) => b.vehicleId).filter(Boolean);
+
+  const baseWhere = {
+    status: "ACTIVE",
+    ...(busyIds.length ? { id: { notIn: busyIds } } : {}),
+    ...(minCapacity ? { capacity: { gte: minCapacity } } : {}),
+  };
+
+  const typeKey = String(vehicleTypeHint || "").trim().toUpperCase();
+  if (typeKey && VEHICLE_TYPES.has(typeKey)) {
+    const typed = await prisma.vehicle.findFirst({
+      where: { ...baseWhere, type: typeKey },
+      orderBy: { capacity: "asc" },
+    });
+    if (typed) return typed;
+  }
+
+  return prisma.vehicle.findFirst({ where: baseWhere, orderBy: { capacity: "asc" } });
+};
+
+/**
+ * Smart Auto Assignment: finds a conflict-free driver, then prefers that
+ * driver's own paired vehicle (Vehicle.driverId is a 1:1 relation in the
+ * schema) if it's free this week, otherwise finds any other free,
+ * right-sized vehicle.
+ */
+const autoAssignDriverAndVehicle = async (
+  weekStartDate,
+  targetRouteId,
+  maxCapacity,
+  vehicleTypeHint,
+  excludeEmployeeId
+) => {
+  const driver = await findBestAvailableDriver(weekStartDate, targetRouteId, excludeEmployeeId);
+  if (!driver) return { driverId: undefined, vehicleId: undefined };
+
+  let vehicle = driver.vehicle && driver.vehicle.status === "ACTIVE" ? driver.vehicle : null;
+  if (vehicle) {
+    const conflict = await findVehicleConflict(vehicle.id, weekStartDate, targetRouteId, excludeEmployeeId);
+    if (conflict) vehicle = null;
+  }
+  if (!vehicle) {
+    vehicle = await findBestAvailableVehicle(
+      weekStartDate,
+      targetRouteId,
+      maxCapacity,
+      vehicleTypeHint,
+      excludeEmployeeId
+    );
+  }
+
+  return { driverId: driver.id, vehicleId: vehicle?.id };
+};
+
+/**
+ * Conflict Prevention + Smart Auto Assignment, combined into one call site
+ * used by both bulk upload and bulk reassign:
+ *   1. If a driver/vehicle was proposed (e.g. named in the sheet, or carried
+ *      over from a prior assignment) but it's already booked on a DIFFERENT
+ *      route this week, drop it and note why instead of silently
+ *      double-booking that driver/vehicle.
+ *   2. If there's still no driver, auto-assign the best available
+ *      (AVAILABLE status + conflict-free) one, and try to bring along its
+ *      own paired vehicle.
+ *   3. If there's still no vehicle, auto-assign the best available
+ *      (ACTIVE status + conflict-free + capacity-fitting) one.
+ *   4. Keeps Route.driverId in sync so it stays the source of truth the rest
+ *      of the app (e.g. the grouped-schedule driver badge) reads from.
+ */
+const resolveConflictFreeAssignment = async ({
+  route,
+  weekStartDate,
+  proposedDriverId,
+  proposedVehicleId,
+  vehicleTypeHint,
+  excludeEmployeeId,
+}) => {
+  const notes = [];
+  let driverId = proposedDriverId;
+  let vehicleId = proposedVehicleId;
+  let autoAssignedDriver = false;
+  let autoAssignedVehicle = false;
+
+  if (driverId) {
+    const conflict = await findDriverConflict(driverId, weekStartDate, route.id, excludeEmployeeId);
+    if (conflict) {
+      notes.push(
+        `Requested driver is already booked on route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available driver instead.`
+      );
+      driverId = undefined;
+    }
+  }
+
+  if (driverId) {
+    const hoursCheck = await checkDriverWorkingHours(
+      prisma,
+      driverId,
+      weekStartDate,
+      route.shiftTiming,
+      undefined,
+      excludeEmployeeId
+    );
+    if (!hoursCheck.ok) {
+      notes.push(`Requested driver was skipped — ${hoursCheck.reason} Auto-assigned a different available driver instead.`);
+      driverId = undefined;
+    }
+  }
+
+  if (vehicleId) {
+    const conflict = await findVehicleConflict(vehicleId, weekStartDate, route.id, excludeEmployeeId);
+    if (conflict) {
+      notes.push(
+        `Requested vehicle is already booked on route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available vehicle instead.`
+      );
+      vehicleId = undefined;
+    }
+  }
+
+  if (!driverId) {
+    const best = await autoAssignDriverAndVehicle(
+      weekStartDate,
+      route.id,
+      route.maxCapacity,
+      vehicleTypeHint,
+      excludeEmployeeId
+    );
+    if (best.driverId) {
+      driverId = best.driverId;
+      autoAssignedDriver = true;
+      if (!vehicleId && best.vehicleId) {
+        vehicleId = best.vehicleId;
+        autoAssignedVehicle = true;
+      }
+    } else {
+      notes.push("No available (conflict-free) driver found for this row — left unassigned; assign manually.");
+    }
+  }
+
+  if (driverId && !vehicleId) {
+    const vehicle = await findBestAvailableVehicle(
+      weekStartDate,
+      route.id,
+      route.maxCapacity,
+      vehicleTypeHint,
+      excludeEmployeeId
+    );
+    if (vehicle) {
+      vehicleId = vehicle.id;
+      autoAssignedVehicle = true;
+    } else {
+      notes.push("No available (conflict-free) vehicle found for this row — left unassigned; assign manually.");
+    }
+  }
+
+  if (driverId && !route.driverId) {
+    await prisma.route.update({ where: { id: route.id }, data: { driverId } });
+  }
+
+  return { driverId, vehicleId, autoAssignedDriver, autoAssignedVehicle, notes };
 };
 
 /**
@@ -421,8 +924,8 @@ const findAvailableRouteLeg = async (
  */
 const reassignMismatchedShiftEmployees = async (req, res, next) => {
   try {
-    const {  routeCode, weekStart } = req.body;
-    if ((routeCode) || !weekStart) {
+    const { routeId, routeCode, weekStart } = req.body;
+    if ((!routeId && !routeCode) || !weekStart) {
       const response = badRequestResponse("routeId or routeCode, plus weekStart, are required.");
       return res.status(response.status.code).json(response);
     }
@@ -430,17 +933,21 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     const weekStartDate = toDateOnly(weekStart);
 
     const route = await prisma.route.findUnique({
-      where:  { routeCode },
+      where: routeId ? { id: routeId } : { routeCode },
       include: { area: true },
     });
-    console.log('route', route)
     if (!route) {
       const response = badRequestResponse("Route not found.");
       return res.status(response.status.code).json(response);
     }
 
+    // Only pull schedules actually riding THIS route. The previous version
+    // queried every non-cancelled schedule for the week across every route,
+    // so a single reassign call would sweep up and move mismatched employees
+    // that had nothing to do with this route — corrupting unrelated
+    // assignments and creating duplicate/incorrect route legs.
     const schedules = await prisma.weeklySchedule.findMany({
-      where: {  weekStart: weekStartDate, status: { not: "CANCELLED" } },
+      where: { routeId: route.id, weekStart: weekStartDate, status: { not: "CANCELLED" } },
     });
 
     const routeShiftNorm = normalizeShift(route.shiftTiming);
@@ -522,7 +1029,106 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error)
+    next(error);
+  }
+};
+
+// ---------- Real-Time Route Optimization ----------
+
+/**
+ * Scans every ACTIVE (non-cancelled) WeeklySchedule row for a given week and
+ * self-heals anything out of order:
+ *   - a schedule whose driver (or vehicle) is now double-booked on a
+ *     DIFFERENT route this week (e.g. because that route's driver changed
+ *     underneath it) gets bumped off that resource
+ *   - any schedule left without a driver and/or vehicle — whether from the
+ *     above, a manual edit, or a partial bulk upload — gets one assigned
+ *     through the same conflict-free + load-balanced logic used everywhere
+ *     else (resolveConflictFreeAssignment / findBestAvailableDriver)
+ * This is what lets assignments stay correct as data changes throughout the
+ * week, instead of only being fixed the next time someone re-runs a bulk
+ * upload.
+ */
+const optimizeWeekAssignments = async (weekStartDate) => {
+  const schedules = await prisma.weeklySchedule.findMany({
+    where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
+    include: { route: true },
+  });
+
+  const summary = {
+    scanned: schedules.length,
+    driversReassigned: 0,
+    vehiclesReassigned: 0,
+    details: [],
+  };
+
+  for (const entry of schedules) {
+    if (!entry.route) continue; // nothing to optimize against without a route
+
+    let driverId = entry.driverId || undefined;
+    let vehicleId = entry.vehicleId || undefined;
+
+    if (driverId) {
+      const conflict = await findDriverConflict(driverId, weekStartDate, entry.routeId, entry.employeeId);
+      if (conflict) driverId = undefined;
+    }
+    if (vehicleId) {
+      const conflict = await findVehicleConflict(vehicleId, weekStartDate, entry.routeId, entry.employeeId);
+      if (conflict) vehicleId = undefined;
+    }
+
+    if (!driverId || !vehicleId) {
+      const resolved = await resolveConflictFreeAssignment({
+        route: entry.route,
+        weekStartDate,
+        proposedDriverId: driverId,
+        proposedVehicleId: vehicleId,
+        vehicleTypeHint: undefined,
+        excludeEmployeeId: entry.employeeId,
+      });
+      driverId = resolved.driverId;
+      vehicleId = resolved.vehicleId;
+    }
+
+    if (driverId !== (entry.driverId || undefined) || vehicleId !== (entry.vehicleId || undefined)) {
+      await prisma.weeklySchedule.update({
+        where: { id: entry.id },
+        data: { driverId: driverId || null, vehicleId: vehicleId || null },
+      });
+      if (driverId !== (entry.driverId || undefined)) summary.driversReassigned++;
+      if (vehicleId !== (entry.vehicleId || undefined)) summary.vehiclesReassigned++;
+      summary.details.push({
+        weeklyScheduleId: entry.id,
+        employeeId: entry.employeeId,
+        routeId: entry.routeId,
+        driverId,
+        vehicleId,
+      });
+    }
+  }
+
+  return summary;
+};
+
+/**
+ * Endpoint wrapper for optimizeWeekAssignments — wire this to an "Optimize
+ * now" button and/or a periodic job (cron, queue worker, etc.) for
+ * continuous optimization. It's also called inline from create/update below
+ * so a single edit self-heals immediately rather than waiting for the next
+ * scheduled run.
+ * Body: { weekStart: string }
+ */
+const optimizeRouteAssignments = async (req, res, next) => {
+  try {
+    const { weekStart } = req.body;
+    if (!weekStart) {
+      const response = badRequestResponse("weekStart is required.");
+      return res.status(response.status.code).json(response);
+    }
+    const summary = await optimizeWeekAssignments(toDateOnly(weekStart));
+    const response = okResponse(summary, "Route assignments optimized for the week.");
+    return res.status(response.status.code).json(response);
+  } catch (error) {
     next(error);
   }
 };
@@ -593,6 +1199,17 @@ const createWeeklySchedule = async (req, res, next) => {
       dropTime,
       status: status || "ACTIVE",
     });
+
+    // Real-Time Route Optimization: don't wait for the next bulk upload to
+    // fill in / fix driver-vehicle assignments touched by this change.
+    if (routeId) {
+      try {
+        await optimizeWeekAssignments(toDateOnly(weekStart));
+      } catch (optimizeError) {
+        // Optimization is best-effort — a failure here shouldn't fail the
+        // create that already succeeded.
+      }
+    }
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -710,6 +1327,18 @@ const updateWeeklySchedule = async (req, res, next) => {
       vehicle: true,
     });
 
+    // Real-Time Route Optimization: a route/driver/vehicle change on one
+    // schedule can free up or double-book a resource for others on the same
+    // week, so re-scan the week whenever one of those fields moved.
+    const touchesAssignment = ["routeId", "driverId", "vehicleId"].some((f) => f in updateData);
+    if (touchesAssignment) {
+      try {
+        await optimizeWeekAssignments(updateData.weekStart || schedule.weekStart);
+      } catch (optimizeError) {
+        // Best-effort — don't fail an already-successful update.
+      }
+    }
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -738,10 +1367,15 @@ const deleteWeeklySchedule = async (req, res, next) => {
 
 const getCurrentWeekSchedules = async (req, res, next) => {
   try {
-    const today = new Date();
-    const startOfWeek = new Date(today);
-    startOfWeek.setDate(today.getDate() - today.getDay());
-    startOfWeek.setHours(0, 0, 0, 0);
+    const now = new Date();
+    const utcToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    // weekStart is always a Monday (see schema). Convert Sunday=0..Saturday=6
+    // into "days since Monday" so this lines up with every other Monday-based
+    // weekStart in the app (e.g. the frontend's own default-week-start calc),
+    // instead of the previous Sunday-based start which pointed at the wrong
+    // week entirely whenever this ran on a Sunday.
+    const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
+    const startOfWeek = new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
 
     const schedules = await prisma.weeklySchedule.findMany({
       where: {
@@ -855,6 +1489,7 @@ const getGroupedSchedules = async (req, res, next) => {
             routeName: true,
             routeCode: true,
             area: true,
+            shiftTiming: true,
             driver: { select: { id: true, name: true } },
           },
         },
@@ -874,7 +1509,14 @@ const getGroupedSchedules = async (req, res, next) => {
           code: s.route?.routeCode ?? "—",
           name: s.route?.routeName ?? "Unassigned Route",
           area: s.route?.area ?? "",
-          shift: s.shiftTiming ?? "",
+          // Use the ROUTE's own canonical shiftTiming — the same field
+          // reassignMismatchedShiftEmployees compares against — not an
+          // arbitrary schedule row's shiftTiming. Using a schedule row's
+          // value here caused the frontend to flag/clear "mismatches" that
+          // didn't agree with what the reassign endpoint actually checks,
+          // so reassign would report 0 updates even when the UI showed
+          // mismatched employees.
+          shift: s.route?.shiftTiming ?? s.shiftTiming ?? "",
           service: s.serviceType,
           // Prefer the driver assigned to the ROUTE itself (Route.driverId)
           // since that's the actual source of truth per-route; fall back to
@@ -1147,8 +1789,26 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
       vehiclesCreated: 0,
       routesCreated: 0,
       routeLegsOpenedForOverflow: 0,
+      driversAutoAssigned: 0,
+      vehiclesAutoAssigned: 0,
+      conflictsResolved: 0,
       skipped: [],
       notes: [],
+    };
+
+    // Records a skipped row both in the HTTP response AND the persistent
+    // exception queue — previously logScheduleException was defined but
+    // never called, so skipped rows only ever lived in the transient
+    // response payload and were lost the moment the request finished.
+    const skipRow = async (rowNum, employeeCode, reason, rawData) => {
+      results.skipped.push({ row: rowNum, employeeCode, reason });
+      await logScheduleException(prisma, {
+        weekStart: weekStartDate,
+        employeeCode,
+        rowNumber: rowNum,
+        reason,
+        rawData,
+      });
     };
 
     const dataRows = rows.slice(headerRowIndex + 1);
@@ -1236,21 +1896,41 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
           }
           // Verification: a routeId must exist on every row from here on.
           if (!route?.id) {
-            results.skipped.push({
-              row: rowNum,
+            await skipRow(
+              rowNum,
               employeeCode,
-              reason: "Route could not be created/found even with fallback — check Route model required fields.",
-            });
+              "Route could not be created/found even with fallback — check Route model required fields.",
+              raw
+            );
             continue;
           }
         } catch (routeError) {
-          results.skipped.push({
-            row: rowNum,
-            employeeCode,
-            reason: `Route creation failed: ${routeError.message}`,
-          });
+          await skipRow(rowNum, employeeCode, `Route creation failed: ${routeError.message}`, raw);
           continue;
         }
+
+        // Conflict-free assignment: previously this step was skipped for bulk
+        // uploads entirely, so a sheet naming a driver already double-booked
+        // on another route this week (or exceeding their working-hours
+        // limit) would silently write that conflict straight into the DB.
+        // This is the same resolver used by reassign/optimize, so bulk
+        // upload now gets the identical conflict/auto-assign/hours guarantees.
+        const assignment = await resolveConflictFreeAssignment({
+          route,
+          weekStartDate,
+          proposedDriverId: driverId,
+          proposedVehicleId: vehicleId,
+          vehicleTypeHint: vehicleType,
+          excludeEmployeeId: employee.id,
+        });
+        driverId = assignment.driverId;
+        vehicleId = assignment.vehicleId;
+        if (assignment.autoAssignedDriver) results.driversAutoAssigned++;
+        if (assignment.autoAssignedVehicle) results.vehiclesAutoAssigned++;
+        assignment.notes.forEach((note) => {
+          if (note.includes("already booked") || note.includes("was skipped")) results.conflictsResolved++;
+          results.notes.push({ row: rowNum, employeeCode, note });
+        });
 
         const offDaySet = parseOffDays(get("offDay"));
         const dayFields = {};
@@ -1292,7 +1972,7 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
 
         if (existing) {
           if (existing.isLocked) {
-            results.skipped.push({ row: rowNum, employeeCode, reason: "Schedule is locked." });
+            await skipRow(rowNum, employeeCode, "Schedule is locked.", raw);
             continue;
           }
           await prisma.weeklySchedule.update({ where: { id: existing.id }, data: scheduleData });
@@ -1302,7 +1982,7 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
           results.created++;
         }
       } catch (rowError) {
-        results.skipped.push({ row: rowNum, employeeCode, reason: rowError.message });
+        await skipRow(rowNum, employeeCode, rowError.message, raw);
       }
     }
 
@@ -1327,4 +2007,5 @@ module.exports = {
   getScheduleTableGroupedByArea,
   bulkUploadWeeklySchedule,        // new
   reassignMismatchedShiftEmployees, // new
+  optimizeRouteAssignments,        // new
 };

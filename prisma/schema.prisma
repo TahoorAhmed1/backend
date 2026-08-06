@@ -235,6 +235,8 @@
       shiftLabel    String?
       status        DriverStatus    @default(AVAILABLE)
       notes         String?
+      maxDailyHours  Int?
+      maxWeeklyHours Int?
 
       createdAt DateTime @default(now())
       updatedAt DateTime @updatedAt
@@ -468,6 +470,19 @@
       after     Json?
       ipAddress String?
       createdAt DateTime @default(now())
+    }
+
+    model ScheduleException {
+      id           String   @id @default(uuid())
+      weekStart    DateTime
+      employeeCode String?
+      rowNumber    Int?
+      reason       String
+      rawData      Json?
+      resolved     Boolean  @default(false)
+      createdAt    DateTime @default(now())
+
+      @@index([weekStart])
     }
 
     model Notification {

@@ -14,7 +14,8 @@ const {
   getScheduleTableStats,
   getScheduleTableGroupedByArea,
   bulkUploadWeeklySchedule,
-  reassignMismatchedShiftEmployees
+  reassignMismatchedShiftEmployees,
+  optimizeRouteAssignments,
 } = require("../../../controllers/client/schedule/weeklySchedule.controller");
 const upload = require("../../../middlewares/upload.middleware");
 
@@ -28,6 +29,7 @@ router.post("/", createWeeklySchedule);
 
 router.get("/schedule-table/stats", getScheduleTableStats);
 router.post("/reassignMismatchedShiftEmployees", reassignMismatchedShiftEmployees);
+router.post("/optimize", optimizeRouteAssignments);
 router.get("/schedule-table/grouped-by-area", getScheduleTableGroupedByArea);
 
 router.get("/:id", getWeeklyScheduleById);
