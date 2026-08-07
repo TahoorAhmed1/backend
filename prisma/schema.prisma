@@ -222,6 +222,7 @@
       rides           Ride[]
       complaints      Complaint[]
       weeklySchedules WeeklySchedule[]
+      trips           Trip[]
     }
 
     model Driver {
@@ -248,6 +249,7 @@
       vehicle         Vehicle?
       rides           Ride[]
       routes          Route[]
+      trips           Trip[]
       complaints      Complaint[]
       weeklySchedules WeeklySchedule[]
     }
@@ -261,7 +263,15 @@
       subAreaId      String?
       officeLocation OfficeLocation?
       serviceType    ServiceType     @default(PICK_AND_DROP)
+      // Aggregate seating across all ACTIVE trips on this route (sum of each
+      // trip's vehicle capacity). Kept in sync by the route/trip controller
+      // whenever a trip is added/updated/removed — it's a denormalized
+      // rollup for list views, NOT the source of truth. The source of truth
+      // for a single trip's capacity is always Trip.vehicle.capacity.
       maxCapacity    Int
+      // Legacy single driver/route pointer, kept for back-compat with the
+      // bulk-upload "leg" flow and existing queries. For routes created
+      // through the new Trip-aware flow this mirrors trips[0].driverId.
       driverId       String?
       status         RouteStatus     @default(ACTIVE)
 
@@ -277,9 +287,40 @@
       driver          Driver?          @relation(fields: [driverId], references: [id])
       weeklySchedules WeeklySchedule[]
       rides           Ride[]
+      trips           Trip[]
 
       @@index([areaId])
       @@index([subAreaId])
+    }
+
+    // A single vehicle/driver run on a Route. A Route is the named corridor
+    // (e.g. "Gulshan-e-Iqbal - Evening Shift"); a Trip is one vehicle
+    // actually driving it. Most routes have exactly one Trip. When an
+    // area/shift is overflowing, a second (third, ...) Trip is opened on the
+    // SAME Route with its own driver, vehicle, and capacity, instead of
+    // spinning up a lookalike Route row — this is what lets the weekly
+    // schedule show "Route X — Trip 2" under one route name.
+    model Trip {
+      id          String      @id @default(uuid())
+      routeId     String
+      tripNumber  Int         @default(1)
+      driverId    String?
+      vehicleId   String?
+      shiftTiming String?     // overrides Route.shiftTiming for this trip if set
+      status      RouteStatus @default(ACTIVE)
+
+      createdAt DateTime @default(now())
+      updatedAt DateTime @updatedAt
+
+      route           Route            @relation(fields: [routeId], references: [id], onDelete: Cascade)
+      driver          Driver?          @relation(fields: [driverId], references: [id])
+      vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id])
+      weeklySchedules WeeklySchedule[]
+
+      @@unique([routeId, tripNumber])
+      @@index([routeId])
+      @@index([driverId])
+      @@index([vehicleId])
     }
 
 
@@ -327,8 +368,20 @@
 
       routeId String?
 
+      // Which specific Trip (vehicle run) on the route this employee rides.
+      // Optional for back-compat with rows created before Trips existed —
+      // those keep working off routeId/driverId/vehicleId directly. New
+      // assignments should always set tripId so per-trip capacity/remaining
+      // seats can be computed precisely instead of only per-route.
+      tripId String?
+
       serviceType ServiceType @default(PICK_AND_DROP)
 
+      // driverId/vehicleId are denormalized copies of the trip's own
+      // driver/vehicle, kept in sync by the route/trip controller whenever
+      // the trip's assignment changes. They stay here (rather than being
+      // dropped in favor of always joining through trip) because most of
+      // the existing schedule queries filter/display directly off them.
       driverId      String?
       vehicleId     String?
       vendorId      String?
@@ -357,6 +410,7 @@
 
       employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
       route    Route?   @relation(fields: [routeId], references: [id])
+      trip     Trip?    @relation(fields: [tripId], references: [id])
       driver   Driver?  @relation(fields: [driverId], references: [id])
       vehicle  Vehicle? @relation(fields: [vehicleId], references: [id])
       vendor   Vendor?  @relation(fields: [vendorId], references: [id])
@@ -364,6 +418,7 @@
       @@unique([employeeId, weekStart])
       @@index([weekStart])
       @@index([employeeId])
+      @@index([tripId])
     }
 
     model Ride {
