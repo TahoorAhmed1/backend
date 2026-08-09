@@ -1,12 +1,11 @@
-const { Router } = require("express");
-const router = Router();
-const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
-const {
-  routeCreateSchema,
-  routeUpdateSchema,
-} = require("../../../validations/common");
+const express = require("express");
+const router = express.Router();
+
 const {
   createRoute,
+  addTripToRoute,
+  updateTripAssignment,
+  assignEmployeeToTrip,
   getAllRoutes,
   getRouteById,
   updateRoute,
@@ -14,22 +13,26 @@ const {
   getRouteEmployees,
   getRouteRides,
   getRouteStats,
+  getRouteWeeklyView,
 } = require("../../../controllers/client/route/route.controller");
 
-router.post("/", validateRequest(routeCreateSchema), createRoute);
-
+router.post("/", createRoute);
 router.get("/", getAllRoutes);
+router.get("/:id", getRouteById);
+router.patch("/:id", updateRoute);
+router.delete("/:id", deleteRoute);
 
-router.get("/stats/overview", getRouteStats);
 
 router.get("/:id/employees", getRouteEmployees);
-
 router.get("/:id/rides", getRouteRides);
+router.get("/:id/stats", getRouteStats);
+router.get("/:routeId/weekly-view", getRouteWeeklyView);
 
-router.get("/:id", getRouteById);
 
-router.put("/:id", validateRequest(routeUpdateSchema), updateRoute);
+router.post("/:routeId/trips", addTripToRoute);
+router.patch("/trips/:tripId", updateTripAssignment);
 
-router.delete("/:id", deleteRoute);
+
+router.post("/trips/:tripId/assign", assignEmployeeToTrip);
 
 module.exports = router;

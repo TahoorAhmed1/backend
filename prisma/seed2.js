@@ -13,9 +13,26 @@ const { randomUUID } = require("crypto");
 // ── helpers ──────────────────────────────────────────────────────────────────
 const hash = (pw) => bcrypt.hash(pw, 10);
 
-/** Deterministic-ish QR payload — unique per entity */
 const empQR = (code) => `EMP-${code}-${randomUUID()}`;
 const drvQR = (cnic) => `DRV-${cnic}-${randomUUID()}`;
+
+
+const startOfCurrentWeekUTC = () => {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0 = Sunday .. 6 = Saturday
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  return new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + diffToMonday),
+  );
+};
+
+/** `base` (a UTC-midnight date) plus `days`, with a specific UTC time of day set. */
+const atTime = (base, days, hh, mm) => {
+  const dt = new Date(base);
+  dt.setUTCDate(dt.getUTCDate() + days);
+  dt.setUTCHours(hh, mm, 0, 0);
+  return dt;
+};
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -125,12 +142,13 @@ async function main() {
   //  NOTE: Email is set to employeeCode (DRV-<cnic> for uniqueness)
   // ══════════════════════════════════════════════════════════════════════════
   const driverUserData = [
-    { email: "DRV-4210101234567",      name: "Imran Ali",        cnic: "4210101234567", vendorId: artVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE" },
-    { email: "DRV-4210204321098",      name: "Kamran Siddiqui",  cnic: "4210204321098", vendorId: ccsVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE" },
-    { email: "DRV-4210399887766",      name: "Shahid Nawaz",     cnic: "4210399887766", vendorId: plgVendor.id, shiftType: "TWENTY_FOUR_HOUR", shiftLabel: "Night",   status: "ON_RIDE" },
-    { email: "DRV-4210455667788",      name: "Faisal Qureshi",   cnic: "4210455667788", vendorId: artVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Evening", status: "AVAILABLE" },
-    { email: "DRV-4210511223344",      name: "Zubair Ahmed",     cnic: "4210511223344", vendorId: swtVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE" },
-    { email: "DRV-4210677889900",      name: "Nadeem Butt",      cnic: "4210677889900", vendorId: ccsVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "OFFLINE" },
+    { email: "DRV-4210101234567",      name: "Imran Ali",        cnic: "4210101234567", vendorId: artVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE", maxDailyHours: 12, maxWeeklyHours: 60, notes: "Senior driver, prefers morning routes" },
+    { email: "DRV-4210204321098",      name: "Kamran Siddiqui",  cnic: "4210204321098", vendorId: ccsVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE", maxDailyHours: 12, maxWeeklyHours: 60, notes: null },
+    { email: "DRV-4210399887766",      name: "Shahid Nawaz",     cnic: "4210399887766", vendorId: plgVendor.id, shiftType: "TWENTY_FOUR_HOUR", shiftLabel: "Night",   status: "ON_RIDE",   maxDailyHours: 24, maxWeeklyHours: 72, notes: "24-hour shift, bus route" },
+    { email: "DRV-4210455667788",      name: "Faisal Qureshi",   cnic: "4210455667788", vendorId: artVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Evening", status: "AVAILABLE", maxDailyHours: 12, maxWeeklyHours: 60, notes: null },
+    { email: "DRV-4210511223344",      name: "Zubair Ahmed",     cnic: "4210511223344", vendorId: swtVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE", maxDailyHours: 12, maxWeeklyHours: 60, notes: "Handles evening Johar route" },
+    { email: "DRV-4210677889900",      name: "Nadeem Butt",      cnic: "4210677889900", vendorId: ccsVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "OFFLINE",   maxDailyHours: 12, maxWeeklyHours: 60, notes: "On leave this week" },
+    { email: "DRV-4210788990011",      name: "Waqar Sheikh",     cnic: "4210788990011", vendorId: artVendor.id, shiftType: "TWELVE_HOUR",      shiftLabel: "Morning", status: "AVAILABLE", maxDailyHours: 12, maxWeeklyHours: 60, notes: "Backup driver — covers overflow trips when a route exceeds vehicle capacity" },
   ];
 
   const driverPw = await hash("Driver@1234");
@@ -164,6 +182,9 @@ async function main() {
         shiftType:     d.shiftType,
         shiftLabel:    d.shiftLabel,
         status:        d.status,
+        maxDailyHours:  d.maxDailyHours,
+        maxWeeklyHours: d.maxWeeklyHours,
+        notes:          d.notes,
         userId:        drvUser.id,     // ← link back
       },
     });
@@ -171,19 +192,20 @@ async function main() {
     drivers.push(driver);
   }
 
-  const [driver1, driver2, driver3, driver4, driver5, driver6] = drivers;
+  const [driver1, driver2, driver3, driver4, driver5, driver6, driver7] = drivers;
   console.log("✅ Driver Users + Drivers (with QR codes)");
 
   // ══════════════════════════════════════════════════════════════════════════
   // 8. VEHICLES  (linked to drivers)
   // ══════════════════════════════════════════════════════════════════════════
-  const [van1, hijet1, bus1, car1, karvan1, van2] = await Promise.all([
+  const [van1, hijet1, bus1, car1, karvan1, van2, car2] = await Promise.all([
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-A-1234" }, update: {}, create: { vehicleNumber: "KHI-A-1234", type: "VAN",    make: "Toyota",   model: "HiAce",    year: "2021", capacity: 14, vendorId: artVendor.id, driverId: driver1.id, status: "ACTIVE"      } }),
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-B-5678" }, update: {}, create: { vehicleNumber: "KHI-B-5678", type: "HIJET",  make: "Daihatsu", model: "HiJet",    year: "2020", capacity: 8,  vendorId: ccsVendor.id, driverId: driver2.id, status: "ACTIVE"      } }),
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-C-9012" }, update: {}, create: { vehicleNumber: "KHI-C-9012", type: "BUS",    make: "Hino",     model: "Dutro",    year: "2019", capacity: 30, vendorId: plgVendor.id, driverId: driver3.id, status: "ACTIVE"      } }),
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-D-3456" }, update: {}, create: { vehicleNumber: "KHI-D-3456", type: "CAR",    make: "Honda",    model: "City",     year: "2022", capacity: 4,  vendorId: artVendor.id, driverId: driver4.id, status: "ACTIVE"      } }),
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-E-7890" }, update: {}, create: { vehicleNumber: "KHI-E-7890", type: "KARVAN", make: "Suzuki",   model: "Every",    year: "2021", capacity: 10, vendorId: swtVendor.id, driverId: driver5.id, status: "ACTIVE"      } }),
     prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-F-1122" }, update: {}, create: { vehicleNumber: "KHI-F-1122", type: "VAN",    make: "Toyota",   model: "HiAce GL", year: "2018", capacity: 14, vendorId: mmvVendor.id,                       status: "MAINTENANCE", notes: "Engine overhaul in progress" } }),
+    prisma.vehicle.upsert({ where: { vehicleNumber: "KHI-G-3344" }, update: {}, create: { vehicleNumber: "KHI-G-3344", type: "CAR",    make: "Honda",    model: "City",     year: "2022", capacity: 4,  vendorId: artVendor.id, driverId: driver7.id, status: "ACTIVE", notes: "Overflow vehicle for CLF-IBT3-AM Trip 2" } }),
   ]);
   console.log("✅ Vehicles");
 
@@ -194,11 +216,37 @@ async function main() {
     prisma.route.upsert({ where: { routeCode: "GUL-IBT1-AM" }, update: {}, create: { routeCode: "GUL-IBT1-AM", routeName: "Gulshan Block 1 → IBT-1 Morning",     areaId: gulshan.id,        subAreaId: gulshan1.id, officeLocation: "IBT_1",     serviceType: "PICK_AND_DROP", maxCapacity: 14, shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T07:30:00Z"), dropTime: new Date("2024-01-01T18:30:00Z"), driverId: driver1.id, status: "ACTIVE"   } }),
     prisma.route.upsert({ where: { routeCode: "DHA-SKY-AM"  }, update: {}, create: { routeCode: "DHA-SKY-AM",  routeName: "DHA Phase 5 → Sky Tower Morning",      areaId: dha.id,            subAreaId: dhaP5.id,    officeLocation: "SKY_TOWER", serviceType: "PICK_AND_DROP", maxCapacity: 8,  shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T07:00:00Z"), dropTime: new Date("2024-01-01T18:00:00Z"), driverId: driver2.id, status: "ACTIVE"   } }),
     prisma.route.upsert({ where: { routeCode: "NN-IBT2-AM"  }, update: {}, create: { routeCode: "NN-IBT2-AM",  routeName: "North Nazimabad → IBT-2 Morning",       areaId: northNazimabad.id, subAreaId: nnH.id,      officeLocation: "IBT_2",     serviceType: "PICK_AND_DROP", maxCapacity: 30, shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T07:15:00Z"), dropTime: new Date("2024-01-01T18:15:00Z"), driverId: driver3.id, status: "ACTIVE"   } }),
-    prisma.route.upsert({ where: { routeCode: "CLF-IBT3-AM" }, update: {}, create: { routeCode: "CLF-IBT3-AM", routeName: "Clifton → IBT-3 Morning",               areaId: clifton.id,        subAreaId: cliff4.id,   officeLocation: "IBT_3",     serviceType: "PICK_ONLY",     maxCapacity: 4,  shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T08:00:00Z"),                                                     driverId: driver4.id, status: "ACTIVE"   } }),
+    prisma.route.upsert({ where: { routeCode: "CLF-IBT3-AM" }, update: {}, create: { routeCode: "CLF-IBT3-AM", routeName: "Clifton → IBT-3 Morning",               areaId: clifton.id,        subAreaId: cliff4.id,   officeLocation: "IBT_3",     serviceType: "PICK_ONLY",     maxCapacity: 8,  shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T08:00:00Z"),                                                     driverId: driver4.id, status: "ACTIVE"   } }),
     prisma.route.upsert({ where: { routeCode: "JHR-IBT1-PM" }, update: {}, create: { routeCode: "JHR-IBT1-PM", routeName: "Johar → IBT-1 Evening Shift",           areaId: johar.id,          subAreaId: johar14B.id, officeLocation: "IBT_1",     serviceType: "PICK_AND_DROP", maxCapacity: 10, shiftTiming: "18:00", pickupStartTime: new Date("2024-01-01T15:30:00Z"), dropTime: new Date("2024-01-01T20:30:00Z"), driverId: driver5.id, status: "ACTIVE"   } }),
     prisma.route.upsert({ where: { routeCode: "NAZ-SKY-AM"  }, update: {}, create: { routeCode: "NAZ-SKY-AM",  routeName: "Nazimabad → Sky Tower Morning",         areaId: nazimabad.id,      subAreaId: naz3.id,     officeLocation: "SKY_TOWER", serviceType: "PICK_AND_DROP", maxCapacity: 14, shiftTiming: "09:00", pickupStartTime: new Date("2024-01-01T07:45:00Z"), dropTime: new Date("2024-01-01T18:45:00Z"),                       status: "INACTIVE" } }),
   ]);
   console.log("✅ Routes");
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9B. TRIPS  (a Trip = one vehicle/driver actually running a Route.
+  //   Trip capacity = Trip.vehicle.capacity, this is the source of truth for
+  //   how many employees that trip can carry. A route gets ONE trip as long
+  //   as its assigned riders fit in one vehicle. CLF-IBT3-AM has 5 employees
+  //   assigned but car1 only seats 4, so Trip 1 (driver4/car1) takes the
+  //   first 4 and a Trip 2 (driver7/car2, SAME shiftTiming) is opened with a
+  //   new driver+vehicle to carry the overflow rider — this is the pattern
+  //   to repeat (Trip 3, Trip 4, ...) if a route keeps growing past what the
+  //   newest vehicle can hold. route6 has no driver/vehicle assigned yet,
+  //   matching its INACTIVE status.)
+  // ══════════════════════════════════════════════════════════════════════════
+  const [trip1a, trip2a, trip3a, trip4a, trip4b, trip5a, trip6a] = await Promise.all([
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route1.id, tripNumber: 1 } }, update: {}, create: { routeId: route1.id, tripNumber: 1, driverId: driver1.id, vehicleId: van1.id,    status: "ACTIVE"   } }),
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route2.id, tripNumber: 1 } }, update: {}, create: { routeId: route2.id, tripNumber: 1, driverId: driver2.id, vehicleId: hijet1.id,  status: "ACTIVE"   } }),
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route3.id, tripNumber: 1 } }, update: {}, create: { routeId: route3.id, tripNumber: 1, driverId: driver3.id, vehicleId: bus1.id,    status: "ACTIVE"   } }),
+    // route4 (Clifton → IBT-3): 5 employees assigned, car1 capacity is only 4
+    // → Trip 1 fills the vehicle to capacity...
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route4.id, tripNumber: 1 } }, update: {}, create: { routeId: route4.id, tripNumber: 1, driverId: driver4.id, vehicleId: car1.id,    status: "ACTIVE"   } }),
+    // ...and the 5th (overflow) employee rides Trip 2, same shiftTiming/pickup, new driver+vehicle.
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route4.id, tripNumber: 2 } }, update: {}, create: { routeId: route4.id, tripNumber: 2, driverId: driver7.id, vehicleId: car2.id,    status: "ACTIVE"   } }),
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route5.id, tripNumber: 1 } }, update: {}, create: { routeId: route5.id, tripNumber: 1, driverId: driver5.id, vehicleId: karvan1.id, status: "ACTIVE"   } }),
+    prisma.trip.upsert({ where: { routeId_tripNumber: { routeId: route6.id, tripNumber: 1 } }, update: {}, create: { routeId: route6.id, tripNumber: 1,                                              status: "INACTIVE" } }),
+  ]);
+  console.log("✅ Trips");
 
   // ══════════════════════════════════════════════════════════════════════════
   // 10. EMPLOYEE USERS  → then Employees
@@ -344,6 +392,82 @@ async function main() {
       shiftTiming:    "09:00",
       status:         "INACTIVE",
     },
+    // ── The next 4 employees all ride route4 (CLF-IBT3-AM). Combined with
+    // Zara Malik above that's 5 riders on a route whose Trip 1 vehicle
+    // (car1) only seats 4 — the 5th, Hina Sheikh, is the one who overflows
+    // onto Trip 2 (driver7/car2) below. ──────────────────────────────────
+    {
+      employeeCode:   "IBX-0007",
+      name:           "Kashif Malik",
+      email:          "IBX-0007",
+      contactNumber:  "03808889900",
+      cnic:           "4210800088888",
+      gender:         "MALE",
+      designation:    "Support Engineer",
+      entity:         "IBEX",
+      officeLocation: "IBT_3",
+      departmentId:   opsDept.id,
+      areaId:         clifton.id,
+      subAreaId:      cliff4.id,
+      address:        "Apartment 5C, Block 4, Clifton, Karachi",
+      serviceType:    "PICK_ONLY",
+      shiftTiming:    "09:00",
+      status:         "ACTIVE",
+    },
+    {
+      employeeCode:   "IBX-0008",
+      name:           "Ayesha Siddiqui",
+      email:          "IBX-0008",
+      contactNumber:  "03909990011",
+      cnic:           "4210900099999",
+      gender:         "FEMALE",
+      designation:    "QA Analyst",
+      entity:         "IBEX",
+      officeLocation: "IBT_3",
+      departmentId:   qaDept.id,
+      areaId:         clifton.id,
+      subAreaId:      cliff4.id,
+      address:        "House 9, Block 4, Clifton, Karachi",
+      serviceType:    "PICK_ONLY",
+      shiftTiming:    "09:00",
+      status:         "ACTIVE",
+    },
+    {
+      employeeCode:   "IBX-0009",
+      name:           "Bilal Ahmed",
+      email:          "IBX-0009",
+      contactNumber:  "03011112223",
+      cnic:           "4211000000001",
+      gender:         "MALE",
+      designation:    "Sales Associate",
+      entity:         "IBEX",
+      officeLocation: "IBT_3",
+      departmentId:   salesDept.id,
+      areaId:         clifton.id,
+      subAreaId:      cliff4.id,
+      address:        "Flat 11, Block 4, Clifton, Karachi",
+      serviceType:    "PICK_ONLY",
+      shiftTiming:    "09:00",
+      status:         "ACTIVE",
+    },
+    {
+      employeeCode:   "IBX-0010",
+      name:           "Hina Sheikh",
+      email:          "IBX-0010",
+      contactNumber:  "03122223344",
+      cnic:           "4211100000002",
+      gender:         "FEMALE",
+      designation:    "Finance Analyst",
+      entity:         "IBEX",
+      officeLocation: "IBT_3",
+      departmentId:   financeDept.id,
+      areaId:         clifton.id,
+      subAreaId:      cliff4.id,
+      address:        "House 20, Block 4, Clifton, Karachi",
+      serviceType:    "PICK_ONLY",
+      shiftTiming:    "09:00",
+      status:         "ACTIVE",
+    },
   ];
 
   const employees = [];
@@ -391,31 +515,37 @@ async function main() {
     employees.push(emp);
   }
 
-  const [emp1, emp2, emp3, emp4, emp5, emp6, emp7] = employees;
+  const [emp1, emp2, emp3, emp4, emp5, emp6, emp7, emp8, emp9, emp10, emp11] = employees;
   console.log("✅ Employee Users + Employees (with QR codes)");
 
   // ══════════════════════════════════════════════════════════════════════════
   // 11. WEEKLY SCHEDULES
   // ══════════════════════════════════════════════════════════════════════════
-  const weekStart = new Date("2025-01-06T00:00:00Z");
+  const weekStart = startOfCurrentWeekUTC();
 
   await Promise.all([
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp1.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp1.id, routeId: route1.id, driverId: driver1.id, vehicleId: van1.id,    serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:30", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:30", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp2.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp2.id, routeId: route3.id, driverId: driver3.id, vehicleId: bus1.id,    serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "ABSENT", thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:15", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:15", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp3.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp3.id, routeId: route5.id, driverId: driver5.id, vehicleId: karvan1.id, serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "15:30", shiftTiming: "18:00", officeArrivalTime: "18:00", dropTime: "20:30", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp4.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp4.id, routeId: route2.id, driverId: driver2.id, vehicleId: hijet1.id,  serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:00", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:00", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp5.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp5.id, routeId: route4.id, driverId: driver4.id, vehicleId: car1.id,    serviceType: "PICK_ONLY",     monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp6.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp6.id, routeId: route1.id, driverId: driver1.id, vehicleId: van1.id,    serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:30", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:30", status: "ACTIVE" } }),
-    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp7.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp7.id, routeId: route1.id, driverId: driver6.id, vehicleId: van1.id,    serviceType: "DROP_ONLY",     monday: "DROP",   tuesday: "DROP",   wednesday: "DROP",   thursday: "DROP",   friday: "DROP",   saturday: "OFF", sunday: "OFF", dropTime: "18:30", shiftTiming: "09:00", status: "DRAFT" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp1.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp1.id, routeId: route1.id, tripId: trip1a.id, driverId: driver1.id, vehicleId: van1.id,   vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:30", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:30", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp2.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp2.id, routeId: route3.id, tripId: trip3a.id, driverId: driver3.id, vehicleId: bus1.id,   vendorId: plgVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "ABSENT", thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:15", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:15", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp3.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp3.id, routeId: route5.id, tripId: trip5a.id, driverId: driver5.id, vehicleId: karvan1.id, vendorId: swtVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "15:30", shiftTiming: "18:00", officeArrivalTime: "18:00", dropTime: "20:30", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp4.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp4.id, routeId: route2.id, tripId: trip2a.id, driverId: driver2.id, vehicleId: hijet1.id, vendorId: ccsVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:00", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp5.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp5.id, routeId: route4.id, tripId: trip4a.id, driverId: driver4.id, vehicleId: car1.id,   vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_ONLY",     monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp6.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp6.id, routeId: route1.id, tripId: trip1a.id, driverId: driver1.id, vehicleId: van1.id,   vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_AND_DROP", monday: "BOTH", tuesday: "BOTH", wednesday: "BOTH",   thursday: "BOTH", friday: "BOTH", saturday: "OFF", sunday: "OFF", pickupTime: "07:30", shiftTiming: "09:00", officeArrivalTime: "09:00", dropTime: "18:30", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp7.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp7.id, routeId: route1.id, tripId: trip1a.id, driverId: driver1.id, vehicleId: van1.id,   vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "DROP_ONLY",     monday: "DROP",   tuesday: "DROP",   wednesday: "DROP",   thursday: "DROP",   friday: "DROP",   saturday: "OFF", sunday: "OFF", dropTime: "18:30", shiftTiming: "09:00", offDay: "Saturday & Sunday", status: "DRAFT" } }),
+    // ── route4 (CLF-IBT3-AM): 5 riders total, car1 seats 4 → 4 on Trip 1, 1 overflows to Trip 2 ──
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp8.id,  weekStart } }, update: {}, create: { weekStart, employeeId: emp8.id,  routeId: route4.id, tripId: trip4a.id, driverId: driver4.id, vehicleId: car1.id, vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_ONLY", monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp9.id,  weekStart } }, update: {}, create: { weekStart, employeeId: emp9.id,  routeId: route4.id, tripId: trip4a.id, driverId: driver4.id, vehicleId: car1.id, vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_ONLY", monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp10.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp10.id, routeId: route4.id, tripId: trip4a.id, driverId: driver4.id, vehicleId: car1.id, vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_ONLY", monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
+    // emp11 is the 5th rider — car1 (Trip 1) is already full at 4/4, so she's on Trip 2 (driver7/car2), same pickup/shift timing as Trip 1
+    prisma.weeklySchedule.upsert({ where: { employeeId_weekStart: { employeeId: emp11.id, weekStart } }, update: {}, create: { weekStart, employeeId: emp11.id, routeId: route4.id, tripId: trip4b.id, driverId: driver7.id, vehicleId: car2.id, vendorId: artVendor.id, vehicleEntity: "IBEX", serviceType: "PICK_ONLY", monday: "PICKUP", tuesday: "PICKUP", wednesday: "PICKUP", thursday: "PICKUP", friday: "PICKUP", saturday: "OFF", sunday: "OFF", pickupTime: "08:00", shiftTiming: "09:00", officeArrivalTime: "09:00", offDay: "Saturday & Sunday", status: "ACTIVE" } }),
   ]);
   console.log("✅ Weekly Schedules");
 
   // ══════════════════════════════════════════════════════════════════════════
   // 12. RIDES
   // ══════════════════════════════════════════════════════════════════════════
-  const d1 = new Date("2025-01-06T00:00:00Z");
-  const d2 = new Date("2025-01-07T00:00:00Z");
-  const d3 = new Date("2025-01-08T00:00:00Z");
+  const d1 = weekStart;                 // Monday this week
+  const d2 = atTime(weekStart, 1, 0, 0); // Tuesday this week
+  const d3 = atTime(weekStart, 2, 0, 0); // Wednesday this week
 
   const [ride1, ride2, ride3, ride4, ride5, ride6] = await Promise.all([
     prisma.ride.create({ data: { rideDate: d1, routeId: route1.id, driverId: driver1.id, vehicleId: van1.id,    vendorId: artVendor.id, areaId: gulshan.id,        pickupTime: "07:30", dropTime: "18:30", status: "COMPLETED" } }),
@@ -446,11 +576,11 @@ async function main() {
   //   Driver scans employee QR → POST /attendance/scan → PRESENT / LATE marked
   // ══════════════════════════════════════════════════════════════════════════
   await Promise.all([
-    prisma.attendance.create({ data: { rideDate: d1, employeeId: emp1.id, rideId: ride1.id, arrivalTime: new Date("2025-01-06T09:05:00Z"), delayMinutes: 5,  status: "LATE"    } }),
-    prisma.attendance.create({ data: { rideDate: d1, employeeId: emp4.id, rideId: ride2.id, arrivalTime: new Date("2025-01-06T08:58:00Z"), delayMinutes: 0,  status: "PRESENT" } }),
+    prisma.attendance.create({ data: { rideDate: d1, employeeId: emp1.id, rideId: ride1.id, arrivalTime: atTime(weekStart, 0, 9, 5),  delayMinutes: 5,  status: "LATE"    } }),
+    prisma.attendance.create({ data: { rideDate: d1, employeeId: emp4.id, rideId: ride2.id, arrivalTime: atTime(weekStart, 0, 8, 58), delayMinutes: 0,  status: "PRESENT" } }),
     prisma.attendance.create({ data: { rideDate: d2, employeeId: emp2.id, rideId: ride3.id,                                                                  status: "ABSENT"  } }),
-    prisma.attendance.create({ data: { rideDate: d2, employeeId: emp5.id, rideId: ride4.id, arrivalTime: new Date("2025-01-07T09:00:00Z"), delayMinutes: 0,  status: "PRESENT" } }),
-    prisma.attendance.create({ data: { rideDate: d3, employeeId: emp3.id, rideId: ride5.id, arrivalTime: new Date("2025-01-08T18:12:00Z"), delayMinutes: 12, status: "LATE"    } }),
+    prisma.attendance.create({ data: { rideDate: d2, employeeId: emp5.id, rideId: ride4.id, arrivalTime: atTime(weekStart, 1, 9, 0),  delayMinutes: 0,  status: "PRESENT" } }),
+    prisma.attendance.create({ data: { rideDate: d3, employeeId: emp3.id, rideId: ride5.id, arrivalTime: atTime(weekStart, 2, 18, 12), delayMinutes: 12, status: "LATE"    } }),
     prisma.attendance.create({ data: { rideDate: d3, employeeId: emp7.id, rideId: ride6.id,                                                                  status: "NO_SHOW" } }),
   ]);
   console.log("✅ Attendance");
@@ -483,6 +613,19 @@ async function main() {
   console.log("✅ Audit Logs");
 
   // ══════════════════════════════════════════════════════════════════════════
+  // 16B. SCHEDULE EXCEPTIONS  (rows from a bulk weekly-schedule upload that
+  //   couldn't be auto-matched/applied and need manual review)
+  // ══════════════════════════════════════════════════════════════════════════
+  await prisma.scheduleException.createMany({
+    data: [
+      { weekStart, employeeCode: "IBX-0099", rowNumber: 12, reason: "Employee code not found in system",     rawData: { employeeCode: "IBX-0099", name: "Unknown Employee", route: "GUL-IBT1-AM" }, resolved: false },
+      { weekStart, employeeCode: "VW-0002",  rowNumber: 27, reason: "Duplicate entry for same week",         rawData: { employeeCode: "VW-0002", name: "Haris Raza", route: "NAZ-SKY-AM" },         resolved: true  },
+      { weekStart, employeeCode: null,       rowNumber: 33, reason: "Missing route code in upload sheet",    rawData: { name: "Nadia Farooq", pickupTime: "07:30" },                                 resolved: false },
+    ],
+  });
+  console.log("✅ Schedule Exceptions");
+
+  // ══════════════════════════════════════════════════════════════════════════
   // 17. NOTIFICATIONS
   // ══════════════════════════════════════════════════════════════════════════
   // resolve userIds from employees array
@@ -510,13 +653,14 @@ async function main() {
 ╠══════════════════════════════════════════════════════╣
 ║  Areas            6   SubAreas      9   Blocks    6  ║
 ║  Departments      6   Vendors       5              ║
-║  Driver Users     6   Drivers       6  (QR coded)   ║
-║  Employee Users   7   Employees     7  (QR coded)   ║
+║  Driver Users     7   Drivers       7  (QR coded)   ║
+║  Employee Users  11   Employees    11  (QR coded)   ║
 ║  System Users     3   (Admin/Mgr/Dispatch)           ║
-║  Vehicles         6   Routes        6              ║
-║  Weekly Schedules 7   Rides         6              ║
-║  Ride Passengers  6   Attendance    6              ║
-║  Complaints       6   Audit Logs    5              ║
+║  Vehicles         7   Routes        6              ║
+║  Trips            7   Weekly Schedules  11         ║
+║  Rides            6   Ride Passengers   6          ║
+║  Attendance       6   Complaints        6          ║
+║  Audit Logs       5   Schedule Exceptions 3        ║
 ║  Notifications    6                               ║
 ╠══════════════════════════════════════════════════════╣
 ║  Default passwords:                                  ║

@@ -7,7 +7,10 @@ const {
   updateRecord,
   deleteRecord,
 } = require("../../../utils/crudHelper");
-const { badRequestResponse, okResponse } = require("../../../constants/responses");
+const {
+  badRequestResponse,
+  okResponse,
+} = require("../../../constants/responses");
 const {
   normalizeShift,
   parseShiftRange,
@@ -35,7 +38,9 @@ const toDateOnly = (d) => {
   // formatDateOnly -> frontend -> toDateOnly again (e.g. reassign/optimize
   // calls), eventually landing on a different instant than what's stored,
   // so exact-match Prisma queries silently return zero rows.
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+  );
 };
 
 const formatDateOnly = (d) => new Date(d).toISOString().slice(0, 10);
@@ -61,13 +66,56 @@ const hasMinimumRest = (a, b) => {
   if (!a || !b) return true;
   const aEnd = a.start + a.durationMinutes;
   const bEnd = b.start + b.durationMinutes;
-  const gapAToB = ((b.start - aEnd) % 1440 + 1440) % 1440;
-  const gapBToA = ((a.start - bEnd) % 1440 + 1440) % 1440;
+  const gapAToB = (((b.start - aEnd) % 1440) + 1440) % 1440;
+  const gapBToA = (((a.start - bEnd) % 1440) + 1440) % 1440;
   return Math.max(gapAToB, gapBToA) >= MIN_REST_MINUTES;
 };
 
 const countWorkingDays = (entry) =>
   DAY_KEYS.filter((day) => entry[day] && entry[day] !== "OFF").length;
+
+// ---------- In-memory "week roster" cache (bulk-upload perf) ----------
+//
+// THE REAL BOTTLENECK: findDriverConflict / findVehicleConflict /
+// findBestAvailableDriver / findBestAvailableVehicle / checkDriverWorkingHours
+// each run their own `prisma.weeklySchedule.findMany(...)` scoped to "every
+// live row for this week." That's fine called once. But resolveConflictFreeAssignment
+// calls several of these per row, and a bulk upload calls it for EVERY row —
+// and the result set they're scanning grows by one row every time the job
+// itself writes a new WeeklySchedule entry. So row 1 scans ~0 rows, row 300
+// scans ~300 rows, all re-fetched from the DB from scratch every time: total
+// work is O(rows^2), not O(rows). THIS, not the employee/driver/vendor/vehicle
+// lookups, is why a few hundred rows can take many minutes.
+//
+// Fix: when `caches.weekRoster` is present, these functions read/filter an
+// in-memory array instead of hitting the DB, and the bulk-upload loop keeps
+// that array in sync (see upsertRosterEntry) as it writes each row. Callers
+// outside bulk upload (single edits, reassign-one, optimize) don't pass
+// `caches`, so they keep querying the DB live — correct there, since only
+// one or a handful of rows change at a time and staleness isn't a concern.
+const filterRoster = (
+  roster,
+  { driverId, vehicleId, excludeTripId, excludeEmployeeId } = {},
+) =>
+  roster.filter((r) => {
+    if (driverId && r.driverId !== driverId) return false;
+    if (vehicleId && r.vehicleId !== vehicleId) return false;
+    if (excludeTripId && r.tripId === excludeTripId) return false;
+    if (excludeEmployeeId && r.employeeId === excludeEmployeeId) return false;
+    return true;
+  });
+
+// Called after a row's assignment is written, so the NEXT row in the same
+// job sees it immediately instead of racing a DB round trip that would
+// return stale (pre-write) data anyway inside a single request.
+const upsertRosterEntry = (caches, entry) => {
+  if (!caches?.weekRoster) return;
+  const idx = caches.weekRoster.findIndex(
+    (r) => r.employeeId === entry.employeeId,
+  );
+  if (idx === -1) caches.weekRoster.push(entry);
+  else caches.weekRoster[idx] = { ...caches.weekRoster[idx], ...entry };
+};
 
 /**
  * Driver Working Hours Limit: checks a candidate shift against the driver's
@@ -81,9 +129,14 @@ const checkDriverWorkingHours = async (
   weekStartDate,
   candidateShiftTiming,
   candidateWorkingDays,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
-  const driver = await client.driver.findUnique({ where: { id: driverId } });
+  let driver = caches?.driverById?.get(driverId);
+  if (!driver) {
+    driver = await client.driver.findUnique({ where: { id: driverId } });
+    if (driver) caches?.driverById?.set(driverId, driver);
+  }
   if (!driver) return { ok: true };
 
   const maxDaily = driver.maxDailyHours || DEFAULT_MAX_DAILY_HOURS;
@@ -100,19 +153,24 @@ const checkDriverWorkingHours = async (
     };
   }
 
-  const others = await client.weeklySchedule.findMany({
-    where: {
-      driverId,
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-  });
+  const others = caches?.weekRoster
+    ? filterRoster(caches.weekRoster, { driverId, excludeEmployeeId })
+    : await client.weeklySchedule.findMany({
+        where: {
+          driverId,
+          weekStart: weekStartDate,
+          status: { not: "CANCELLED" },
+          ...(excludeEmployeeId
+            ? { employeeId: { not: excludeEmployeeId } }
+            : {}),
+        },
+      });
 
   let weeklyMinutes = range.durationMinutes * (candidateWorkingDays || 5);
   for (const other of others) {
     const otherRange = parseShiftRange(other.shiftTiming);
-    if (otherRange) weeklyMinutes += otherRange.durationMinutes * countWorkingDays(other);
+    if (otherRange)
+      weeklyMinutes += otherRange.durationMinutes * countWorkingDays(other);
   }
 
   const weeklyHours = weeklyMinutes / 60;
@@ -135,7 +193,14 @@ const checkDriverWorkingHours = async (
  * overwritten or deleted. `before`/`after` are shallow snapshots of just the
  * assignment-relevant fields.
  */
-const recordAssignmentHistory = async (client, action, weeklyScheduleId, before, after, changedBy) => {
+const recordAssignmentHistory = async (
+  client,
+  action,
+  weeklyScheduleId,
+  before,
+  after,
+  changedBy,
+) => {
   try {
     await client.auditLog.create({
       data: {
@@ -160,7 +225,10 @@ const recordAssignmentHistory = async (client, action, weeklyScheduleId, before,
  * instead of only recording it in the response payload, so it isn't lost
  * once the HTTP response is gone.
  */
-const logScheduleException = async (client, { weekStart, employeeCode, rowNumber, reason, rawData }) => {
+const logScheduleException = async (
+  client,
+  { weekStart, employeeCode, rowNumber, reason, rawData },
+) => {
   try {
     await client.scheduleException.create({
       data: {
@@ -187,7 +255,46 @@ const logScheduleException = async (client, { weekStart, employeeCode, rowNumber
  */
 const acquireWeekAreaLock = async (client, weekStartDate, areaKey) => {
   const lockKey = `weekly-schedule::${weekStartDate.toISOString()}::${areaKey || "no-area"}`;
-  await client.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+  // FIX: pg_advisory_xact_lock() returns Postgres type `void`. $queryRaw
+  // tries to deserialize whatever comes back into a typed result row/column,
+  // and there's no Prisma type for `void` — hence "Failed to deserialize
+  // column of type 'void'". $executeRaw runs the statement without trying
+  // to parse a result set, which is the correct tool here since we only
+  // care about the side effect (the lock being held), not any return value.
+  await client.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+};
+
+/**
+ * Wraps acquireWeekAreaLock in its own short transaction and never lets a
+ * failure here block the caller.
+ *
+ * This lock is explicitly a narrow, best-effort mitigation (see the comments
+ * at each call site) for two jobs racing on the same week — not something
+ * the rest of this file depends on for correctness. Interactive transactions
+ * ($transaction) need a stable DB session, which a connection pooler running
+ * in "transaction mode" (PgBouncer, Supabase's pooler on port 6543, Neon's
+ * pooler, etc.) does NOT reliably provide — that combination is a common,
+ * known source of "Unable to start a transaction in the given time" even
+ * when the database itself is perfectly healthy. If DATABASE_URL points at
+ * a pooled connection, consider using a direct (non-pooled) connection
+ * string for this app, or Prisma's `directUrl` datasource option.
+ *
+ * A raised maxWait/timeout gives a merely-busy pool more room before giving
+ * up; the try/catch means that even a hard failure (pooler incompatibility,
+ * DB briefly unreachable, whatever) degrades to "proceed without the lock"
+ * instead of failing the whole upload/reassign/optimize call.
+ */
+const tryAcquireWeekAreaLock = async (weekStartDate, areaKey) => {
+  try {
+    await prisma.$transaction(
+      (tx) => acquireWeekAreaLock(tx, weekStartDate, areaKey),
+      { maxWait: 10000, timeout: 10000 },
+    );
+  } catch (lockError) {
+    console.warn(
+      `[weeklySchedule] Skipping week/area lock (continuing without it): ${lockError.message}`,
+    );
+  }
 };
 
 // ---------- Bulk upload (XLSX) helpers ----------
@@ -212,11 +319,22 @@ const HEADER_ALIASES = {
   "vehicle entity": "vehicleEntityName", // distinct from the employee's own "Entity" column below
   "vehicle reg": "vehicleReg",
   "vehicle registration": "vehicleReg",
+  // Plain "Vehicle" (as opposed to "Vehicle Type") is the sheet's vehicle
+  // registration/number column on some templates (e.g. "IBEX Global INT").
+  // If your sheets actually use bare "Vehicle" to mean vehicle TYPE instead,
+  // swap this to "vehicleType".
+  vehicle: "vehicleReg",
   drivers: "drivers",
   "employee id": "employeeCode",
   "user name": "name",
   "off day": "offDay",
   campaign: "campaign",
+  // No dedicated "batch" field on WeeklySchedule/Employee. Kept as its own
+  // column key (not merged into "campaign" at the alias level, so a sheet
+  // that has BOTH columns doesn't have one silently overwrite the other)
+  // — see the `campaign = get("campaign") || get("batch")` fallback where
+  // it's actually used, a few lines below in processBulkUploadJob.
+  batch: "batch",
   entity: "entity",
   "shift timings": "shiftTiming",
   // NOTE: despite the name, "Office Ar(r)ival Time" is the employee's PICK-UP
@@ -238,7 +356,10 @@ const HEADER_ALIASES = {
  * codes like "NASTP" that sometimes end up in this column) is ignored.
  */
 const parseOffDays = (offDayRaw) => {
-  const tokens = String(offDayRaw || "").toUpperCase().match(/SUN|MON|TUE|WED|THU|FRI|SAT/g) || [];
+  const tokens =
+    String(offDayRaw || "")
+      .toUpperCase()
+      .match(/SUN|MON|TUE|WED|THU|FRI|SAT/g) || [];
   return new Set(tokens.map((t) => DAY_ABBR_MAP[t]));
 };
 
@@ -250,8 +371,12 @@ const parseOffDays = (offDayRaw) => {
  * match your actual ServiceType enum in schema.prisma before relying on this.
  */
 const deriveServiceType = (officeArrivalTime, dropTime) => {
-  const arrival = String(officeArrivalTime || "").trim().toLowerCase();
-  const drop = String(dropTime || "").trim().toLowerCase();
+  const arrival = String(officeArrivalTime || "")
+    .trim()
+    .toLowerCase();
+  const drop = String(dropTime || "")
+    .trim()
+    .toLowerCase();
   if (arrival.includes("drop")) return "DROP_ONLY";
   if (drop.includes("pick")) return "PICK_ONLY";
   return "PICK_AND_DROP";
@@ -286,21 +411,45 @@ const parseDriverEntries = (raw) => {
 // so we take the first parsed driver as the primary driver for the row.
 const parseDriverEntry = (raw) => parseDriverEntries(raw)[0] || null;
 
-const findOrCreateDriver = async (name, phone) => {
+// `cache` is an OPTIONAL Map<lowercasedName, driver> shared across every row
+// of a single bulk-upload job. Sheets routinely repeat the same handful of
+// drivers hundreds of times — without this cache every one of those rows
+// pays a full DB round trip just to re-look-up a driver we already fetched
+// two rows ago. This is the single biggest contributor to "upload takes
+// forever": ~20+ sequential DB calls per row, most of them re-fetching data
+// that hasn't changed since the last row.
+const findOrCreateDriver = async (name, phone, cache, extraCaches) => {
   if (!name) return { driver: null, created: false };
+  const key = name.trim().toLowerCase();
+  if (cache?.has(key)) return { driver: cache.get(key), created: false };
+
   let driver = await prisma.driver.findFirst({
     where: { name: { equals: name, mode: "insensitive" } },
   });
-  if (driver) return { driver, created: false };
-
-  driver = await prisma.driver.create({
-    data: {
-      name,
-      contactNumber: phone || undefined,
-      status: "AVAILABLE",
-    },
-  });
-  return { driver, created: true };
+  let created = false;
+  if (!driver) {
+    driver = await prisma.driver.create({
+      data: {
+        name,
+        // FIX: Driver.phone is the schema field (Driver has no
+        // `contactNumber` — that's an Employee field). This was throwing
+        // "Unknown argument `contactNumber`" on every brand-new driver,
+        // which — since this runs inside the row's try/catch — silently
+        // skipped the whole row instead of just failing to save a phone
+        // number.
+        phone: phone || undefined,
+        status: "AVAILABLE",
+      },
+    });
+    created = true;
+    // Keep the job-wide "available drivers" pool warm so a driver created
+    // mid-upload is immediately eligible for auto-assignment on later rows,
+    // without re-querying the DB for the whole pool.
+    extraCaches?.availableDrivers?.push({ ...driver, vehicle: null });
+  }
+  extraCaches?.driverById?.set(driver.id, driver);
+  cache?.set(key, driver);
+  return { driver, created };
 };
 
 /**
@@ -309,20 +458,47 @@ const findOrCreateDriver = async (name, phone) => {
  * `prisma.vehicle.count({ where: { status: "ACTIVE" } })`). Adjust field
  * names below if your Vehicle model differs.
  */
-const findOrCreateVehicle = async (vehicleReg) => {
+const findOrCreateVehicle = async (vehicleReg, cache, extraCaches) => {
   if (!vehicleReg) return { vehicle: null, created: false };
+  const key = vehicleReg.trim().toUpperCase();
+  if (cache?.has(key)) return { vehicle: cache.get(key), created: false };
+
   let vehicle = await prisma.vehicle.findFirst({
     where: { vehicleNumber: { equals: vehicleReg, mode: "insensitive" } },
   });
-  if (vehicle) return { vehicle, created: false };
-
-  vehicle = await prisma.vehicle.create({
-    data: { vehicleNumber: vehicleReg, status: "ACTIVE" },
-  });
-  return { vehicle, created: true };
+  let created = false;
+  if (!vehicle) {
+    vehicle = await prisma.vehicle.create({
+      data: { vehicleNumber: vehicleReg, status: "ACTIVE" },
+    });
+    created = true;
+    // Same idea as findOrCreateDriver's availableDrivers push: keep the
+    // job-wide "active vehicles" pool warm so a vehicle created mid-upload
+    // is immediately eligible for auto-assignment on later rows.
+    extraCaches?.activeVehicles?.push(vehicle);
+  }
+  cache?.set(key, vehicle);
+  return { vehicle, created };
 };
 
 const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
+
+/**
+ * Normalizes a raw vehicle-type cell into one of VEHICLE_TYPES' keys.
+ * Source sheets are inconsistent — "Hi jet", "Hi jet " (space in the
+ * middle), "HiJet", even "Hi jet/ Van " (two types jammed together) all
+ * show up for what should be the single type HIJET. A plain
+ * .trim().toUpperCase() only fixes case/edge-whitespace, so "Hi jet"
+ * becomes "HI JET" (with an internal space) and never matches "HIJET" —
+ * silently breaking type-based vehicle matching and capacity guessing for
+ * every "Hi jet" row. This strips ALL whitespace before comparing, and for
+ * combo values ("Hi jet/ Van") takes the first recognized type.
+ */
+const normalizeVehicleType = (raw) => {
+  const str = String(raw || "").toUpperCase();
+  const parts = str.split(/[\/,]/).map((p) => p.replace(/\s+/g, ""));
+  return parts.find((p) => VEHICLE_TYPES.has(p)) || parts[0] || "";
+};
 
 /**
  * Is this driver already committed to something that ACTUALLY OVERLAPS this
@@ -349,27 +525,44 @@ const findDriverConflict = async (
   weekStartDate,
   candidateShiftTiming,
   targetTripId,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
   if (!driverId) return null;
-  const others = await prisma.weeklySchedule.findMany({
-    where: {
-      driverId,
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-    include: { route: true },
-  });
+  const others = caches?.weekRoster
+    ? filterRoster(caches.weekRoster, {
+        driverId,
+        excludeTripId: targetTripId,
+        excludeEmployeeId,
+      })
+    : await prisma.weeklySchedule.findMany({
+        where: {
+          driverId,
+          weekStart: weekStartDate,
+          status: { not: "CANCELLED" },
+          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
+          ...(excludeEmployeeId
+            ? { employeeId: { not: excludeEmployeeId } }
+            : {}),
+        },
+        include: { route: true },
+      });
 
-  const candidateRange = candidateShiftTiming ? parseShiftRange(candidateShiftTiming) : null;
+  const candidateRange = candidateShiftTiming
+    ? parseShiftRange(candidateShiftTiming)
+    : null;
 
   for (const other of others) {
     if (!candidateShiftTiming || !other.shiftTiming) return other; // can't prove no overlap
-    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming)) return other;
+    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming))
+      return other;
     const otherRange = parseShiftRange(other.shiftTiming);
-    if (candidateRange && otherRange && !hasMinimumRest(candidateRange, otherRange)) return other;
+    if (
+      candidateRange &&
+      otherRange &&
+      !hasMinimumRest(candidateRange, otherRange)
+    )
+      return other;
   }
   return null;
 };
@@ -380,23 +573,33 @@ const findVehicleConflict = async (
   weekStartDate,
   candidateShiftTiming,
   targetTripId,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
   if (!vehicleId) return null;
-  const others = await prisma.weeklySchedule.findMany({
-    where: {
-      vehicleId,
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-    include: { route: true },
-  });
+  const others = caches?.weekRoster
+    ? filterRoster(caches.weekRoster, {
+        vehicleId,
+        excludeTripId: targetTripId,
+        excludeEmployeeId,
+      })
+    : await prisma.weeklySchedule.findMany({
+        where: {
+          vehicleId,
+          weekStart: weekStartDate,
+          status: { not: "CANCELLED" },
+          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
+          ...(excludeEmployeeId
+            ? { employeeId: { not: excludeEmployeeId } }
+            : {}),
+        },
+        include: { route: true },
+      });
 
   for (const other of others) {
     if (!candidateShiftTiming || !other.shiftTiming) return other;
-    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming)) return other;
+    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming))
+      return other;
     // Vehicles don't need rest time the way drivers do — overlap alone is
     // the disqualifying condition (a van can go straight from one run into
     // the next), so no hasMinimumRest check here.
@@ -415,19 +618,34 @@ const findVehicleConflict = async (
  * unrelated evening shift, artificially starving the "available" list and
  * pushing more rows than necessary into "no driver found."
  */
-const findBestAvailableDriver = async (weekStartDate, candidateShiftTiming, targetTripId, excludeEmployeeId) => {
-  const others = await prisma.weeklySchedule.findMany({
-    where: {
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      driverId: { not: null },
-      ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-    select: { driverId: true, shiftTiming: true },
-  });
+const findBestAvailableDriver = async (
+  weekStartDate,
+  candidateShiftTiming,
+  targetTripId,
+  excludeEmployeeId,
+  caches,
+) => {
+  const others = caches?.weekRoster
+    ? filterRoster(caches.weekRoster, {
+        excludeTripId: targetTripId,
+        excludeEmployeeId,
+      }).filter((r) => r.driverId)
+    : await prisma.weeklySchedule.findMany({
+        where: {
+          weekStart: weekStartDate,
+          status: { not: "CANCELLED" },
+          driverId: { not: null },
+          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
+          ...(excludeEmployeeId
+            ? { employeeId: { not: excludeEmployeeId } }
+            : {}),
+        },
+        select: { driverId: true, shiftTiming: true },
+      });
 
-  const candidateRange = candidateShiftTiming ? parseShiftRange(candidateShiftTiming) : null;
+  const candidateRange = candidateShiftTiming
+    ? parseShiftRange(candidateShiftTiming)
+    : null;
   const busyIds = new Set();
   const loadMap = new Map();
   for (const row of others) {
@@ -441,19 +659,25 @@ const findBestAvailableDriver = async (weekStartDate, candidateShiftTiming, targ
       continue;
     }
     const otherRange = parseShiftRange(row.shiftTiming);
-    if (candidateRange && otherRange && !hasMinimumRest(candidateRange, otherRange)) {
+    if (
+      candidateRange &&
+      otherRange &&
+      !hasMinimumRest(candidateRange, otherRange)
+    ) {
       busyIds.add(row.driverId);
     }
   }
 
-  const eligible = await prisma.driver.findMany({
-    where: {
-      status: "AVAILABLE",
-      ...(busyIds.size ? { id: { notIn: Array.from(busyIds) } } : {}),
-    },
-    include: { vehicle: true },
-    orderBy: { createdAt: "asc" },
-  });
+  const eligible = caches?.availableDrivers
+    ? caches.availableDrivers.filter((d) => !busyIds.size || !busyIds.has(d.id))
+    : await prisma.driver.findMany({
+        where: {
+          status: "AVAILABLE",
+          ...(busyIds.size ? { id: { notIn: Array.from(busyIds) } } : {}),
+        },
+        include: { vehicle: true },
+        orderBy: { createdAt: "asc" },
+      });
   if (!eligible.length) return null;
   if (eligible.length === 1) return eligible[0];
 
@@ -487,23 +711,56 @@ const findBestAvailableVehicle = async (
   targetTripId,
   minCapacity,
   vehicleTypeHint,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
-  const others = await prisma.weeklySchedule.findMany({
-    where: {
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      vehicleId: { not: null },
-      ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-    select: { vehicleId: true, shiftTiming: true },
-  });
+  const others = caches?.weekRoster
+    ? filterRoster(caches.weekRoster, {
+        excludeTripId: targetTripId,
+        excludeEmployeeId,
+      }).filter((r) => r.vehicleId)
+    : await prisma.weeklySchedule.findMany({
+        where: {
+          weekStart: weekStartDate,
+          status: { not: "CANCELLED" },
+          vehicleId: { not: null },
+          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
+          ...(excludeEmployeeId
+            ? { employeeId: { not: excludeEmployeeId } }
+            : {}),
+        },
+        select: { vehicleId: true, shiftTiming: true },
+      });
   const busyIds = [];
   for (const row of others) {
-    if (!candidateShiftTiming || !row.shiftTiming || shiftTimesOverlap(candidateShiftTiming, row.shiftTiming)) {
+    if (
+      !candidateShiftTiming ||
+      !row.shiftTiming ||
+      shiftTimesOverlap(candidateShiftTiming, row.shiftTiming)
+    ) {
       busyIds.push(row.vehicleId);
     }
+  }
+
+  const typeKey = normalizeVehicleType(vehicleTypeHint);
+
+  if (caches?.activeVehicles) {
+    // In-memory equivalent of the two DB queries below: filter by
+    // ACTIVE + not-busy + capacity, sorted smallest-capacity-first so a
+    // right-sized vehicle is preferred over an oversized one.
+    const candidates = caches.activeVehicles
+      .filter(
+        (v) =>
+          (!busyIds.length || !busyIds.includes(v.id)) &&
+          (!minCapacity || (v.capacity ?? 0) >= minCapacity),
+      )
+      .sort((a, b) => (a.capacity ?? 0) - (b.capacity ?? 0));
+
+    if (typeKey && VEHICLE_TYPES.has(typeKey)) {
+      const typed = candidates.find((v) => v.type === typeKey);
+      if (typed) return typed;
+    }
+    return candidates[0] || null;
   }
 
   const baseWhere = {
@@ -512,7 +769,6 @@ const findBestAvailableVehicle = async (
     ...(minCapacity ? { capacity: { gte: minCapacity } } : {}),
   };
 
-  const typeKey = String(vehicleTypeHint || "").trim().toUpperCase();
   if (typeKey && VEHICLE_TYPES.has(typeKey)) {
     const typed = await prisma.vehicle.findFirst({
       where: { ...baseWhere, type: typeKey },
@@ -521,7 +777,10 @@ const findBestAvailableVehicle = async (
     if (typed) return typed;
   }
 
-  return prisma.vehicle.findFirst({ where: baseWhere, orderBy: { capacity: "asc" } });
+  return prisma.vehicle.findFirst({
+    where: baseWhere,
+    orderBy: { capacity: "asc" },
+  });
 };
 
 /**
@@ -536,14 +795,31 @@ const autoAssignDriverAndVehicle = async (
   targetTripId,
   minCapacity,
   vehicleTypeHint,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
-  const driver = await findBestAvailableDriver(weekStartDate, candidateShiftTiming, targetTripId, excludeEmployeeId);
+  const driver = await findBestAvailableDriver(
+    weekStartDate,
+    candidateShiftTiming,
+    targetTripId,
+    excludeEmployeeId,
+    caches,
+  );
   if (!driver) return { driverId: undefined, vehicleId: undefined };
 
-  let vehicle = driver.vehicle && driver.vehicle.status === "ACTIVE" ? driver.vehicle : null;
+  let vehicle =
+    driver.vehicle && driver.vehicle.status === "ACTIVE"
+      ? driver.vehicle
+      : null;
   if (vehicle) {
-    const conflict = await findVehicleConflict(vehicle.id, weekStartDate, candidateShiftTiming, targetTripId, excludeEmployeeId);
+    const conflict = await findVehicleConflict(
+      vehicle.id,
+      weekStartDate,
+      candidateShiftTiming,
+      targetTripId,
+      excludeEmployeeId,
+      caches,
+    );
     if (conflict) vehicle = null;
   }
   if (!vehicle) {
@@ -553,7 +829,8 @@ const autoAssignDriverAndVehicle = async (
       targetTripId,
       minCapacity,
       vehicleTypeHint,
-      excludeEmployeeId
+      excludeEmployeeId,
+      caches,
     );
   }
 
@@ -589,19 +866,28 @@ const resolveConflictFreeAssignment = async ({
   vehicleTypeHint,
   minCapacity,
   excludeEmployeeId,
+  caches,
 }) => {
   const notes = [];
   let driverId = proposedDriverId;
   let vehicleId = proposedVehicleId;
   let autoAssignedDriver = false;
   let autoAssignedVehicle = false;
-  const shiftTiming = candidateShiftTiming || trip.shiftTiming || trip.route?.shiftTiming;
+  const shiftTiming =
+    candidateShiftTiming || trip.shiftTiming || trip.route?.shiftTiming;
 
   if (driverId) {
-    const conflict = await findDriverConflict(driverId, weekStartDate, shiftTiming, trip.id, excludeEmployeeId);
+    const conflict = await findDriverConflict(
+      driverId,
+      weekStartDate,
+      shiftTiming,
+      trip.id,
+      excludeEmployeeId,
+      caches,
+    );
     if (conflict) {
       notes.push(
-        `Requested driver's shift overlaps (or doesn't leave enough rest around) route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available driver instead.`
+        `Requested driver's shift overlaps (or doesn't leave enough rest around) route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available driver instead.`,
       );
       driverId = undefined;
     }
@@ -614,19 +900,29 @@ const resolveConflictFreeAssignment = async ({
       weekStartDate,
       shiftTiming,
       undefined,
-      excludeEmployeeId
+      excludeEmployeeId,
+      caches,
     );
     if (!hoursCheck.ok) {
-      notes.push(`Requested driver was skipped — ${hoursCheck.reason} Auto-assigned a different available driver instead.`);
+      notes.push(
+        `Requested driver was skipped — ${hoursCheck.reason} Auto-assigned a different available driver instead.`,
+      );
       driverId = undefined;
     }
   }
 
   if (vehicleId) {
-    const conflict = await findVehicleConflict(vehicleId, weekStartDate, shiftTiming, trip.id, excludeEmployeeId);
+    const conflict = await findVehicleConflict(
+      vehicleId,
+      weekStartDate,
+      shiftTiming,
+      trip.id,
+      excludeEmployeeId,
+      caches,
+    );
     if (conflict) {
       notes.push(
-        `Requested vehicle's shift overlaps route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available vehicle instead.`
+        `Requested vehicle's shift overlaps route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available vehicle instead.`,
       );
       vehicleId = undefined;
     }
@@ -641,7 +937,8 @@ const resolveConflictFreeAssignment = async ({
       trip.id,
       capacityFloor,
       vehicleTypeHint,
-      excludeEmployeeId
+      excludeEmployeeId,
+      caches,
     );
     if (best.driverId) {
       driverId = best.driverId;
@@ -651,7 +948,9 @@ const resolveConflictFreeAssignment = async ({
         autoAssignedVehicle = true;
       }
     } else {
-      notes.push("No available (conflict-free) driver found for this row — left unassigned; assign manually.");
+      notes.push(
+        "No available (conflict-free) driver found for this row — left unassigned; assign manually.",
+      );
     }
   }
 
@@ -662,17 +961,23 @@ const resolveConflictFreeAssignment = async ({
       trip.id,
       capacityFloor,
       vehicleTypeHint,
-      excludeEmployeeId
+      excludeEmployeeId,
+      caches,
     );
     if (vehicle) {
       vehicleId = vehicle.id;
       autoAssignedVehicle = true;
     } else {
-      notes.push("No available (conflict-free) vehicle found for this row — left unassigned; assign manually.");
+      notes.push(
+        "No available (conflict-free) vehicle found for this row — left unassigned; assign manually.",
+      );
     }
   }
 
-  if (driverId !== (trip.driverId || undefined) || vehicleId !== (trip.vehicleId || undefined)) {
+  if (
+    driverId !== (trip.driverId || undefined) ||
+    vehicleId !== (trip.vehicleId || undefined)
+  ) {
     await prisma.trip.update({
       where: { id: trip.id },
       data: {
@@ -680,24 +985,59 @@ const resolveConflictFreeAssignment = async ({
         vehicleId: vehicleId || null,
       },
     });
-    await syncRouteFromTrips(trip.routeId);
+    await syncRouteFromTrips(trip.routeId, caches);
+    // The trip we just patched, and the route's cached trip list, are now
+    // both stale — drop the cached list for this route so the NEXT row
+    // that resolves a trip on it re-reads real data instead of acting on
+    // driver/vehicle info from before this reassignment.
+    caches?.tripsByRoute?.delete(trip.routeId);
   }
 
-  return { driverId, vehicleId, autoAssignedDriver, autoAssignedVehicle, notes };
+  return {
+    driverId,
+    vehicleId,
+    autoAssignedDriver,
+    autoAssignedVehicle,
+    notes,
+  };
 };
 
 /**
  * NOTE: assumes Vendor has a `name` field. Adjust if different.
  */
-const findOrCreateVendor = async (name) => {
+const findOrCreateVendor = async (name, cache) => {
   if (!name) return { vendor: null, created: false };
+  const key = name.trim().toLowerCase();
+  if (cache?.has(key)) return { vendor: cache.get(key), created: false };
+
   let vendor = await prisma.vendor.findFirst({
     where: { name: { equals: name, mode: "insensitive" } },
   });
-  if (vendor) return { vendor, created: false };
+  let created = false;
+  if (!vendor) {
+    vendor = await prisma.vendor.create({ data: { name } });
+    created = true;
+  }
+  cache?.set(key, vendor);
+  return { vendor, created };
+};
 
-  vendor = await prisma.vendor.create({ data: { name } });
-  return { vendor, created: true };
+// Used by findOrCreateEmployee and findOrCreateRouteAndTrip, which look up
+// "Area" by name, so the same area is only ever fetched/created once per
+// upload job instead of once per row.
+const findOrCreateArea = async (name, cache) => {
+  if (!name) return null;
+  const key = name.trim().toLowerCase();
+  if (cache?.has(key)) return cache.get(key);
+
+  let area = await prisma.area.findFirst({
+    where: { name: { equals: name, mode: "insensitive" } },
+  });
+  if (!area) {
+    area = await prisma.area.create({ data: { name } });
+  }
+  cache?.set(key, area);
+  return area;
 };
 
 /**
@@ -706,21 +1046,23 @@ const findOrCreateVendor = async (name) => {
  * used elsewhere in this file (getScheduleTableGroupedByArea). Adjust field
  * names below if your Employee model differs.
  */
-const findOrCreateEmployee = async (row) => {
+const findOrCreateEmployee = async (row, caches) => {
+  if (caches?.employee?.has(row.employeeCode)) {
+    return { employee: caches.employee.get(row.employeeCode), created: false };
+  }
+
   let employee = await prisma.employee.findUnique({
     where: { employeeCode: row.employeeCode },
   });
-  if (employee) return { employee, created: false };
+  if (employee) {
+    caches?.employee?.set(row.employeeCode, employee);
+    return { employee, created: false };
+  }
 
   let areaId;
   if (row.area) {
-    let area = await prisma.area.findFirst({
-      where: { name: { equals: row.area, mode: "insensitive" } },
-    });
-    if (!area) {
-      area = await prisma.area.create({ data: { name: row.area } });
-    }
-    areaId = area.id;
+    const area = await findOrCreateArea(row.area, caches?.area);
+    areaId = area?.id;
   }
 
   employee = await prisma.employee.create({
@@ -734,6 +1076,7 @@ const findOrCreateEmployee = async (row) => {
       status: "ACTIVE",
     },
   });
+  caches?.employee?.set(row.employeeCode, employee);
   return { employee, created: true };
 };
 
@@ -765,7 +1108,7 @@ const DEFAULT_CAPACITY_BY_VEHICLE_TYPE = {
 const FALLBACK_ROUTE_CAPACITY = 10;
 
 const guessMaxCapacity = (vehicleTypeRaw) => {
-  const key = String(vehicleTypeRaw || "").trim().toUpperCase();
+  const key = normalizeVehicleType(vehicleTypeRaw);
   return DEFAULT_CAPACITY_BY_VEHICLE_TYPE[key] || FALLBACK_ROUTE_CAPACITY;
 };
 
@@ -812,23 +1155,59 @@ const generateUniqueRouteCode = async (baseCode) => {
  * elsewhere in the app. Call this any time a trip on the route is created,
  * or its driver/vehicle changes.
  */
-const syncRouteFromTrips = async (routeId) => {
-  const trips = await prisma.trip.findMany({
-    where: { routeId, status: { not: "CANCELLED" } },
-    include: { vehicle: true },
-    orderBy: { tripNumber: "asc" },
-  });
+const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
+  // FIX: Trip.status uses the RouteStatus enum (ACTIVE | INACTIVE only —
+  // see schema.prisma). "CANCELLED" is not a member of that enum, so this
+  // filter previously made every call throw a PrismaClientValidationError
+  // ("Invalid value for argument `status`"). Since syncRouteFromTrips runs
+  // after every trip create/update, that exception propagated straight up
+  // through findOrCreateTripOnRoute -> findOrCreateRouteAndTrip and was
+  // caught by bulk upload's per-row try/catch as "Route/Trip creation
+  // failed" — meaning EVERY row's route/trip step was failing, not just
+  // capacity-overflow ones. "Not cancelled" for a Trip means status ACTIVE.
+  //
+  // FIX (perf): this used to unconditionally re-query every ACTIVE trip on
+  // the route AND write route.update, on every single call — and it was
+  // being called on EVERY bulk-upload row (see findOrCreateTripOnRoute),
+  // even rows that reused an already-correct trip with nothing to sync.
+  // `tripsHint` lets a caller that already has the route's trips in memory
+  // (bulk upload's caches.tripsByRoute) skip the re-fetch, and the write
+  // itself is now skipped when the computed values match what's already
+  // cached — a route that's already in sync no longer costs a DB round
+  // trip just because another row happened to touch it.
+  const trips =
+    tripsHint ||
+    (await prisma.trip.findMany({
+      where: { routeId, status: "ACTIVE" },
+      include: { vehicle: true },
+      orderBy: { tripNumber: "asc" },
+    }));
   const totalCapacity = trips.reduce(
     (sum, t) => sum + (t.vehicle?.capacity ?? FALLBACK_ROUTE_CAPACITY),
-    0
+    0,
   );
-  await prisma.route.update({
+  const newMaxCapacity = totalCapacity || FALLBACK_ROUTE_CAPACITY;
+  const newDriverId = trips[0]?.driverId || null;
+
+  const cachedRoute = caches?.routeById?.get(routeId);
+  if (
+    cachedRoute &&
+    cachedRoute.maxCapacity === newMaxCapacity &&
+    cachedRoute.driverId === newDriverId
+  ) {
+    return cachedRoute;
+  }
+
+  const updated = await prisma.route.update({
     where: { id: routeId },
     data: {
-      maxCapacity: totalCapacity || FALLBACK_ROUTE_CAPACITY,
-      driverId: trips[0]?.driverId || null,
+      maxCapacity: newMaxCapacity,
+      driverId: newDriverId,
     },
+    include: { area: true, driver: true },
   });
+  caches?.routeById?.set(routeId, updated);
+  return updated;
 };
 
 /**
@@ -863,32 +1242,41 @@ const findOrCreateRouteAndTrip = async (
   driverId,
   vehicleIdHint,
   weekStartDate,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
   let areaRecord = null;
   if (areaName) {
-    areaRecord = await prisma.area.findFirst({
-      where: { name: { equals: areaName, mode: "insensitive" } },
-    });
-    if (!areaRecord) {
-      areaRecord = await prisma.area.create({ data: { name: areaName } });
-    }
+    areaRecord = await findOrCreateArea(areaName, caches?.area);
   }
 
   let route = null;
   if (areaRecord) {
-    const candidates = await prisma.route.findMany({
-      where: { areaId: areaRecord.id },
-      include: { area: true },
-      orderBy: { routeCode: "asc" },
-    });
+    // Routes-per-area are also cached per job: once we've loaded a given
+    // area's routes we reuse that list rather than re-querying it for
+    // every row that shares the area (very common — a sheet's rows are
+    // usually clustered by area/shift). The cache is invalidated (deleted)
+    // whenever this job creates or mutates a route/trip in that area, so
+    // capacity/overflow decisions never read stale data.
+    let candidates = caches?.routesByArea?.get(areaRecord.id);
+    if (!candidates) {
+      candidates = await prisma.route.findMany({
+        where: { areaId: areaRecord.id },
+        include: { area: true },
+        orderBy: { routeCode: "asc" },
+      });
+      caches?.routesByArea?.set(areaRecord.id, candidates);
+    }
     if (shiftTiming) {
       const shiftLower = shiftTiming.trim().toLowerCase();
       route =
         candidates.find(
           (r) =>
-            (r.shiftTiming && r.shiftTiming.trim().toLowerCase() === shiftLower) ||
-            String(r.routeName || "").toLowerCase().includes(shiftLower)
+            (r.shiftTiming &&
+              r.shiftTiming.trim().toLowerCase() === shiftLower) ||
+            String(r.routeName || "")
+              .toLowerCase()
+              .includes(shiftLower),
         ) || null;
     } else {
       route = candidates[0] || null;
@@ -898,7 +1286,9 @@ const findOrCreateRouteAndTrip = async (
   let routeCreated = false;
   if (!route) {
     const baseName =
-      [areaName, vehicleType, shiftTiming].filter(Boolean).join(" - ") || campaign || "General Route";
+      [areaName, vehicleType, shiftTiming].filter(Boolean).join(" - ") ||
+      campaign ||
+      "General Route";
     const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
     const routeCode = await generateUniqueRouteCode(baseCode);
     route = await prisma.route.create({
@@ -912,6 +1302,10 @@ const findOrCreateRouteAndTrip = async (
       include: { area: true },
     });
     routeCreated = true;
+    // Invalidate the cached route list for this area so the NEXT row that
+    // needs this area (very likely, later in the same sheet) sees the route
+    // we just created instead of an empty/stale list from before it existed.
+    if (areaRecord) caches?.routesByArea?.delete(areaRecord.id);
   }
 
   const { trip, newTrip } = await findOrCreateTripOnRoute(
@@ -921,10 +1315,17 @@ const findOrCreateRouteAndTrip = async (
     driverId,
     vehicleIdHint,
     weekStartDate,
-    excludeEmployeeId
+    excludeEmployeeId,
+    caches,
   );
 
-  route = await prisma.route.findUnique({ where: { id: route.id }, include: { area: true, driver: true } });
+  // FIX (perf): this used to unconditionally re-fetch the route from the
+  // DB on EVERY row just to attach area/driver — one more guaranteed round
+  // trip per row on top of everything above. syncRouteFromTrips (inside
+  // findOrCreateTripOnRoute) already writes the freshest copy into
+  // caches.routeById whenever it actually changes anything; reuse that
+  // instead of asking the DB again for data we very likely already have.
+  route = caches?.routeById?.get(route.id) || route;
 
   return { route, trip, created: routeCreated, newTrip };
 };
@@ -944,51 +1345,140 @@ const findOrCreateTripOnRoute = async (
   driverId,
   vehicleIdHint,
   weekStartDate,
-  excludeEmployeeId
+  excludeEmployeeId,
+  caches,
 ) => {
-  const trips = await prisma.trip.findMany({
-    where: { routeId: route.id, status: { not: "CANCELLED" } },
-    include: { vehicle: true },
-    orderBy: { tripNumber: "asc" },
-  });
+  // FIX (perf — this is the main reason bulk upload was taking forever /
+  // never finishing on real-size workbooks): this used to run
+  // `prisma.trip.findMany` fresh on EVERY row, and then — worse — ran a
+  // separate `prisma.weeklySchedule.count` (countTripOccupancy) for EVERY
+  // candidate trip on the route, on EVERY row, even though rows are
+  // normally clustered by area/shift and hit the exact same handful of
+  // routes/trips hundreds of times over. On a route with 2-3 trips that
+  // alone was 3-4 extra DB round trips per row, on top of everything else.
+  // The job already preloads the whole week's live roster into
+  // caches.weekRoster up front specifically so per-row checks like this
+  // don't need to hit the DB (see the big comment in processBulkUploadJob
+  // and how checkDriverWorkingHours/findDriverConflict/etc. already use
+  // it) — this just brings trip lookup and occupancy counting in line with
+  // that same pattern instead of being the one place still doing it the
+  // slow way.
+  let trips = caches?.tripsByRoute?.get(route.id);
+  if (!trips) {
+    // FIX: same invalid-enum issue as syncRouteFromTrips below — Trip.status
+    // is RouteStatus (ACTIVE | INACTIVE), not "CANCELLED".
+    trips = await prisma.trip.findMany({
+      where: { routeId: route.id, status: "ACTIVE" },
+      include: { vehicle: true },
+      orderBy: { tripNumber: "asc" },
+    });
+    caches?.tripsByRoute?.set(route.id, trips);
+  }
+  const hadExistingTrips = trips.length > 0;
 
   let trip = null;
   for (const candidate of trips) {
-    const capacity = candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
-    const occupancy = await countTripOccupancy(candidate.id, weekStartDate, excludeEmployeeId);
+    const capacity =
+      candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
+    const occupancy = caches?.weekRoster
+      ? caches.weekRoster.filter(
+          (r) =>
+            r.tripId === candidate.id &&
+            (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
+        ).length
+      : await countTripOccupancy(candidate.id, weekStartDate, excludeEmployeeId);
     const hasRoom = occupancy < capacity;
-    const driverOk = !driverId || !candidate.driverId || candidate.driverId === driverId;
+    const driverOk =
+      !driverId || !candidate.driverId || candidate.driverId === driverId;
     if (hasRoom && driverOk) {
       trip = candidate;
       break;
     }
   }
 
+  // FIX (real-world bug): previously this attached `driverId`/`vehicleIdHint`
+  // straight onto a brand-new trip (or patched them onto an existing one)
+  // with NO conflict check at all — a driver already booked on a DIFFERENT
+  // route at an overlapping time this week would get written here first,
+  // and only get silently corrected afterward by resolveConflictFreeAssignment
+  // (which then has to issue a second `trip.update` to undo it). That's a
+  // real window where "same driver, same timing, two routes" gets persisted,
+  // even if briefly. Checking BEFORE the write means a conflicting
+  // driver/vehicle is never attached to a trip in the first place — if
+  // there's a conflict we just leave it off this trip and let
+  // resolveConflictFreeAssignment (the single source of truth for
+  // conflict-free auto-assignment) pick a real replacement, instead of
+  // handing it something to undo.
+  let safeDriverId = driverId || undefined;
+  if (safeDriverId) {
+    const driverConflict = await findDriverConflict(
+      safeDriverId,
+      weekStartDate,
+      shiftTiming,
+      trip?.id, // exclude the trip we're about to reuse, if any
+      excludeEmployeeId,
+      caches,
+    );
+    if (driverConflict) safeDriverId = undefined;
+  }
+  let safeVehicleId = vehicleIdHint || undefined;
+  if (safeVehicleId) {
+    const vehicleConflict = await findVehicleConflict(
+      safeVehicleId,
+      weekStartDate,
+      shiftTiming,
+      trip?.id,
+      excludeEmployeeId,
+      caches,
+    );
+    if (vehicleConflict) safeVehicleId = undefined;
+  }
+
   let tripCreated = false;
+  let tripChanged = false;
   if (!trip) {
-    const nextTripNumber = trips.length ? Math.max(...trips.map((t) => t.tripNumber)) + 1 : 1;
+    const nextTripNumber = trips.length
+      ? Math.max(...trips.map((t) => t.tripNumber)) + 1
+      : 1;
     trip = await prisma.trip.create({
       data: {
         routeId: route.id,
         tripNumber: nextTripNumber,
-        driverId: driverId || undefined,
-        vehicleId: vehicleIdHint || undefined,
+        driverId: safeDriverId,
+        vehicleId: safeVehicleId,
         shiftTiming: shiftTiming || undefined,
       },
       include: { vehicle: true },
     });
     tripCreated = true;
+    tripChanged = true;
+    // Keep the cached list current so the NEXT row that hits this route
+    // sees the trip we just created instead of re-fetching or missing it.
+    trips.push(trip);
   } else {
     const patch = {};
-    if (driverId && !trip.driverId) patch.driverId = driverId;
-    if (vehicleIdHint && !trip.vehicleId) patch.vehicleId = vehicleIdHint;
+    if (safeDriverId && !trip.driverId) patch.driverId = safeDriverId;
+    if (safeVehicleId && !trip.vehicleId) patch.vehicleId = safeVehicleId;
     if (Object.keys(patch).length) {
-      trip = await prisma.trip.update({ where: { id: trip.id }, data: patch, include: { vehicle: true } });
+      trip = await prisma.trip.update({
+        where: { id: trip.id },
+        data: patch,
+        include: { vehicle: true },
+      });
+      tripChanged = true;
+      const idx = trips.findIndex((t) => t.id === trip.id);
+      if (idx !== -1) trips[idx] = trip;
     }
   }
 
-  await syncRouteFromTrips(route.id);
-  return { trip, newTrip: tripCreated && trips.length > 0 };
+  // FIX (perf): previously ran unconditionally on EVERY row (a
+  // trip.findMany + a route.update), even when this row reused an
+  // existing trip with no driver/vehicle/capacity change at all. Only
+  // worth doing when something about this route's trips actually changed.
+  if (tripChanged) {
+    await syncRouteFromTrips(route.id, caches, trips);
+  }
+  return { trip, newTrip: tripCreated && hadExistingTrips };
 };
 
 // ---------- Bulk reassign: shift-mismatched employees, one click ----------
@@ -1017,11 +1507,19 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
   try {
     const { routeId, routeCode, weekStart } = req.body;
     if ((!routeId && !routeCode) || !weekStart) {
-      const response = badRequestResponse("routeId or routeCode, plus weekStart, are required.");
+      const response = badRequestResponse(
+        "routeId or routeCode, plus weekStart, are required.",
+      );
       return res.status(response.status.code).json(response);
     }
 
     const weekStartDate = toDateOnly(weekStart);
+
+    // See the matching comment in processBulkUploadJob: this narrows, but
+    // doesn't eliminate, the window where this call and a concurrent bulk
+    // upload/optimize for the same week each act on their own stale
+    // snapshot of the roster.
+    await prisma.$transaction((tx) => acquireWeekAreaLock(tx, weekStartDate));
 
     const route = await prisma.route.findUnique({
       where: routeId ? { id: routeId } : { routeCode },
@@ -1038,18 +1536,22 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     // that had nothing to do with this route — corrupting unrelated
     // assignments and creating duplicate/incorrect route legs.
     const schedules = await prisma.weeklySchedule.findMany({
-      where: { routeId: route.id, weekStart: weekStartDate, status: { not: "CANCELLED" } },
+      where: {
+        routeId: route.id,
+        weekStart: weekStartDate,
+        status: { not: "CANCELLED" },
+      },
     });
 
     const routeShiftNorm = normalizeShift(route.shiftTiming);
     const mismatched = schedules.filter(
-      (s) => s.shiftTiming && normalizeShift(s.shiftTiming) !== routeShiftNorm
+      (s) => s.shiftTiming && normalizeShift(s.shiftTiming) !== routeShiftNorm,
     );
 
     if (!mismatched.length) {
       const response = okResponse(
         { updated: 0, routesCreated: 0, legsOpened: 0, details: [] },
-        "No shift-mismatched employees found on this route — nothing to reassign."
+        "No shift-mismatched employees found on this route — nothing to reassign.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -1061,12 +1563,18 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     const groups = new Map();
     mismatched.forEach((s) => {
       const key = normalizeShift(s.shiftTiming);
-      if (!groups.has(key)) groups.set(key, { shiftTiming: s.shiftTiming, entries: [] });
+      if (!groups.has(key))
+        groups.set(key, { shiftTiming: s.shiftTiming, entries: [] });
       groups.get(key).entries.push(s);
     });
 
     const areaName = route.area?.name;
-    const results = { updated: 0, routesCreated: 0, legsOpened: 0, details: [] };
+    const results = {
+      updated: 0,
+      routesCreated: 0,
+      legsOpened: 0,
+      details: [],
+    };
 
     for (const { shiftTiming, entries } of groups.values()) {
       for (const entry of entries) {
@@ -1078,7 +1586,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           entry.driverId || undefined,
           entry.vehicleId || undefined,
           weekStartDate,
-          entry.employeeId
+          entry.employeeId,
         );
 
         if (routeResult.created) results.routesCreated++;
@@ -1109,7 +1617,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 
     const response = okResponse(
       results,
-      `Reassigned ${results.updated} employee(s) off "${route.routeCode}" onto their correct shift's route.`
+      `Reassigned ${results.updated} employee(s) off "${route.routeCode}" onto their correct shift's route.`,
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1134,6 +1642,11 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
  * upload.
  */
 const optimizeWeekAssignments = async (weekStartDate) => {
+  // See the matching comment in processBulkUploadJob: narrows, doesn't
+  // eliminate, the window where this and a concurrent bulk upload/reassign
+  // for the same week each act on their own stale snapshot of the roster.
+  await prisma.$transaction((tx) => acquireWeekAreaLock(tx, weekStartDate));
+
   const schedules = await prisma.weeklySchedule.findMany({
     where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
     include: { route: true, trip: { include: { vehicle: true } } },
@@ -1163,10 +1676,13 @@ const optimizeWeekAssignments = async (weekStartDate) => {
         entry.driverId || undefined,
         entry.vehicleId || undefined,
         weekStartDate,
-        entry.employeeId
+        entry.employeeId,
       );
       trip = backfilled.trip;
-      await prisma.weeklySchedule.update({ where: { id: entry.id }, data: { tripId: trip.id } });
+      await prisma.weeklySchedule.update({
+        where: { id: entry.id },
+        data: { tripId: trip.id },
+      });
       summary.tripsBackfilled++;
     }
 
@@ -1175,11 +1691,23 @@ const optimizeWeekAssignments = async (weekStartDate) => {
     const shiftTiming = entry.shiftTiming || entry.route.shiftTiming;
 
     if (driverId) {
-      const conflict = await findDriverConflict(driverId, weekStartDate, shiftTiming, trip.id, entry.employeeId);
+      const conflict = await findDriverConflict(
+        driverId,
+        weekStartDate,
+        shiftTiming,
+        trip.id,
+        entry.employeeId,
+      );
       if (conflict) driverId = undefined;
     }
     if (vehicleId) {
-      const conflict = await findVehicleConflict(vehicleId, weekStartDate, shiftTiming, trip.id, entry.employeeId);
+      const conflict = await findVehicleConflict(
+        vehicleId,
+        weekStartDate,
+        shiftTiming,
+        trip.id,
+        entry.employeeId,
+      );
       if (conflict) vehicleId = undefined;
     }
 
@@ -1197,13 +1725,22 @@ const optimizeWeekAssignments = async (weekStartDate) => {
       vehicleId = resolved.vehicleId;
     }
 
-    if (driverId !== (entry.driverId || undefined) || vehicleId !== (entry.vehicleId || undefined)) {
+    if (
+      driverId !== (entry.driverId || undefined) ||
+      vehicleId !== (entry.vehicleId || undefined)
+    ) {
       await prisma.weeklySchedule.update({
         where: { id: entry.id },
-        data: { driverId: driverId || null, vehicleId: vehicleId || null, tripId: trip.id },
+        data: {
+          driverId: driverId || null,
+          vehicleId: vehicleId || null,
+          tripId: trip.id,
+        },
       });
-      if (driverId !== (entry.driverId || undefined)) summary.driversReassigned++;
-      if (vehicleId !== (entry.vehicleId || undefined)) summary.vehiclesReassigned++;
+      if (driverId !== (entry.driverId || undefined))
+        summary.driversReassigned++;
+      if (vehicleId !== (entry.vehicleId || undefined))
+        summary.vehiclesReassigned++;
       summary.details.push({
         weeklyScheduleId: entry.id,
         employeeId: entry.employeeId,
@@ -1234,7 +1771,10 @@ const optimizeRouteAssignments = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
     const summary = await optimizeWeekAssignments(toDateOnly(weekStart));
-    const response = okResponse(summary, "Route assignments optimized for the week.");
+    const response = okResponse(
+      summary,
+      "Route assignments optimized for the week.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1268,7 +1808,9 @@ const createWeeklySchedule = async (req, res, next) => {
     } = req.body;
 
     if (!employeeId || !weekStart) {
-      const response = badRequestResponse("employeeId and weekStart are required.");
+      const response = badRequestResponse(
+        "employeeId and weekStart are required.",
+      );
       return res.status(response.status.code).json(response);
     }
 
@@ -1283,7 +1825,7 @@ const createWeeklySchedule = async (req, res, next) => {
 
     if (existingSchedule) {
       const response = badRequestResponse(
-        "Schedule already exists for this employee in this week."
+        "Schedule already exists for this employee in this week.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -1329,7 +1871,15 @@ const createWeeklySchedule = async (req, res, next) => {
 
 const getAllWeeklySchedules = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10, employeeId, status, weekStart, routeId, search } = req.query;
+    const {
+      skip = 0,
+      take = 10,
+      employeeId,
+      status,
+      weekStart,
+      routeId,
+      search,
+    } = req.query;
 
     const where = {};
     if (employeeId) where.employeeId = employeeId;
@@ -1347,11 +1897,15 @@ const getAllWeeklySchedules = async (req, res, next) => {
     if (search) {
       where.OR = [
         { employee: { name: { contains: search, mode: "insensitive" } } },
-        { employee: { employeeCode: { contains: search, mode: "insensitive" } } },
+        {
+          employee: { employeeCode: { contains: search, mode: "insensitive" } },
+        },
         { route: { routeName: { contains: search, mode: "insensitive" } } },
         { route: { routeCode: { contains: search, mode: "insensitive" } } },
         { driver: { name: { contains: search, mode: "insensitive" } } },
-        { vehicle: { vehicleNumber: { contains: search, mode: "insensitive" } } },
+        {
+          vehicle: { vehicleNumber: { contains: search, mode: "insensitive" } },
+        },
       ];
     }
 
@@ -1361,34 +1915,63 @@ const getAllWeeklySchedules = async (req, res, next) => {
       take: parseInt(take),
       include: {
         employee: {
-          select: { id: true, name: true, employeeCode: true },
-        },
-        route: {
           select: {
             id: true,
-            routeName: true,
-            routeCode: true,
+            name: true,
+            employeeCode: true,
+            contactNumber: true,
+          },
+        },
+        // FIX: previously selected only a handful of route fields (no
+        // shiftTiming/serviceType/status/officeLocation), so the list view
+        // had a routeId but nothing to actually display for "Route" beyond
+        // its name/code. Now returns the full route record.
+        route: {
+          include: {
             area: true,
-            driver: { select: { id: true, name: true } },
+            subArea: true,
+            driver: { select: { id: true, name: true, phone: true } },
           },
         },
         // Trip Number / per-trip vehicle so the list view can show which
         // specific vehicle run (not just which route) an employee is on —
         // previously omitted here, so tripId was being written on every row
-        // but never came back out of this endpoint.
+        // but never came back out of this endpoint. Also now returns the
+        // trip's own shiftTiming/status (it can override the route's).
         trip: {
-          select: {
-            id: true,
-            tripNumber: true,
-            vehicle: { select: { id: true, vehicleNumber: true, capacity: true } },
-            driver: { select: { id: true, name: true } },
+          include: {
+            vehicle: {
+              select: {
+                id: true,
+                vehicleNumber: true,
+                type: true,
+                capacity: true,
+                status: true,
+              },
+            },
+            driver: {
+              select: { id: true, name: true, phone: true, status: true },
+            },
           },
         },
+        // Denormalized driver/vehicle directly on the schedule row (see
+        // schema comment on WeeklySchedule.driverId/vehicleId) — kept as a
+        // fallback for rows saved before tripId existed, or wherever the
+        // trip's own driver/vehicle wasn't carried over.
         driver: {
-          select: { id: true, name: true },
+          select: { id: true, name: true, phone: true, status: true },
         },
         vehicle: {
-          select: { id: true, vehicleNumber: true },
+          select: {
+            id: true,
+            vehicleNumber: true,
+            type: true,
+            capacity: true,
+            status: true,
+          },
+        },
+        vendor: {
+          select: { id: true, name: true },
         },
       },
       orderBy: [{ weekStart: "desc" }, { route: { routeCode: "asc" } }],
@@ -1454,10 +2037,17 @@ const updateWeeklySchedule = async (req, res, next) => {
     // Real-Time Route Optimization: a route/driver/vehicle change on one
     // schedule can free up or double-book a resource for others on the same
     // week, so re-scan the week whenever one of those fields moved.
-    const touchesAssignment = ["routeId", "tripId", "driverId", "vehicleId"].some((f) => f in updateData);
+    const touchesAssignment = [
+      "routeId",
+      "tripId",
+      "driverId",
+      "vehicleId",
+    ].some((f) => f in updateData);
     if (touchesAssignment) {
       try {
-        await optimizeWeekAssignments(updateData.weekStart || schedule.weekStart);
+        await optimizeWeekAssignments(
+          updateData.weekStart || schedule.weekStart,
+        );
       } catch (optimizeError) {
         // Best-effort — don't fail an already-successful update.
       }
@@ -1492,14 +2082,18 @@ const deleteWeeklySchedule = async (req, res, next) => {
 const getCurrentWeekSchedules = async (req, res, next) => {
   try {
     const now = new Date();
-    const utcToday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const utcToday = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    );
     // weekStart is always a Monday (see schema). Convert Sunday=0..Saturday=6
     // into "days since Monday" so this lines up with every other Monday-based
     // weekStart in the app (e.g. the frontend's own default-week-start calc),
     // instead of the previous Sunday-based start which pointed at the wrong
     // week entirely whenever this ran on a Sunday.
     const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
-    const startOfWeek = new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
+    const startOfWeek = new Date(
+      utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000,
+    );
 
     const schedules = await prisma.weeklySchedule.findMany({
       where: {
@@ -1522,7 +2116,7 @@ const getCurrentWeekSchedules = async (req, res, next) => {
 
     const response = okResponse(
       schedules,
-      "Current week schedules retrieved successfully."
+      "Current week schedules retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -1558,7 +2152,7 @@ const getEmployeeScheduleRange = async (req, res, next) => {
 
     const response = okResponse(
       schedules,
-      "Employee schedule range retrieved successfully."
+      "Employee schedule range retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -1587,11 +2181,15 @@ const getGroupedSchedules = async (req, res, next) => {
     if (search) {
       where.OR = [
         { employee: { name: { contains: search, mode: "insensitive" } } },
-        { employee: { employeeCode: { contains: search, mode: "insensitive" } } },
+        {
+          employee: { employeeCode: { contains: search, mode: "insensitive" } },
+        },
         { route: { routeName: { contains: search, mode: "insensitive" } } },
         { route: { routeCode: { contains: search, mode: "insensitive" } } },
         { driver: { name: { contains: search, mode: "insensitive" } } },
-        { vehicle: { vehicleNumber: { contains: search, mode: "insensitive" } } },
+        {
+          vehicle: { vehicleNumber: { contains: search, mode: "insensitive" } },
+        },
       ];
     }
 
@@ -1627,7 +2225,9 @@ const getGroupedSchedules = async (req, res, next) => {
           select: {
             id: true,
             tripNumber: true,
-            vehicle: { select: { id: true, vehicleNumber: true, capacity: true } },
+            vehicle: {
+              select: { id: true, vehicleNumber: true, capacity: true },
+            },
           },
         },
         driver: { select: { id: true, name: true } },
@@ -1674,15 +2274,14 @@ const getGroupedSchedules = async (req, res, next) => {
       const routeEntry = routeMap.get(routeKey);
       routeEntry.empIds.add(s.employeeId);
 
-      if (s.trip) {
-        if (!routeEntry.tripMap.has(s.trip.id)) {
-          routeEntry.tripMap.set(s.trip.id, {
-            tripNumber: s.trip.tripNumber,
-            capacity: s.trip.vehicle?.capacity ?? null,
-            empIds: new Set(),
-          });
+      if (s.tripId) {
+        // Just count riders per trip here — the Trip's own existence,
+        // driver, vehicle, and capacity come authoritatively from the
+        // direct Trip query below (tripsByRoute), not from this row.
+        if (!routeEntry.tripMap.has(s.tripId)) {
+          routeEntry.tripMap.set(s.tripId, { empIds: new Set() });
         }
-        routeEntry.tripMap.get(s.trip.id).empIds.add(s.employeeId);
+        routeEntry.tripMap.get(s.tripId).empIds.add(s.employeeId);
       }
 
       const weekKey = formatDateOnly(s.weekStart);
@@ -1710,15 +2309,71 @@ const getGroupedSchedules = async (req, res, next) => {
       });
     }
 
+    // FIX: previously every route's `trips` list here was built ONLY from
+    // WeeklySchedule rows that happened to carry a non-null tripId (see the
+    // `if (s.trip)` block below). A Route + Trip can be created correctly
+    // by bulk upload — with a real driver/vehicle on the Trip — and STILL
+    // show up as "no trip configured" on the frontend if any of its
+    // schedule rows lack a tripId (locked rows, legacy rows, manual
+    // creates via createWeeklySchedule where the caller didn't pass one).
+    // Trip is the source of truth for "does this route have a configured
+    // trip", not WeeklySchedule.tripId, so we now query Trip directly for
+    // every route in this response and seed tripMap from that — a trip
+    // with zero riders still shows up, with its real driver/vehicle.
+    const routeIdsForTrips = Array.from(routeMap.keys()).filter(
+      (k) => k !== "unassigned",
+    );
+    const tripsByRoute = routeIdsForTrips.length
+      ? await prisma.trip.findMany({
+          // Same enum fix as syncRouteFromTrips/findOrCreateTripOnRoute —
+          // Trip.status is RouteStatus (ACTIVE | INACTIVE), no CANCELLED.
+          where: { routeId: { in: routeIdsForTrips }, status: "ACTIVE" },
+          include: {
+            vehicle: {
+              select: { id: true, vehicleNumber: true, capacity: true },
+            },
+            driver: { select: { id: true, name: true } }, // NOTE: verify Trip.driver relation name matches schema.prisma
+          },
+          orderBy: { tripNumber: "asc" },
+        })
+      : [];
+    for (const t of tripsByRoute) {
+      const routeEntry = routeMap.get(t.routeId);
+      if (!routeEntry) continue;
+      // Merge onto whatever rider-count entry the schedule-row pass already
+      // created for this tripId (if any) — Trip data always overwrites the
+      // metadata fields, riders (empIds) are kept as already counted.
+      const existingRiders = routeEntry.tripMap.get(t.id)?.empIds ?? new Set();
+      routeEntry.tripMap.set(t.id, {
+        tripNumber: t.tripNumber,
+        capacity: t.vehicle?.capacity ?? null,
+        driverName: t.driver?.name ?? null,
+        vehicleNumber: t.vehicle?.vehicleNumber ?? null,
+        empIds: existingRiders,
+      });
+    }
+
     const routes = Array.from(routeMap.values()).map((r) => {
       const trips = Array.from(r.tripMap.values())
+        .filter((t) => t.tripNumber != null) // drop placeholders whose Trip is missing/cancelled
         .sort((a, b) => a.tripNumber - b.tripNumber)
         .map((t) => ({
           tripNumber: t.tripNumber,
           capacity: t.capacity,
+          driver: t.driverName ?? "—",
+          vehicle: t.vehicleNumber ?? "—",
           assignedEmployees: t.empIds.size,
-          remainingSeats: t.capacity != null ? Math.max(t.capacity - t.empIds.size, 0) : null,
+          remainingSeats:
+            t.capacity != null ? Math.max(t.capacity - t.empIds.size, 0) : null,
         }));
+
+      // Route.driverId can be stale/unset on legacy rows; fall back to the
+      // first real trip's driver/vehicle so the badge matches what
+      // bulk-upload actually configured, instead of showing "—" even when
+      // trip 1 has a driver assigned.
+      const firstTrip = Array.from(r.tripMap.values())
+        .filter((t) => t.tripNumber != null)
+        .sort((a, b) => a.tripNumber - b.tripNumber)[0];
 
       return {
         code: r.code,
@@ -1726,23 +2381,33 @@ const getGroupedSchedules = async (req, res, next) => {
         area: r.area,
         shift: r.shift,
         service: r.service,
-        driverBadge: r.driverBadge,
-        vehicleBadge: r.vehicleBadge,
+        driverBadge:
+          r.driverBadge !== "—"
+            ? r.driverBadge
+            : (firstTrip?.driverName ?? "—"),
+        vehicleBadge:
+          r.vehicleBadge !== "—"
+            ? r.vehicleBadge
+            : (firstTrip?.vehicleNumber ?? "—"),
         empCount: r.empIds.size,
         // Requirement 7: Vehicle Capacity + Remaining Available Seats at the
         // route level (aggregate across trips), plus a per-trip breakdown
         // (with Trip Number) whenever the route runs more than one trip.
         capacity: r.capacity,
-        remainingSeats: r.capacity != null ? Math.max(r.capacity - r.empIds.size, 0) : null,
+        remainingSeats:
+          r.capacity != null ? Math.max(r.capacity - r.empIds.size, 0) : null,
         multiTrip: trips.length > 1,
         trips,
         weeks: Array.from(r.weekMap.values()).sort((a, b) =>
-          b.weekOf.localeCompare(a.weekOf)
+          b.weekOf.localeCompare(a.weekOf),
         ),
       };
     });
 
-    const response = okResponse(routes, "Grouped weekly schedules retrieved successfully.");
+    const response = okResponse(
+      routes,
+      "Grouped weekly schedules retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1757,11 +2422,12 @@ const getScheduleStats = async (req, res, next) => {
   try {
     const totalEntries = await prisma.weeklySchedule.count();
 
-    const [activeRoutesResult, weeksOnFileResult, employeesResult] = await Promise.all([
-      prisma.$queryRaw`SELECT COUNT(DISTINCT "routeId") as count FROM "WeeklySchedule" WHERE "status" = 'ACTIVE'`,
-      prisma.$queryRaw`SELECT COUNT(DISTINCT "weekStart") as count FROM "WeeklySchedule"`,
-      prisma.$queryRaw`SELECT COUNT(DISTINCT "employeeId") as count FROM "WeeklySchedule"`,
-    ]);
+    const [activeRoutesResult, weeksOnFileResult, employeesResult] =
+      await Promise.all([
+        prisma.$queryRaw`SELECT COUNT(DISTINCT "routeId") as count FROM "WeeklySchedule" WHERE "status" = 'ACTIVE'`,
+        prisma.$queryRaw`SELECT COUNT(DISTINCT "weekStart") as count FROM "WeeklySchedule"`,
+        prisma.$queryRaw`SELECT COUNT(DISTINCT "employeeId") as count FROM "WeeklySchedule"`,
+      ]);
 
     const activeRoutes = Number(activeRoutesResult[0]?.count ?? 0);
     const weeksOnFile = Number(weeksOnFileResult[0]?.count ?? 0);
@@ -1774,7 +2440,7 @@ const getScheduleStats = async (req, res, next) => {
         weeksOnFile,
         employees,
       },
-      "Schedule stats retrieved successfully."
+      "Schedule stats retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -1782,7 +2448,6 @@ const getScheduleStats = async (req, res, next) => {
     next(error);
   }
 };
-
 
 // ---------- New: Schedule Table (grouped by Area) to power the Schedule UI ----------
 
@@ -1792,12 +2457,13 @@ const getScheduleStats = async (req, res, next) => {
  */
 const getScheduleTableStats = async (req, res, next) => {
   try {
-    const [activeEmployees, areasCount, availableDrivers, activeVehicles] = await Promise.all([
-      prisma.employee.count({ where: { status: "ACTIVE" } }),
-      prisma.area.count(),
-      prisma.driver.count({ where: { status: "AVAILABLE" } }),
-      prisma.vehicle.count({ where: { status: "ACTIVE" } }),
-    ]);
+    const [activeEmployees, areasCount, availableDrivers, activeVehicles] =
+      await Promise.all([
+        prisma.employee.count({ where: { status: "ACTIVE" } }),
+        prisma.area.count(),
+        prisma.driver.count({ where: { status: "AVAILABLE" } }),
+        prisma.vehicle.count({ where: { status: "ACTIVE" } }),
+      ]);
 
     const response = okResponse(
       {
@@ -1806,7 +2472,7 @@ const getScheduleTableStats = async (req, res, next) => {
         availableDrivers,
         activeVehicles,
       },
-      "Schedule table stats retrieved successfully."
+      "Schedule table stats retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -1880,7 +2546,7 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
 
     const response = okResponse(
       groups,
-      "Schedule table grouped by area retrieved successfully."
+      "Schedule table grouped by area retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -1918,37 +2584,298 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
  * Vehicle record here — that field feeds the Route name instead. If you want
  * vehicleId populated too, the sheet needs an actual vehicle-number column.
  */
-const bulkUploadWeeklySchedule = async (req, res, next) => {
+// ---------- Bulk Upload Job Tracking (progress + status polling) ----------
+//
+// WHY THIS EXISTS: a bulk upload used to be one long synchronous HTTP
+// request. For a few hundred rows, each with ~15-25 sequential DB round
+// trips (employee/driver/vendor/vehicle lookups, route/trip resolution,
+// conflict checks, working-hours checks), that request could easily run
+// past a minute — often past the browser/proxy's request timeout. The
+// caller then saw a generic network error with NO indication of whether
+// anything actually got written, because the server kept processing rows
+// after the client had already given up and closed the connection.
+//
+// FIX: the HTTP handler now only PARSES the file and hands the row
+// processing off to a background job. It responds immediately with a
+// jobId, and the frontend polls GET /bulk-upload-status/:jobId for
+// progress (rows processed / total) and, once done, the final
+// created/updated/skipped summary — so the user always knows whether it
+// succeeded, is still running, or failed, and roughly how far along it is.
+//
+// NOTE: this job store is in-memory (a plain Map), which is fine for a
+// single server instance. If this API ever runs multiple instances behind
+// a load balancer, move this to Redis (or similar) so a status poll can't
+// land on an instance that never processed the job.
+const bulkUploadJobs = new Map();
+const BULK_UPLOAD_JOB_TTL_MS = 30 * 60 * 1000; // sweep finished jobs after 30 min
+
+// Row-count bounds for the `batchSize` API param — keeps a caller from
+// passing 1 (near-infinite yields) or 100000 (defeats the point of
+// batching) on a very large workbook.
+const MIN_BATCH_SIZE = 10;
+const MAX_BATCH_SIZE = 1000;
+const DEFAULT_BATCH_SIZE = 100;
+
+const createBulkUploadJob = (totalRows, batchSize) => {
+  // Sweep old finished jobs opportunistically so the Map doesn't grow
+  // unbounded on a long-running server.
+  const cutoff = Date.now() - BULK_UPLOAD_JOB_TTL_MS;
+  for (const [id, job] of bulkUploadJobs) {
+    if (job.status !== "processing" && job.startedAt < cutoff) {
+      bulkUploadJobs.delete(id);
+    }
+  }
+
+  const jobId = `bulkupload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  bulkUploadJobs.set(jobId, {
+    status: "processing", // "processing" | "done" | "failed"
+    totalRows,
+    processedRows: 0,
+    batchSize,
+    totalBatches: totalRows ? Math.ceil(totalRows / batchSize) : 0,
+    batchesCompleted: 0,
+    startedAt: Date.now(),
+    // Snapshot of the results-so-far, refreshed after every batch (not just
+    // at the end) so a client polling mid-run can show live counts —
+    // "312 assigned, 4 skipped" while it's still going — instead of only
+    // finding out anything at all once status flips to "done".
+    partialResult: null,
+    result: null,
+    error: null,
+  });
+  return jobId;
+};
+
+const updateBulkUploadJob = (jobId, patch) => {
+  const job = bulkUploadJobs.get(jobId);
+  if (!job) return;
+  Object.assign(job, patch);
+};
+
+/**
+ * GET /weekly-schedule/bulk-upload-status/:jobId
+ * Polled by the frontend's progress bar. Returns 0-100 percent plus the
+ * final result payload once status is "done" (or the error once "failed"),
+ * so the UI can always show an accurate success/failure state instead of
+ * guessing from a dropped connection. While still "processing", `result`
+ * carries the same-shaped partial tally accumulated so far (see
+ * partialResult on the job), so the UI isn't blind until the very end.
+ */
+const getBulkUploadStatus = async (req, res, next) => {
   try {
-    if (!req.file) {
+    const { jobId } = req.params;
+    const job = bulkUploadJobs.get(jobId);
+    if (!job) {
       const response = badRequestResponse(
-        "No file uploaded. Attach an .xlsx file under the 'file' field."
+        "Unknown or expired upload job id. If the upload was large, it may still be worth checking the schedule directly.",
       );
       return res.status(response.status.code).json(response);
     }
 
-    const { weekStart } = req.body;
-    if (!weekStart) {
-      const response = badRequestResponse(
-        "weekStart (the Monday this schedule applies to) is required."
-      );
-      return res.status(response.status.code).json(response);
-    }
-    const weekStartDate = toDateOnly(weekStart);
+    const percent = job.totalRows
+      ? Math.min(100, Math.round((job.processedRows / job.totalRows) * 100))
+      : job.status === "done"
+        ? 100
+        : 0;
 
-    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
+    const response = okResponse(
+      {
+        jobId,
+        status: job.status,
+        totalRows: job.totalRows,
+        processedRows: job.processedRows,
+        batchSize: job.batchSize,
+        totalBatches: job.totalBatches,
+        batchesCompleted: job.batchesCompleted,
+        percent,
+        result: job.status === "done" ? job.result : job.partialResult,
+        error: job.status === "failed" ? job.error : null,
+      },
+      "Bulk upload job status.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
 
+/**
+ * Does the actual row-by-row processing for a bulk upload, running AFTER
+ * the HTTP response has already gone back to the client with a jobId. Every
+ * lookup that's likely to repeat across rows (employee, driver, vendor,
+ * vehicle, area, a given area's routes) goes through the `caches` object so
+ * a sheet with, say, 300 rows but only 8 distinct drivers doesn't pay for
+ * 300 driver lookups — see findOrCreateDriver/Vendor/Vehicle/Area and
+ * findOrCreateRouteAndTrip above.
+ */
+const processBulkUploadJob = async (
+  jobId,
+  workbook,
+  weekStartDate,
+  batchSize = DEFAULT_BATCH_SIZE,
+) => {
+  const results = {
+    created: 0,
+    updated: 0,
+    employeesCreated: 0,
+    driversCreated: 0,
+    vendorsCreated: 0,
+    vehiclesCreated: 0,
+    routesCreated: 0,
+    routeLegsOpenedForOverflow: 0,
+    driversAutoAssigned: 0,
+    vehiclesAutoAssigned: 0,
+    conflictsResolved: 0,
+    // Rows saved as DRAFT because no conflict-free driver and/or vehicle
+    // could be found — see the missingDriver/missingVehicle check below.
+    // Surfaced separately from `created`/`updated` so a batch that "succeeded"
+    // but left people unstaffed is obvious in the summary, not hidden inside
+    // a generic success count.
+    pendingAssignment: 0,
+    skipped: [],
+    notes: [],
+    sheetsProcessed: [],
+    sheetsSkipped: [],
+  };
+
+  // Pre-load everything the per-row conflict/assignment checks need ONCE,
+  // up front, instead of letting findDriverConflict / findVehicleConflict /
+  // findBestAvailableDriver / findBestAvailableVehicle / checkDriverWorkingHours
+  // each hit the DB fresh for every row (see the big comment above on why
+  // that made the whole job O(rows^2)). weekRoster/availableDrivers/
+  // activeVehicles/driverById below are exactly the caches those functions
+  // already know how to use — they just weren't being built or passed in.
+  // FIX: acquireWeekAreaLock existed in this file but was never actually
+  // called anywhere — a lock defined for exactly this situation (two
+  // concurrent writers targeting the same week) sitting unused. Without
+  // it, two bulk-upload jobs kicked off for the same weekStart at close to
+  // the same instant each build their OWN in-memory snapshot of
+  // roster/driver/vehicle state (caches.weekRoster etc. below) from
+  // whatever the DB looked like at that moment, then run their
+  // capacity/conflict checks against that private snapshot for the rest of
+  // the job — neither one sees the other's writes. That's how a trip ends
+  // up overbooked or a driver double-booked despite the per-row conflict
+  // checks: the checks are correct, but they're checking against a
+  // snapshot the other job has already invalidated.
+  //
+  // IMPORTANT — what this DOES and DOESN'T fix: this acquires and releases
+  // the lock in a short transaction right here, before the snapshot reads
+  // below. That serializes job STARTS for the same week — two jobs can no
+  // longer build their initial snapshots at the literal same instant — but
+  // it does NOT hold the lock for the rest of this (potentially
+  // multi-minute) job. A second job could still start seconds later, once
+  // this one has released the lock, and run concurrently with it for the
+  // remainder. Deliberately not holding the lock for the whole job: doing
+  // that would mean keeping one DB connection checked out for the job's
+  // entire duration, which trades this race for a worse, guaranteed
+  // problem (starving the connection pool, holding locks against
+  // unrelated requests). The real fix for FULL concurrent-upload safety is
+  // serializing job execution per weekStart at the queue level (e.g. a
+  // job-queue concurrency limit), not a longer-held DB lock — this line is
+  // a cheap, safe narrowing of the window, not a complete guarantee.
+  await prisma.$transaction((tx) => acquireWeekAreaLock(tx, weekStartDate));
+
+  const [existingWeekRoster, availableDriversList, activeVehiclesList] =
+    await Promise.all([
+      prisma.weeklySchedule.findMany({
+        where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
+        include: { route: true },
+      }),
+      prisma.driver.findMany({
+        where: { status: "AVAILABLE" },
+        include: { vehicle: true },
+        orderBy: { createdAt: "asc" },
+      }),
+      prisma.vehicle.findMany({ where: { status: "ACTIVE" } }),
+    ]);
+
+  const caches = {
+    employee: new Map(),
+    driver: new Map(),
+    vendor: new Map(),
+    vehicle: new Map(),
+    area: new Map(),
+    routesByArea: new Map(),
+    // FIX (perf): trips-per-route and the route record itself were being
+    // re-fetched from the DB on every single row that touched a given
+    // route (see findOrCreateTripOnRoute / findOrCreateRouteAndTrip) —
+    // these two caches let a route hit hundreds of times in one workbook
+    // (the normal case; rows are usually clustered by area/shift) pay for
+    // that lookup once instead of once per row.
+    tripsByRoute: new Map(),
+    routeById: new Map(),
+    weekRoster: existingWeekRoster,
+    availableDrivers: availableDriversList,
+    activeVehicles: activeVehiclesList,
+    driverById: new Map(availableDriversList.map((d) => [d.id, d])),
+    // O(1) "does this employee already have a schedule row this week"
+    // lookup, seeded from the same existingWeekRoster query above and kept
+    // current as rows are written (see the create/update block below).
+    // Previously this was a fresh `prisma.weeklySchedule.findUnique` PER
+    // ROW — on a 1,600-row workbook that's 1,600 extra round trips on top
+    // of everything else, for data we'd already pulled once at job start.
+    scheduleByEmployeeId: new Map(
+      existingWeekRoster.map((r) => [r.employeeId, r]),
+    ),
+  };
+
+  // Cumulative across every sheet — this is what the status endpoint's
+  // "processedRows" reflects, matched against the "totalRows" the outer
+  // handler pre-counted before responding with the jobId.
+  let processedCount = 0;
+  let batchesCompleted = 0;
+
+  // Records a skipped row both in the result payload AND the persistent
+  // exception queue — previously logScheduleException was defined but
+  // never called, so skipped rows only ever lived in the transient
+  // response payload and were lost the moment the request finished.
+  const skipRow = async (sheetName, rowNum, employeeCode, reason, rawData) => {
+    results.skipped.push({
+      sheet: sheetName,
+      row: rowNum,
+      employeeCode,
+      reason,
+    });
+    await logScheduleException(prisma, {
+      weekStart: weekStartDate,
+      employeeCode,
+      rowNumber: rowNum,
+      reason: `[${sheetName}] ${reason}`,
+      rawData,
+    });
+  };
+
+  // ---------- Pass 1: parse every sheet ONCE, and bulk-prefetch employees ----------
+  //
+  // Previously each row triggered its OWN `prisma.employee.findUnique` —
+  // for a sheet with 1,600 distinct employee codes (the normal case; codes
+  // are rarely repeated) that's 1,600 more round trips. Parse every sheet
+  // up front, collect every candidate Employee ID across ALL sheets, and
+  // fetch them in a SINGLE `findMany(... in: [...])` call instead. Sheets
+  // are only ~1-2MB of JSON in memory even at 1,600+ rows, so doing this
+  // parse pass twice (once here, once implicitly via the cached
+  // `parsedSheets` below) costs nothing compared to the DB round trips it
+  // removes.
+  const parsedSheets = [];
+  const allEmployeeCodes = new Set();
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      raw: false,
+      defval: "",
+    });
     const headerRowIndex = rows.findIndex((r) =>
-      r.some((cell) => String(cell).trim().toLowerCase() === "employee id")
+      r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
     );
     if (headerRowIndex === -1) {
-      const response = badRequestResponse(
-        "Could not find an 'Employee ID' header column in the sheet."
-      );
-      return res.status(response.status.code).json(response);
+      results.sheetsSkipped.push({
+        sheet: sheetName,
+        reason: "No 'Employee ID' header found.",
+      });
+      continue;
     }
+    results.sheetsProcessed.push(sheetName);
 
     const colIndex = {};
     rows[headerRowIndex].forEach((cell, i) => {
@@ -1956,58 +2883,57 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
       if (key) colIndex[key] = i;
     });
 
-    const results = {
-      created: 0,
-      updated: 0,
-      employeesCreated: 0,
-      driversCreated: 0,
-      vendorsCreated: 0,
-      vehiclesCreated: 0,
-      routesCreated: 0,
-      routeLegsOpenedForOverflow: 0,
-      driversAutoAssigned: 0,
-      vehiclesAutoAssigned: 0,
-      conflictsResolved: 0,
-      skipped: [],
-      notes: [],
-    };
-
-    // Records a skipped row both in the HTTP response AND the persistent
-    // exception queue — previously logScheduleException was defined but
-    // never called, so skipped rows only ever lived in the transient
-    // response payload and were lost the moment the request finished.
-    const skipRow = async (rowNum, employeeCode, reason, rawData) => {
-      results.skipped.push({ row: rowNum, employeeCode, reason });
-      await logScheduleException(prisma, {
-        weekStart: weekStartDate,
-        employeeCode,
-        rowNumber: rowNum,
-        reason,
-        rawData,
-      });
-    };
-
     const dataRows = rows.slice(headerRowIndex + 1);
+    const empCodeCol = colIndex.employeeCode;
+    for (const raw of dataRows) {
+      const code =
+        empCodeCol !== undefined ? String(raw[empCodeCol] ?? "").trim() : "";
+      if (code && /^\d+$/.test(code)) allEmployeeCodes.add(code);
+    }
 
+    parsedSheets.push({ sheetName, colIndex, dataRows, headerRowIndex });
+  }
+
+  if (allEmployeeCodes.size) {
+    const existingEmployees = await prisma.employee.findMany({
+      where: { employeeCode: { in: Array.from(allEmployeeCodes) } },
+    });
+    for (const emp of existingEmployees)
+      caches.employee.set(emp.employeeCode, emp);
+  }
+
+  // ---------- Pass 2: process each row (creates/writes only from here on) ----------
+  for (const {
+    sheetName,
+    colIndex,
+    dataRows,
+    headerRowIndex,
+  } of parsedSheets) {
     for (let i = 0; i < dataRows.length; i++) {
       const raw = dataRows[i];
       const rowNum = headerRowIndex + i + 2; // 1-indexed sheet row, for error messages
       const get = (key) =>
-        colIndex[key] !== undefined ? String(raw[colIndex[key]] ?? "").trim() : "";
+        colIndex[key] !== undefined
+          ? String(raw[colIndex[key]] ?? "").trim()
+          : "";
 
       const employeeCode = get("employeeCode");
       // Skip blank rows and the sheet's repeated header rows (Employee ID isn't numeric there).
       if (!employeeCode || !/^\d+$/.test(employeeCode)) continue;
 
       try {
-        const { employee, created: employeeCreated } = await findOrCreateEmployee({
-          employeeCode,
-          name: get("name"),
-          contact: get("contact"),
-          area: get("area"),
-          entity: get("entity"),
-          shiftTiming: get("shiftTiming"),
-        });
+        const { employee, created: employeeCreated } =
+          await findOrCreateEmployee(
+            {
+              employeeCode,
+              name: get("name"),
+              contact: get("contact"),
+              area: get("area"),
+              entity: get("entity"),
+              shiftTiming: get("shiftTiming"),
+            },
+            caches,
+          );
         if (employeeCreated) results.employeesCreated++;
 
         // A row can list more than one driver (e.g. "Tariq 03043160572Shahrukh
@@ -2020,7 +2946,9 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
         for (let d = 0; d < driverEntries.length; d++) {
           const { driver, created } = await findOrCreateDriver(
             driverEntries[d].name,
-            driverEntries[d].phone
+            driverEntries[d].phone,
+            caches.driver,
+            caches,
           );
           if (created) results.driversCreated++;
           if (d === 0) driverId = driver?.id;
@@ -2029,7 +2957,10 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
         const vendorName = get("vendor");
         let vendorId;
         if (vendorName) {
-          const { vendor, created } = await findOrCreateVendor(vendorName);
+          const { vendor, created } = await findOrCreateVendor(
+            vendorName,
+            caches.vendor,
+          );
           vendorId = vendor?.id;
           if (created) results.vendorsCreated++;
         }
@@ -2037,7 +2968,11 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
         const vehicleReg = get("vehicleReg");
         let vehicleId;
         if (vehicleReg) {
-          const { vehicle, created } = await findOrCreateVehicle(vehicleReg);
+          const { vehicle, created } = await findOrCreateVehicle(
+            vehicleReg,
+            caches.vehicle,
+            caches,
+          );
           vehicleId = vehicle?.id;
           if (created) results.vehiclesCreated++;
         }
@@ -2045,7 +2980,7 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
         const areaName = get("area");
         const vehicleType = get("vehicleType");
         const shiftTiming = get("shiftTiming");
-        const campaign = get("campaign");
+        const campaign = get("campaign") || get("batch");
 
         let route;
         let trip;
@@ -2059,7 +2994,8 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
             driverId,
             vehicleId,
             weekStartDate,
-            employee.id
+            employee.id,
+            caches,
           );
           route = routeResult.route;
           trip = routeResult.trip;
@@ -2076,15 +3012,22 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
           // Verification: a routeId AND tripId must exist on every row from here on.
           if (!route?.id || !trip?.id) {
             await skipRow(
+              sheetName,
               rowNum,
               employeeCode,
               "Route/Trip could not be created/found even with fallback — check Route/Trip model required fields.",
-              raw
+              raw,
             );
             continue;
           }
         } catch (routeError) {
-          await skipRow(rowNum, employeeCode, `Route/Trip creation failed: ${routeError.message}`, raw);
+          await skipRow(
+            sheetName,
+            rowNum,
+            employeeCode,
+            `Route/Trip creation failed: ${routeError.message}`,
+            raw,
+          );
           continue;
         }
 
@@ -2105,13 +3048,15 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
           vehicleTypeHint: vehicleType,
           minCapacity: undefined,
           excludeEmployeeId: employee.id,
+          caches,
         });
         driverId = assignment.driverId;
         vehicleId = assignment.vehicleId;
         if (assignment.autoAssignedDriver) results.driversAutoAssigned++;
         if (assignment.autoAssignedVehicle) results.vehiclesAutoAssigned++;
         assignment.notes.forEach((note) => {
-          if (note.includes("overlaps") || note.includes("was skipped")) results.conflictsResolved++;
+          if (note.includes("overlaps") || note.includes("was skipped"))
+            results.conflictsResolved++;
           results.notes.push({ row: rowNum, employeeCode, note });
         });
 
@@ -2124,6 +3069,31 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
         const officeArrivalTime = get("officeArrivalTime");
         const dropTime = get("dropTime");
 
+        // FIX (real-world bug): a route/trip with no driver and/or no
+        // vehicle was previously still saved as a fully "ACTIVE" schedule
+        // row — indistinguishable in the UI/reports from a properly
+        // staffed one, even though nobody is actually assigned to drive or
+        // carry this employee. A transport schedule with a missing driver
+        // or vehicle isn't a usable assignment yet, so it's saved as
+        // "DRAFT" (pending manual assignment) instead of "ACTIVE", and
+        // counted separately so it's visible in the upload summary rather
+        // than silently blending in with successful rows.
+        const missingDriver = !driverId;
+        const missingVehicle = !vehicleId;
+        if (missingDriver || missingVehicle) {
+          results.pendingAssignment += 1;
+          results.notes.push({
+            row: rowNum,
+            employeeCode,
+            note: `Saved as DRAFT — missing ${[
+              missingDriver ? "driver" : null,
+              missingVehicle ? "vehicle" : null,
+            ]
+              .filter(Boolean)
+              .join(" and ")}. Assign manually to activate.`,
+          });
+        }
+
         const scheduleData = {
           weekStart: weekStartDate,
           employeeId: employee.id,
@@ -2132,45 +3102,421 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
           driverId,
           vendorId,
           vehicleId,
-          // "Vehicle Entity" (e.g. "IBEX") is a separate column from the
-          // employee's own "Entity" (e.g. "VW") — don't conflate the two.
+
           vehicleEntity: get("vehicleEntityName") || undefined,
           serviceType: deriveServiceType(officeArrivalTime, dropTime),
           shiftTiming: shiftTiming || undefined,
-          // "Office Arrival Time" IS the pick-up time — feed both fields so
-          // the UI's "Pick Time" column (which reads pickupTime) is populated,
-          // while officeArrivalTime is kept too for reference.
+
           pickupTime: officeArrivalTime || undefined,
           officeArrivalTime: officeArrivalTime || undefined,
           dropTime: dropTime || undefined,
           offDay: get("offDay") || undefined,
           ...dayFields,
-          status: "ACTIVE",
+          status: missingDriver || missingVehicle ? "DRAFT" : "ACTIVE",
         };
 
-        const existing = await prisma.weeklySchedule.findUnique({
-          where: {
-            employeeId_weekStart: { employeeId: employee.id, weekStart: weekStartDate },
-          },
-        });
+        // FIX: previously a fresh prisma.weeklySchedule.findUnique PER
+        // ROW just to check "does this employee already have a row this
+        // week" — that's 1 extra round trip x every row in the sheet.
+        // The answer is already sitting in scheduleByEmployeeId (seeded
+        // from the same week-roster query the conflict checks use, and
+        // kept current below as each row writes), so read it from memory
+        // instead.
+        const existing = caches.scheduleByEmployeeId.get(employee.id) || null;
 
+        let savedSchedule;
         if (existing) {
           if (existing.isLocked) {
-            await skipRow(rowNum, employeeCode, "Schedule is locked.", raw);
+            await skipRow(
+              sheetName,
+              rowNum,
+              employeeCode,
+              "Schedule is locked.",
+              raw,
+            );
             continue;
           }
-          await prisma.weeklySchedule.update({ where: { id: existing.id }, data: scheduleData });
+          savedSchedule = await prisma.weeklySchedule.update({
+            where: { id: existing.id },
+            data: scheduleData,
+          });
           results.updated++;
         } else {
-          await prisma.weeklySchedule.create({ data: scheduleData });
+          savedSchedule = await prisma.weeklySchedule.create({
+            data: scheduleData,
+          });
           results.created++;
         }
+        // Keep the O(1) existing-row cache current with the row we just
+        // wrote (full record, so a LATER duplicate employeeCode in this
+        // same workbook — or the isLocked check above — still has
+        // everything it needs without another DB round trip).
+        caches.scheduleByEmployeeId.set(employee.id, savedSchedule);
+
+        // Keep the in-memory week roster in sync so the NEXT row in this
+        // same job sees this assignment immediately (no DB round trip),
+        // which is what keeps driver/vehicle conflict + working-hours
+        // checks fast and accurate as the job progresses.
+        upsertRosterEntry(caches, {
+          employeeId: employee.id,
+          tripId: scheduleData.tripId,
+          routeId: scheduleData.routeId,
+          driverId: scheduleData.driverId || null,
+          vehicleId: scheduleData.vehicleId || null,
+          shiftTiming: scheduleData.shiftTiming,
+          route,
+          ...dayFields,
+        });
       } catch (rowError) {
-        await skipRow(rowNum, employeeCode, rowError.message, raw);
+        await skipRow(sheetName, rowNum, employeeCode, rowError.message, raw);
+      } finally {
+        // Runs on every exit path for this row — success, skip via
+        // `continue`, or caught error — so the progress bar always keeps
+        // moving and never stalls partway through a sheet.
+        processedCount += 1;
+        updateBulkUploadJob(jobId, { processedRows: processedCount });
+
+        // Batch boundary: every `batchSize` rows, publish a snapshot of
+        // the results-so-far (so a client polling mid-run sees live
+        // counts, not just a percent) and yield the event loop. On a very
+        // large workbook this keeps the server responsive to OTHER
+        // requests (including the status poll itself) between batches,
+        // instead of one giant unbroken run of row processing.
+        if (processedCount % batchSize === 0) {
+          batchesCompleted += 1;
+          updateBulkUploadJob(jobId, {
+            batchesCompleted,
+            partialResult: JSON.parse(JSON.stringify(results)),
+          });
+          await new Promise((resolve) => setImmediate(resolve));
+        }
       }
     }
+  } // end per-sheet loop
 
-    const response = okResponse(results, "Weekly schedule bulk upload processed.");
+  // Final partial snapshot for any rows since the last batch boundary,
+  // plus whatever fraction of a batch the job ended on.
+  if (processedCount % batchSize !== 0) {
+    batchesCompleted += 1;
+  }
+  updateBulkUploadJob(jobId, {
+    batchesCompleted,
+    partialResult: JSON.parse(JSON.stringify(results)),
+  });
+
+  return results;
+};
+
+/**
+ * POST /weekly-schedule/bulk-upload
+ *
+ * Body (multipart/form-data):
+ *   file       - the .xlsx/.xls workbook (required)
+ *   weekStart  - Monday the schedule applies to (required)
+ *   batchSize  - optional rows-per-batch (default 100, clamped to
+ *                10-1000). Rows are still processed one at a time in
+ *                order — this doesn't parallelize anything — but every
+ *                `batchSize` rows the job publishes a partial-result
+ *                snapshot (see partialResult in getBulkUploadStatus) and
+ *                yields the event loop, so a large workbook shows live
+ *                progress in chunks instead of going quiet until the very
+ *                end. Smaller batchSize = more frequent updates but more
+ *                overhead; larger = fewer updates, slightly less overhead.
+ *
+ * Returns almost immediately with a jobId + totalRows instead of blocking
+ * on the whole file. The actual row processing (see processBulkUploadJob)
+ * runs in the background; poll GET /bulk-upload-status/:jobId for progress
+ * and the final result. This is what fixes the "waiting with no idea if it
+ * failed or succeeded" problem — the client can no longer lose track of a
+ * long-running upload just because its own HTTP request timed out, since
+ * the job keeps running server-side and the status endpoint reflects that.
+ *
+ * NOTE on vehicles: the sheet only gives a Vehicle Type (e.g. "Hiace"), never
+ * a real vehicle number/plate, so we deliberately do NOT auto-create a
+ * Vehicle record here — that field feeds the Route name instead. If you want
+ * vehicleId populated too, the sheet needs an actual vehicle-number column.
+ */
+/**
+ * POST /weekly-schedule/validate-upload
+ *
+ * Read-only format check for a bulk-upload .xlsx BEFORE committing to the
+ * (potentially long-running) real import. Parses every sheet the same way
+ * processBulkUploadJob does, but writes nothing to the DB — it just reports,
+ * per sheet:
+ *   - whether an "Employee ID" header row was found at all
+ *   - which recognized columns (HEADER_ALIASES) it mapped
+ *   - which raw header cells it did NOT recognize (so a renamed/misspelled
+ *     column shows up immediately instead of silently importing as blank)
+ *   - how many data rows look valid (numeric Employee ID) vs total rows seen
+ *   - how many of those valid rows are missing fields the row needs to be
+ *     useful (name, shift timing) — these still import (skipRow logic in the
+ *     real job decides row-by-row) but are surfaced here as a warning so the
+ *     count doesn't come as a surprise after a multi-minute job finishes.
+ *
+ * Response.data.canProceed is false only when NOTHING in the workbook is
+ * usable (no sheet has a recognizable header, or zero valid rows anywhere)
+ * — the frontend uses this to block the real upload; everything else is a
+ * warning the user can proceed past.
+ */
+const validateBulkUploadFile = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      const response = badRequestResponse(
+        "No file uploaded. Attach an .xlsx file under the 'file' field.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    let workbook;
+    try {
+      workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    } catch (parseError) {
+      const response = badRequestResponse(
+        "Couldn't read that file as an .xlsx/.xls workbook. Verify it isn't corrupted and try again.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const REQUIRED_FIELD_LABELS = {
+      employeeCode: "Employee ID",
+      name: "User Name",
+      shiftTiming: "Shift Timings",
+    };
+    // Fields we'd like to see but don't hard-require, since real rows in the
+    // wild sometimes omit them without the row being useless.
+    const RECOMMENDED_FIELD_LABELS = {
+      area: "Area",
+      vehicleReg: "Vehicle Reg",
+      drivers: "Drivers",
+    };
+
+    const sheetsReport = [];
+    const errors = [];
+    let anyValidRows = false;
+
+    if (!workbook.SheetNames.length) {
+      errors.push("The workbook has no sheets.");
+    }
+
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, {
+        header: 1,
+        raw: false,
+        defval: "",
+      });
+
+      const headerRowIndex = rows.findIndex((r) =>
+        r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
+      );
+
+      if (headerRowIndex === -1) {
+        sheetsReport.push({
+          sheet: sheetName,
+          headerFound: false,
+          totalDataRows: 0,
+          validRows: 0,
+          mappedFields: [],
+          unmappedHeaders: [],
+          missingRequiredFields: [],
+          warnings: [
+            "No 'Employee ID' header found — this sheet will be skipped entirely on upload.",
+          ],
+        });
+        continue;
+      }
+
+      const headerRow = rows[headerRowIndex];
+      const mappedFields = [];
+      const unmappedHeaders = [];
+      const colIndexByField = {};
+      headerRow.forEach((cell, i) => {
+        const raw = String(cell).trim();
+        if (!raw) return;
+        const key = HEADER_ALIASES[raw.toLowerCase()];
+        if (key) {
+          colIndexByField[key] = i;
+          if (!mappedFields.includes(`${raw} → ${key}`)) {
+            mappedFields.push(`${raw} → ${key}`);
+          }
+        } else {
+          unmappedHeaders.push(raw);
+        }
+      });
+
+      const dataRows = rows.slice(headerRowIndex + 1);
+      const get = (raw, key) =>
+        colIndexByField[key] !== undefined
+          ? String(raw[colIndexByField[key]] ?? "").trim()
+          : "";
+
+      let validRows = 0;
+      let missingName = 0;
+      let missingShift = 0;
+      for (const raw of dataRows) {
+        const employeeCode = get(raw, "employeeCode");
+        if (!employeeCode || !/^\d+$/.test(employeeCode)) continue; // blank/header-repeat row
+        validRows++;
+        if (!get(raw, "name")) missingName++;
+        if (!get(raw, "shiftTiming")) missingShift++;
+      }
+      if (validRows > 0) anyValidRows = true;
+
+      const missingRequiredFields = Object.entries(REQUIRED_FIELD_LABELS)
+        .filter(([field]) => colIndexByField[field] === undefined)
+        .map(([, label]) => label);
+      const missingRecommendedFields = Object.entries(RECOMMENDED_FIELD_LABELS)
+        .filter(([field]) => colIndexByField[field] === undefined)
+        .map(([, label]) => label);
+
+      const warnings = [];
+      if (validRows === 0) {
+        warnings.push(
+          "No valid data rows found under the header (Employee ID column is blank/non-numeric throughout).",
+        );
+      }
+      if (missingName > 0)
+        warnings.push(`${missingName} row(s) missing a User Name.`);
+      if (missingShift > 0)
+        warnings.push(`${missingShift} row(s) missing Shift Timings.`);
+      if (missingRecommendedFields.length) {
+        warnings.push(
+          `Missing recommended column(s): ${missingRecommendedFields.join(", ")}.`,
+        );
+      }
+      if (unmappedHeaders.length) {
+        warnings.push(
+          `Unrecognized column(s), will be ignored: ${unmappedHeaders.join(", ")}.`,
+        );
+      }
+
+      sheetsReport.push({
+        sheet: sheetName,
+        headerFound: true,
+        totalDataRows: dataRows.filter(
+          (r) => String(r[0] ?? "").trim().length > 0,
+        ).length,
+        validRows,
+        mappedFields,
+        unmappedHeaders,
+        missingRequiredFields,
+        warnings,
+      });
+    }
+
+    if (!anyValidRows) {
+      errors.push(
+        "None of the sheets in this workbook have any usable rows — check that at least one sheet has an 'Employee ID' header with numeric IDs beneath it.",
+      );
+    }
+
+    const result = {
+      canProceed: errors.length === 0,
+      errors,
+      sheets: sheetsReport,
+    };
+
+    const response = okResponse(result, "Workbook format checked.");
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const bulkUploadWeeklySchedule = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      const response = badRequestResponse(
+        "No file uploaded. Attach an .xlsx file under the 'file' field.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const { weekStart, batchSize: batchSizeRaw } = req.body;
+    if (!weekStart) {
+      const response = badRequestResponse(
+        "weekStart (the Monday this schedule applies to) is required.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+    const weekStartDate = toDateOnly(weekStart);
+
+    // Optional caller-supplied rows-per-batch. A large sheet (many hundreds
+    // of rows) can be processed in smaller chunks so progress/partial
+    // results update more often and the server yields between chunks —
+    // useful when a workbook is big enough that a single unbroken run feels
+    // like it's hung. Falls back to DEFAULT_BATCH_SIZE if omitted, and is
+    // clamped to [MIN_BATCH_SIZE, MAX_BATCH_SIZE] so a bad value (0, a
+    // negative number, "abc", or something absurdly large/small) can't
+    // break the job.
+    let batchSize = DEFAULT_BATCH_SIZE;
+    if (batchSizeRaw !== undefined && batchSizeRaw !== "") {
+      const parsed = parseInt(batchSizeRaw, 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        const response = badRequestResponse(
+          `batchSize must be a positive whole number (between ${MIN_BATCH_SIZE} and ${MAX_BATCH_SIZE}).`,
+        );
+        return res.status(response.status.code).json(response);
+      }
+      batchSize = Math.min(MAX_BATCH_SIZE, Math.max(MIN_BATCH_SIZE, parsed));
+    }
+
+    let workbook;
+    try {
+      workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    } catch (parseError) {
+      const response = badRequestResponse(
+        "Couldn't read that file as an .xlsx/.xls workbook. Verify it isn't corrupted and try again.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    // Pre-count data rows across every sheet that has an "Employee ID"
+    // header, so the status endpoint has a real denominator for percent
+    // complete. Cheap — this is pure in-memory parsing, no DB calls.
+    let totalRows = 0;
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, {
+        header: 1,
+        raw: false,
+        defval: "",
+      });
+      const headerRowIndex = rows.findIndex((r) =>
+        r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
+      );
+      if (headerRowIndex === -1) continue;
+      totalRows += rows.slice(headerRowIndex + 1).filter((r) => {
+        const first = String(r[0] ?? "").trim();
+        return first.length > 0;
+      }).length;
+    }
+
+    const jobId = createBulkUploadJob(totalRows, batchSize);
+
+    // Fire-and-forget: intentionally not awaited. Any error the worker
+    // throws is caught here so the job is always marked "failed" rather
+    // than left stuck at "processing" forever.
+    processBulkUploadJob(jobId, workbook, weekStartDate, batchSize)
+      .then((results) => {
+        updateBulkUploadJob(jobId, { status: "done", result: results });
+      })
+      .catch((error) => {
+        updateBulkUploadJob(jobId, {
+          status: "failed",
+          error: error.message || "Bulk upload failed unexpectedly.",
+        });
+      });
+
+    const response = okResponse(
+      {
+        jobId,
+        totalRows,
+        batchSize,
+        totalBatches: totalRows ? Math.ceil(totalRows / batchSize) : 0,
+      },
+      "Bulk upload started. Poll bulk-upload-status/:jobId for progress.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -2187,9 +3533,11 @@ module.exports = {
   getEmployeeScheduleRange,
   getGroupedSchedules,
   getScheduleStats,
-  getScheduleTableStats,          // new
+  getScheduleTableStats, // new
   getScheduleTableGroupedByArea,
-  bulkUploadWeeklySchedule,        // new
+  bulkUploadWeeklySchedule, // new
+  validateBulkUploadFile, // new — read-only format/header check, run before bulkUploadWeeklySchedule
+  getBulkUploadStatus, // new — poll for progress/result of a bulk-upload job
   reassignMismatchedShiftEmployees, // new
-  optimizeRouteAssignments,        // new
+  optimizeRouteAssignments, // new
 };

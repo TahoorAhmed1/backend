@@ -8,51 +8,46 @@ const {
   updateRecord,
   deleteRecord,
 } = require("../../../utils/crudHelper");
-const { badRequestResponse, okResponse } = require("../../../constants/responses");
+const { badRequestResponse, okResponse, createSuccessResponse } = require("../../../constants/responses");
+
+
 
 const createVehicle = async (req, res, next) => {
   try {
-    const {
-      vehicleNumber,
-      type,
-      make,
-      model,
-      year,
-      capacity,
-      vendorId,
-      driverId,
-      status,
-      notes,
-    } = req.body;
+    const { vehicleNumber, type, make, model, year, capacity, vendorId, driverId, status, notes } = req.body;
 
-    
-    const existingVehicle = await prisma.vehicle.findUnique({
-      where: { vehicleNumber },
-    });
-
+    const existingVehicle = await prisma.vehicle.findUnique({ where: { vehicleNumber } });
     if (existingVehicle) {
-      const response = badRequestResponse(
-        "Vehicle with this number already exists."
-      );
+      const response = badRequestResponse("Vehicle with this number already exists.");
       return res.status(response.status.code).json(response);
     }
 
-    const response = await createRecord(prisma.vehicle, {
-      vehicleNumber,
-      type,
-      make,
-      model,
-      year,
-      capacity,
-      vendorId,
-      driverId,
-      status: status || "ACTIVE",
-      notes,
+    const vehicle = await prisma.$transaction(async (tx) => {
+      if (driverId) {
+        const driver = await tx.driver.findUnique({ where: { id: driverId } });
+        if (!driver) {
+          const err = new Error("Driver not found.");
+          err.isBadRequest = true;
+          throw err;
+        }
+        await tx.vehicle.updateMany({
+          where: { driverId },
+          data: { driverId: null },
+        });
+      }
+
+      return tx.vehicle.create({
+        data: { vehicleNumber, type, make, model, year, capacity, vendorId, driverId, status: status || "ACTIVE", notes },
+      });
     });
 
+    const response = createSuccessResponse(vehicle, "Record created successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error)
+    if (error.isBadRequest) {
+      const errorResponse = badRequestResponse  (error.message);
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
     next(error);
   }
 };

@@ -16,6 +16,8 @@ const {
   bulkUploadWeeklySchedule,
   reassignMismatchedShiftEmployees,
   optimizeRouteAssignments,
+  getBulkUploadStatus,
+  validateBulkUploadFile,
 } = require("../../../controllers/client/schedule/weeklySchedule.controller");
 const upload = require("../../../middlewares/upload.middleware");
 
@@ -31,10 +33,16 @@ router.get("/schedule-table/stats", getScheduleTableStats);
 router.post("/reassignMismatchedShiftEmployees", reassignMismatchedShiftEmployees);
 router.post("/optimize", optimizeRouteAssignments);
 router.get("/schedule-table/grouped-by-area", getScheduleTableGroupedByArea);
+router.get("/weekly-schedule/bulk-upload-status/:jobId", getBulkUploadStatus);
 
 router.get("/:id", getWeeklyScheduleById);
 router.patch("/:id", updateWeeklySchedule);
 router.delete("/:id", deleteWeeklySchedule);
+router.post(
+  "/weekly-schedule/validate-upload",
+  upload.single("file"),          
+  validateBulkUploadFile
+);
 
 router.post("/bulk-upload", upload.single("file"), bulkUploadWeeklySchedule);
 

@@ -117,7 +117,7 @@ const getDriverById = async (req, res, next) => {
 const updateDriver = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const updateData = req.body;
+    const { vehicleId, ...updateData } = req.body;
 
     const driver = await prisma.driver.findUnique({ where: { id } });
     if (!driver) {
@@ -138,6 +138,28 @@ const updateDriver = async (req, res, next) => {
     }
 
     const response = await prisma.$transaction(async (tx) => {
+      // vehicleId isn't a Driver column — the FK lives on Vehicle.driverId
+      if (vehicleId !== undefined) {
+        // Free this driver from whatever vehicle currently holds them
+        await tx.vehicle.updateMany({
+          where: { driverId: id },
+          data: { driverId: null },
+        });
+
+        if (vehicleId) {
+          const targetVehicle = await tx.vehicle.findUnique({ where: { id: vehicleId } });
+          if (!targetVehicle) {
+            const err = new Error("Vehicle not found.");
+            err.isBadRequest = true;
+            throw err;
+          }
+          await tx.vehicle.update({
+            where: { id: vehicleId },
+            data: { driverId: id },
+          });
+        }
+      }
+
       const updatedDriver = await tx.driver.update({
         where: { id },
         data: updateData,
@@ -156,6 +178,10 @@ const updateDriver = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    if (error.isBadRequest) {
+      const errorResponse = badRequestResponse(error.message);
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
     next(error);
   }
 };

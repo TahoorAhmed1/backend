@@ -144,6 +144,8 @@ CREATE TABLE "Driver" (
     "shiftLabel" TEXT,
     "status" "DriverStatus" NOT NULL DEFAULT 'AVAILABLE',
     "notes" TEXT,
+    "maxDailyHours" INTEGER,
+    "maxWeeklyHours" INTEGER,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "userId" TEXT,
@@ -170,6 +172,21 @@ CREATE TABLE "Route" (
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
     CONSTRAINT "Route_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Trip" (
+    "id" TEXT NOT NULL,
+    "routeId" TEXT NOT NULL,
+    "tripNumber" INTEGER NOT NULL DEFAULT 1,
+    "driverId" TEXT,
+    "vehicleId" TEXT,
+    "shiftTiming" TEXT,
+    "status" "RouteStatus" NOT NULL DEFAULT 'ACTIVE',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Trip_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -204,6 +221,7 @@ CREATE TABLE "WeeklySchedule" (
     "weekStart" TIMESTAMP(3) NOT NULL,
     "employeeId" TEXT NOT NULL,
     "routeId" TEXT,
+    "tripId" TEXT,
     "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "driverId" TEXT,
     "vehicleId" TEXT,
@@ -322,6 +340,20 @@ CREATE TABLE "AuditLog" (
 );
 
 -- CreateTable
+CREATE TABLE "ScheduleException" (
+    "id" TEXT NOT NULL,
+    "weekStart" TIMESTAMP(3) NOT NULL,
+    "employeeCode" TEXT,
+    "rowNumber" INTEGER,
+    "reason" TEXT NOT NULL,
+    "rawData" JSONB,
+    "resolved" BOOLEAN NOT NULL DEFAULT false,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "ScheduleException_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "Notification" (
     "id" TEXT NOT NULL,
     "userId" TEXT NOT NULL,
@@ -374,6 +406,18 @@ CREATE INDEX "Route_areaId_idx" ON "Route"("areaId");
 CREATE INDEX "Route_subAreaId_idx" ON "Route"("subAreaId");
 
 -- CreateIndex
+CREATE INDEX "Trip_routeId_idx" ON "Trip"("routeId");
+
+-- CreateIndex
+CREATE INDEX "Trip_driverId_idx" ON "Trip"("driverId");
+
+-- CreateIndex
+CREATE INDEX "Trip_vehicleId_idx" ON "Trip"("vehicleId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Trip_routeId_tripNumber_key" ON "Trip"("routeId", "tripNumber");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Employee_employeeCode_key" ON "Employee"("employeeCode");
 
 -- CreateIndex
@@ -387,6 +431,9 @@ CREATE INDEX "WeeklySchedule_weekStart_idx" ON "WeeklySchedule"("weekStart");
 
 -- CreateIndex
 CREATE INDEX "WeeklySchedule_employeeId_idx" ON "WeeklySchedule"("employeeId");
+
+-- CreateIndex
+CREATE INDEX "WeeklySchedule_tripId_idx" ON "WeeklySchedule"("tripId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "WeeklySchedule_employeeId_weekStart_key" ON "WeeklySchedule"("employeeId", "weekStart");
@@ -405,6 +452,9 @@ CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "User_qr_code_key" ON "User"("qr_code");
+
+-- CreateIndex
+CREATE INDEX "ScheduleException_weekStart_idx" ON "ScheduleException"("weekStart");
 
 -- AddForeignKey
 ALTER TABLE "SubArea" ADD CONSTRAINT "SubArea_areaId_fkey" FOREIGN KEY ("areaId") REFERENCES "Area"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -434,6 +484,15 @@ ALTER TABLE "Route" ADD CONSTRAINT "Route_subAreaId_fkey" FOREIGN KEY ("subAreaI
 ALTER TABLE "Route" ADD CONSTRAINT "Route_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "Trip" ADD CONSTRAINT "Trip_routeId_fkey" FOREIGN KEY ("routeId") REFERENCES "Route"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Trip" ADD CONSTRAINT "Trip_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Trip" ADD CONSTRAINT "Trip_vehicleId_fkey" FOREIGN KEY ("vehicleId") REFERENCES "Vehicle"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Employee" ADD CONSTRAINT "Employee_departmentId_fkey" FOREIGN KEY ("departmentId") REFERENCES "Department"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -453,6 +512,9 @@ ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_employeeId_fkey" FOR
 
 -- AddForeignKey
 ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_routeId_fkey" FOREIGN KEY ("routeId") REFERENCES "Route"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_tripId_fkey" FOREIGN KEY ("tripId") REFERENCES "Trip"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "WeeklySchedule" ADD CONSTRAINT "WeeklySchedule_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE SET NULL ON UPDATE CASCADE;

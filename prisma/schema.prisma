@@ -252,6 +252,17 @@
       trips           Trip[]
       complaints      Complaint[]
       weeklySchedules WeeklySchedule[]
+
+      // Backs findOrCreateDriver's case-insensitive name lookup
+      // (prisma.driver.findFirst({ where: { name: { equals, mode: "insensitive" } } })),
+      // which previously had no index to use and fell back to a full table
+      // scan on every driver name not already in the current job's cache.
+      // A plain btree index on `name` still helps Postgres's ILIKE/equals
+      // planning even though it isn't a perfect case-insensitive index —
+      // if driver-name lookups still show up as slow in query logs once the
+      // table is large, consider the `citext` extension for this column
+      // instead of String, or a normalized-lowercase shadow column.
+      @@index([name])
     }
 
 
@@ -263,7 +274,7 @@
       subAreaId      String?
       officeLocation OfficeLocation?
       serviceType    ServiceType     @default(PICK_AND_DROP)
-      // Aggregate seating across all ACTIVE trips on this route (sum of each
+      // Aggregate seating across all ACTIVE trips on this  dev (sum of each
       // trip's vehicle capacity). Kept in sync by the route/trip controller
       // whenever a trip is added/updated/removed — it's a denormalized
       // rollup for list views, NOT the source of truth. The source of truth
@@ -549,3 +560,4 @@
       link      String?
       createdAt DateTime           @default(now())
     }
+  
