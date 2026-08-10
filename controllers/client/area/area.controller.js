@@ -1,5 +1,3 @@
-
-
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -14,13 +12,14 @@ const createArea = async (req, res, next) => {
   try {
     const { name, city } = req.body;
 
-    
     const existingArea = await prisma.area.findUnique({
       where: { name },
     });
 
     if (existingArea) {
-      const response = badRequestResponse("Area with this name already exists.");
+      const response = badRequestResponse(
+        "Area with this name already exists.",
+      );
       return res.status(response.status.code).json(response);
     }
 
@@ -44,9 +43,9 @@ const getAllAreas = async (req, res, next) => {
       take: parseInt(take),
       include: {
         subAreas: {
-          include:{
- blocks:true
-          }
+          include: {
+            blocks: true,
+          },
         },
         employees: {
           select: { id: true, name: true },
@@ -98,21 +97,19 @@ const updateArea = async (req, res, next) => {
     const { id } = req.params;
     const { name, city } = req.body;
 
-    
     const area = await prisma.area.findUnique({ where: { id } });
     if (!area) {
       const errorResponse = badRequestResponse("Area not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
     if (name && name !== area.name) {
       const existingArea = await prisma.area.findUnique({
         where: { name },
       });
       if (existingArea) {
         const errorResponse = badRequestResponse(
-          "Area with this name already exists."
+          "Area with this name already exists.",
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
@@ -133,7 +130,6 @@ const deleteArea = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    
     const area = await prisma.area.findUnique({
       where: { id },
       include: { subAreas: true, employees: true, routes: true },
@@ -144,10 +140,9 @@ const deleteArea = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
     if (area.employees.length > 0 || area.routes.length > 0) {
       const errorResponse = badRequestResponse(
-        "Cannot delete area with associated employees or routes."
+        "Cannot delete area with associated employees or routes.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -197,7 +192,10 @@ const getAreaStats = async (req, res, next) => {
     };
 
     const { okResponse } = require("../../../../constants/responses");
-    const response = okResponse(stats, "Area statistics retrieved successfully.");
+    const response = okResponse(
+      stats,
+      "Area statistics retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);

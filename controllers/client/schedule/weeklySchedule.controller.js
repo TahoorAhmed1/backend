@@ -418,38 +418,33 @@ const parseDriverEntry = (raw) => parseDriverEntries(raw)[0] || null;
 // two rows ago. This is the single biggest contributor to "upload takes
 // forever": ~20+ sequential DB calls per row, most of them re-fetching data
 // that hasn't changed since the last row.
-const findOrCreateDriver = async (name, phone, cache, extraCaches) => {
-  if (!name) return { driver: null, created: false };
-  const key = name.trim().toLowerCase();
-  if (cache?.has(key)) return { driver: cache.get(key), created: false };
+/**
+ * OPTIMIZATION: drivers now come from the seeded Driver master data (see
+ * prisma/seed.js) instead of being invented on the fly from whatever name
+ * happened to be typed into a weekly sheet. This is a plain lookup —
+ * NEVER creates a driver. A name on the sheet that doesn't match anyone in
+ * the master data is a data problem (typo, someone not onboarded yet)
+ * that should be visible and fixed at the source, not silently papered
+ * over with a fresh throwaway Driver row (which is exactly what used to
+ * happen, and is how the master data got messy in the first place).
+ *
+ * Matches by name only (case-insensitive) — the master seed already
+ * carries phone/CNIC/vendor, so there's nothing to fill in from the
+ * sheet's row on a hit, unlike the old create path.
+ */
+const findDriver = async (name, cache, extraCaches) => {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return null;
+  const key = trimmed.toLowerCase();
+  if (cache?.has(key)) return cache.get(key);
 
-  let driver = await prisma.driver.findFirst({
-    where: { name: { equals: name, mode: "insensitive" } },
+  const driver = await prisma.driver.findFirst({
+    where: { name: { equals: trimmed, mode: "insensitive" } },
+    include: { vehicle: true },
   });
-  let created = false;
-  if (!driver) {
-    driver = await prisma.driver.create({
-      data: {
-        name,
-        // FIX: Driver.phone is the schema field (Driver has no
-        // `contactNumber` — that's an Employee field). This was throwing
-        // "Unknown argument `contactNumber`" on every brand-new driver,
-        // which — since this runs inside the row's try/catch — silently
-        // skipped the whole row instead of just failing to save a phone
-        // number.
-        phone: phone || undefined,
-        status: "AVAILABLE",
-      },
-    });
-    created = true;
-    // Keep the job-wide "available drivers" pool warm so a driver created
-    // mid-upload is immediately eligible for auto-assignment on later rows,
-    // without re-querying the DB for the whole pool.
-    extraCaches?.availableDrivers?.push({ ...driver, vehicle: null });
-  }
-  extraCaches?.driverById?.set(driver.id, driver);
-  cache?.set(key, driver);
-  return { driver, created };
+  cache?.set(key, driver || null);
+  if (driver) extraCaches?.driverById?.set(driver.id, driver);
+  return driver;
 };
 
 /**
@@ -458,27 +453,31 @@ const findOrCreateDriver = async (name, phone, cache, extraCaches) => {
  * `prisma.vehicle.count({ where: { status: "ACTIVE" } })`). Adjust field
  * names below if your Vehicle model differs.
  */
-const findOrCreateVehicle = async (vehicleReg, cache, extraCaches) => {
-  if (!vehicleReg) return { vehicle: null, created: false };
-  const key = vehicleReg.trim().toUpperCase();
-  if (cache?.has(key)) return { vehicle: cache.get(key), created: false };
+/**
+ * OPTIMIZATION: vehicles now come from the seeded Vehicle master data too
+ * (each already paired 1:1 to its driver — see prisma/seed.js). This is a
+ * plain lookup by plate number, used only when the sheet explicitly names
+ * a DIFFERENT vehicle than the one already paired to the matched driver
+ * (a genuine this-week reassignment). It never creates a vehicle — an
+ * unrecognized plate is a data problem to fix at the source, not a reason
+ * to spin up a bare placeholder row.
+ *
+ * (This replaces both the old findOrCreateVehicle AND
+ * findOrCreateDefaultVehicleForDriver — the latter existed specifically
+ * to paper over drivers having no paired vehicle at all, which can't
+ * happen anymore now that every seeded driver already has one.)
+ */
+const findVehicleByReg = async (vehicleReg, cache) => {
+  const trimmed = String(vehicleReg || "").trim();
+  if (!trimmed) return null;
+  const key = trimmed.toUpperCase();
+  if (cache?.has(key)) return cache.get(key);
 
-  let vehicle = await prisma.vehicle.findFirst({
-    where: { vehicleNumber: { equals: vehicleReg, mode: "insensitive" } },
+  const vehicle = await prisma.vehicle.findFirst({
+    where: { vehicleNumber: { equals: trimmed, mode: "insensitive" } },
   });
-  let created = false;
-  if (!vehicle) {
-    vehicle = await prisma.vehicle.create({
-      data: { vehicleNumber: vehicleReg, status: "ACTIVE" },
-    });
-    created = true;
-    // Same idea as findOrCreateDriver's availableDrivers push: keep the
-    // job-wide "active vehicles" pool warm so a vehicle created mid-upload
-    // is immediately eligible for auto-assignment on later rows.
-    extraCaches?.activeVehicles?.push(vehicle);
-  }
-  cache?.set(key, vehicle);
-  return { vehicle, created };
+  cache?.set(key, vehicle || null);
+  return vehicle;
 };
 
 const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
@@ -1005,79 +1004,53 @@ const resolveConflictFreeAssignment = async ({
 /**
  * NOTE: assumes Vendor has a `name` field. Adjust if different.
  */
-const findOrCreateVendor = async (name, cache) => {
-  if (!name) return { vendor: null, created: false };
-  const key = name.trim().toLowerCase();
-  if (cache?.has(key)) return { vendor: cache.get(key), created: false };
-
-  let vendor = await prisma.vendor.findFirst({
-    where: { name: { equals: name, mode: "insensitive" } },
-  });
-  let created = false;
-  if (!vendor) {
-    vendor = await prisma.vendor.create({ data: { name } });
-    created = true;
-  }
-  cache?.set(key, vendor);
-  return { vendor, created };
-};
-
-// Used by findOrCreateEmployee and findOrCreateRouteAndTrip, which look up
-// "Area" by name, so the same area is only ever fetched/created once per
-// upload job instead of once per row.
-const findOrCreateArea = async (name, cache) => {
-  if (!name) return null;
-  const key = name.trim().toLowerCase();
+/**
+ * OPTIMIZATION: vendors now come from the seeded Vendor master data
+ * (prisma/seed.js). Find-only, same reasoning as findDriver/
+ * findVehicleByReg above — an unrecognized vendor name on a sheet is a
+ * typo or a genuinely new vendor that should be added deliberately
+ * (there are only a handful of these; it's cheap to add for real), not
+ * something to silently fork into a near-duplicate Vendor row.
+ */
+const findVendor = async (name, cache) => {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return null;
+  const key = trimmed.toLowerCase();
   if (cache?.has(key)) return cache.get(key);
 
-  let area = await prisma.area.findFirst({
-    where: { name: { equals: name, mode: "insensitive" } },
+  const vendor = await prisma.vendor.findFirst({
+    where: { name: { equals: trimmed, mode: "insensitive" } },
   });
-  if (!area) {
-    area = await prisma.area.create({ data: { name } });
-  }
-  cache?.set(key, area);
-  return area;
+  cache?.set(key, vendor || null);
+  return vendor;
 };
 
 /**
- * NOTE: assumes Employee has `employeeCode` (unique), `name`, `contactNumber`,
- * `areaId`, `entity`, `shiftTiming`, `status` fields, matching how Employee is
- * used elsewhere in this file (getScheduleTableGroupedByArea). Adjust field
- * names below if your Employee model differs.
+ * OPTIMIZATION: employees now come from the seeded Employee master data
+ * (prisma/seed-employees.js), which already carries the canonical
+ * area/subArea/block for each employee (from the real HR address data,
+ * not whatever text happened to be typed into this week's sheet). This is
+ * a plain lookup by employeeCode — it NEVER creates an employee. Someone
+ * appearing on a weekly sheet who isn't in the master data needs to be
+ * added there first (or the code column has a typo) — that's a data
+ * problem to surface, not something to paper over with a bare-bones
+ * Employee row missing gender/CNIC/department/etc.
+ *
+ * Returns the employee with area/subArea/block already attached, since
+ * the caller uses them for route grouping instead of re-parsing the
+ * sheet's own (less reliable) Area/Sub Area/Block columns — see the call
+ * site in processBulkUploadJob.
  */
-const findOrCreateEmployee = async (row, caches) => {
-  if (caches?.employee?.has(row.employeeCode)) {
-    return { employee: caches.employee.get(row.employeeCode), created: false };
+const findEmployee = async (employeeCode, caches) => {
+  if (caches?.employee?.has(employeeCode)) {
+    return caches.employee.get(employeeCode) || null;
   }
-
-  let employee = await prisma.employee.findUnique({
-    where: { employeeCode: row.employeeCode },
+  const employee = await prisma.employee.findUnique({
+    where: { employeeCode },
+    include: { area: true, subArea: true, block: true },
   });
-  if (employee) {
-    caches?.employee?.set(row.employeeCode, employee);
-    return { employee, created: false };
-  }
-
-  let areaId;
-  if (row.area) {
-    const area = await findOrCreateArea(row.area, caches?.area);
-    areaId = area?.id;
-  }
-
-  employee = await prisma.employee.create({
-    data: {
-      employeeCode: row.employeeCode,
-      name: row.name || row.employeeCode,
-      contactNumber: row.contact || undefined,
-      areaId,
-      entity: row.entity || undefined,
-      shiftTiming: row.shiftTiming || undefined,
-      status: "ACTIVE",
-    },
-  });
-  caches?.employee?.set(row.employeeCode, employee);
-  return { employee, created: true };
+  caches?.employee?.set(employeeCode, employee || null);
+  return employee;
 };
 
 /**
@@ -1213,6 +1186,16 @@ const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
 /**
  * Resolves the Route + Trip a sheet row should be assigned to.
  *
+ * Takes an already-resolved `areaRecord` (the matched Employee's own
+ * area — see findEmployee/processBulkUploadJob) rather than an area name
+ * string to look up. Routes/Trips still get created on the fly here (that
+ * part is legitimately dynamic — shift timings and capacity needs change
+ * week to week), but Area no longer does: it comes from the employee
+ * master data now, so a sheet's own "Area" column text (which can vary
+ * week to week for the same person — typos, alternate spellings) no
+ * longer risks fragmenting into duplicate Area rows or misrouting someone
+ * away from their usual corridor.
+ *
  * Area + Shift together define a "corridor" — exactly ONE Route row per
  * corridor (no more routeCode-L2/-L3 route "legs"; that pre-Trip pattern is
  * retired). Capacity overflow within a corridor is handled by opening
@@ -1235,7 +1218,7 @@ const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
  *      stay a correct rollup of the trips underneath it.
  */
 const findOrCreateRouteAndTrip = async (
-  areaName,
+  areaRecord, // already-resolved Area object (or null) — no lookup/creation done here anymore
   vehicleType,
   shiftTiming,
   campaign,
@@ -1245,11 +1228,6 @@ const findOrCreateRouteAndTrip = async (
   excludeEmployeeId,
   caches,
 ) => {
-  let areaRecord = null;
-  if (areaName) {
-    areaRecord = await findOrCreateArea(areaName, caches?.area);
-  }
-
   let route = null;
   if (areaRecord) {
     // Routes-per-area are also cached per job: once we've loaded a given
@@ -1286,7 +1264,7 @@ const findOrCreateRouteAndTrip = async (
   let routeCreated = false;
   if (!route) {
     const baseName =
-      [areaName, vehicleType, shiftTiming].filter(Boolean).join(" - ") ||
+      [areaRecord?.name, vehicleType, shiftTiming].filter(Boolean).join(" - ") ||
       campaign ||
       "General Route";
     const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
@@ -1568,7 +1546,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       groups.get(key).entries.push(s);
     });
 
-    const areaName = route.area?.name;
+    const areaRecord = route.area || null;
     const results = {
       updated: 0,
       routesCreated: 0,
@@ -1579,7 +1557,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     for (const { shiftTiming, entries } of groups.values()) {
       for (const entry of entries) {
         const routeResult = await findOrCreateRouteAndTrip(
-          areaName,
+          areaRecord,
           undefined, // vehicle type unknown at this point — falls back to a safe default capacity
           shiftTiming,
           undefined,
@@ -2564,12 +2542,19 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
  *                encode a date per row — the whole sheet represents one week)
  *
  * For each data row:
- *   1. Finds the Employee by "Employee ID" (employeeCode); auto-creates one
- *      from Name/Contact/Area if it doesn't exist yet.
- *   2. Finds/creates the Driver and Vendor by name.
- *   3. Finds/creates the Route from Area + Vehicle Type + Shift Timing (the
- *      sheet has no explicit Route column, so employees sharing all three of
- *      these are treated as riding the same route).
+ *   1. Finds the Employee by "Employee ID" (employeeCode) in the seeded
+ *      master employee data — never creates one. Not found = row skipped
+ *      and counted in results.employeesNotFound.
+ *   2. Finds the Driver and Vendor by name in their own seeded master
+ *      data — never created either. A row can still be saved without a
+ *      match (as DRAFT, missing driver/vendor); see below.
+ *   3. Finds/creates the Route from the matched employee's own Area
+ *      (master data, not the sheet's Area column) + Vehicle Type + Shift
+ *      Timing (the sheet has no explicit Route column, so employees
+ *      sharing all three of these are treated as riding the same route).
+ *      Route/Trip are the only things this job still creates on the fly
+ *      — they're genuinely dynamic week to week, unlike Employee/Driver/
+ *      Vehicle/Vendor.
  *   4. Derives serviceType from the "Drop"/"Pick" text sometimes found in the
  *      time columns, and OFF days from the "Off Day" column.
  *   5. Upserts (create or update) the WeeklySchedule for that employee + week.
@@ -2579,10 +2564,13 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
  * another reason (bad data, DB error) are recorded in `skipped` rather than
  * aborting the whole import.
  *
- * NOTE on vehicles: the sheet only gives a Vehicle Type (e.g. "Hiace"), never
- * a real vehicle number/plate, so we deliberately do NOT auto-create a
- * Vehicle record here — that field feeds the Route name instead. If you want
- * vehicleId populated too, the sheet needs an actual vehicle-number column.
+ * NOTE on vehicles: every seeded Driver already has a Vehicle paired 1:1
+ * to it (prisma/seed.js) — this job just reads that pairing
+ * (driver.vehicle) instead of ever creating a vehicle itself. If the
+ * sheet's Vehicle Reg column names a DIFFERENT plate than the driver's
+ * own (a genuine this-week reassignment), that plate is looked up — but
+ * only used if it's found in the master data; otherwise the driver's own
+ * vehicle is kept and a note is left on the row.
  */
 // ---------- Bulk Upload Job Tracking (progress + status polling) ----------
 //
@@ -2616,7 +2604,7 @@ const MIN_BATCH_SIZE = 10;
 const MAX_BATCH_SIZE = 1000;
 const DEFAULT_BATCH_SIZE = 100;
 
-const createBulkUploadJob = (totalRows, batchSize) => {
+const createBulkUploadJob = (totalRows, batchSize, weekStartDate) => {
   // Sweep old finished jobs opportunistically so the Map doesn't grow
   // unbounded on a long-running server.
   const cutoff = Date.now() - BULK_UPLOAD_JOB_TTL_MS;
@@ -2626,8 +2614,27 @@ const createBulkUploadJob = (totalRows, batchSize) => {
     }
   }
 
+  // GUARD: refuse to start a second concurrent upload for the SAME week.
+  // Two jobs racing on the same weekStart both load "what's already
+  // scheduled this week" into their own in-memory cache at ~the same
+  // moment, both see nothing there yet for a given employee, and both try
+  // to write/create the same WeeklySchedule (and sometimes the same new
+  // Route) at once — one write wins, the other throws a duplicate-key
+  // error and that row ends up in `skipped`. Rejecting the second request
+  // outright (rather than letting them race) is what actually prevents
+  // this, instead of just making it less likely.
+  const weekKey = weekStartDate.toISOString();
+  const conflicting = Array.from(bulkUploadJobs.values()).find(
+    (job) => job.status === "processing" && job.weekKey === weekKey,
+  );
+  if (conflicting) {
+    return { conflict: true, existingJobId: conflicting.jobId };
+  }
+
   const jobId = `bulkupload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
   bulkUploadJobs.set(jobId, {
+    jobId,
+    weekKey,
     status: "processing", // "processing" | "done" | "failed"
     totalRows,
     processedRows: 0,
@@ -2643,7 +2650,7 @@ const createBulkUploadJob = (totalRows, batchSize) => {
     result: null,
     error: null,
   });
-  return jobId;
+  return { conflict: false, jobId };
 };
 
 const updateBulkUploadJob = (jobId, patch) => {
@@ -2703,10 +2710,18 @@ const getBulkUploadStatus = async (req, res, next) => {
  * Does the actual row-by-row processing for a bulk upload, running AFTER
  * the HTTP response has already gone back to the client with a jobId. Every
  * lookup that's likely to repeat across rows (employee, driver, vendor,
- * vehicle, area, a given area's routes) goes through the `caches` object so
- * a sheet with, say, 300 rows but only 8 distinct drivers doesn't pay for
- * 300 driver lookups — see findOrCreateDriver/Vendor/Vehicle/Area and
- * findOrCreateRouteAndTrip above.
+ * vehicle, a given area's routes) goes through the `caches` object so a
+ * sheet with, say, 300 rows but only 8 distinct drivers doesn't pay for
+ * 300 driver lookups — see findEmployee/findDriver/findVendor/
+ * findVehicleByReg and findOrCreateRouteAndTrip above.
+ *
+ * OPTIMIZATION: Employee/Driver/Vehicle/Vendor are all seeded master data
+ * now (prisma/seed.js, prisma/seed-employees.js) — this job only ever
+ * LOOKS UP those four, it never creates them anymore. Only Route/Trip
+ * (which are legitimately dynamic week to week) still get created here.
+ * A row whose employee code, driver name, or vendor name doesn't match
+ * the master data is counted in results.employeesNotFound/driversNotFound/
+ * vendorsNotFound and (for employee) skipped outright — see below.
  */
 const processBulkUploadJob = async (
   jobId,
@@ -2717,10 +2732,14 @@ const processBulkUploadJob = async (
   const results = {
     created: 0,
     updated: 0,
-    employeesCreated: 0,
-    driversCreated: 0,
-    vendorsCreated: 0,
-    vehiclesCreated: 0,
+    // Rows whose employeeCode / driver name / vehicle plate didn't match
+    // anything in the seeded master data — surfaced explicitly instead of
+    // silently creating throwaway records for them (see findEmployee/
+    // findDriver/findVehicleByReg above). Fix these at the source (master
+    // data or the sheet) rather than re-uploading and hoping.
+    employeesNotFound: 0,
+    driversNotFound: 0,
+    vendorsNotFound: 0,
     routesCreated: 0,
     routeLegsOpenedForOverflow: 0,
     driversAutoAssigned: 0,
@@ -2794,7 +2813,6 @@ const processBulkUploadJob = async (
     driver: new Map(),
     vendor: new Map(),
     vehicle: new Map(),
-    area: new Map(),
     routesByArea: new Map(),
     // FIX (perf): trips-per-route and the route record itself were being
     // re-fetched from the DB on every single row that touched a given
@@ -2895,8 +2913,12 @@ const processBulkUploadJob = async (
   }
 
   if (allEmployeeCodes.size) {
+    // include area/subArea/block: this job now sources routing area from
+    // the employee's own master-data address instead of re-deriving it
+    // from the sheet's Area column — see findEmployee's doc comment.
     const existingEmployees = await prisma.employee.findMany({
       where: { employeeCode: { in: Array.from(allEmployeeCodes) } },
+      include: { area: true, subArea: true, block: true },
     });
     for (const emp of existingEmployees)
       caches.employee.set(emp.employeeCode, emp);
@@ -2922,64 +2944,97 @@ const processBulkUploadJob = async (
       if (!employeeCode || !/^\d+$/.test(employeeCode)) continue;
 
       try {
-        const { employee, created: employeeCreated } =
-          await findOrCreateEmployee(
-            {
-              employeeCode,
-              name: get("name"),
-              contact: get("contact"),
-              area: get("area"),
-              entity: get("entity"),
-              shiftTiming: get("shiftTiming"),
-            },
-            caches,
+        // OPTIMIZATION: employee/driver/vendor/vehicle are seeded master
+        // data now — find-only, never created here. See findEmployee/
+        // findDriver/findVendor/findVehicleByReg above for why.
+        const employee = await findEmployee(employeeCode, caches);
+        if (!employee) {
+          results.employeesNotFound++;
+          await skipRow(
+            sheetName,
+            rowNum,
+            employeeCode,
+            `Employee code ${employeeCode} not found in the master employee data — add them via the employee seed first, or check for a typo in this sheet.`,
+            raw,
           );
-        if (employeeCreated) results.employeesCreated++;
+          continue;
+        }
 
         // A row can list more than one driver (e.g. "Tariq 03043160572Shahrukh
-        // 03192121756"). WeeklySchedule only stores a single driverId, but we
-        // still create/find EVERY driver named on the row so none of them go
-        // missing from the Driver table — the first one becomes the primary
-        // driverId for this schedule entry.
+        // 03192121756"). WeeklySchedule only stores a single driverId, so
+        // only the first NAMED driver that actually matches the master
+        // Driver data is used; any name on the row that doesn't match
+        // anyone is reported, not silently dropped.
         const driverEntries = parseDriverEntries(get("drivers"));
         let driverId;
+        let driverRecord;
         for (let d = 0; d < driverEntries.length; d++) {
-          const { driver, created } = await findOrCreateDriver(
+          const driver = await findDriver(
             driverEntries[d].name,
-            driverEntries[d].phone,
             caches.driver,
             caches,
           );
-          if (created) results.driversCreated++;
-          if (d === 0) driverId = driver?.id;
+          if (!driver) {
+            results.driversNotFound++;
+            results.notes.push({
+              row: rowNum,
+              employeeCode,
+              note: `Driver "${driverEntries[d].name}" not found in the master driver data — not assigned. Add them via the driver seed, or fix the name if it's a typo.`,
+            });
+            continue;
+          }
+          if (!driverId) {
+            driverId = driver.id;
+            driverRecord = driver;
+          }
         }
 
         const vendorName = get("vendor");
         let vendorId;
         if (vendorName) {
-          const { vendor, created } = await findOrCreateVendor(
-            vendorName,
-            caches.vendor,
-          );
-          vendorId = vendor?.id;
-          if (created) results.vendorsCreated++;
+          const vendor = await findVendor(vendorName, caches.vendor);
+          if (vendor) {
+            vendorId = vendor.id;
+          } else {
+            results.vendorsNotFound++;
+            results.notes.push({
+              row: rowNum,
+              employeeCode,
+              note: `Vendor "${vendorName}" not found in the master vendor data — left unassigned.`,
+            });
+          }
         }
 
-        const vehicleReg = get("vehicleReg");
-        let vehicleId;
-        if (vehicleReg) {
-          const { vehicle, created } = await findOrCreateVehicle(
-            vehicleReg,
-            caches.vehicle,
-            caches,
-          );
-          vehicleId = vehicle?.id;
-          if (created) results.vehiclesCreated++;
-        }
-
-        const areaName = get("area");
+        // Area now comes from the employee's own master-data address
+        // (already loaded via findEmployee's include) rather than the
+        // sheet's own Area column — see findOrCreateRouteAndTrip's doc
+        // comment for why. The sheet's Area/Vehicle Type/Shift Timing
+        // columns are still used for vehicle-type/shift matching, which
+        // genuinely can vary week to week.
+        const areaRecord = employee.area || null;
         const vehicleType = get("vehicleType");
         const shiftTiming = get("shiftTiming");
+
+        // Vehicle: prefer whatever's already paired to the matched driver
+        // (seeded 1:1 — see prisma/seed.js) since that's the normal case.
+        // Only look up a DIFFERENT vehicle when the sheet explicitly names
+        // a plate that isn't the driver's own — a genuine this-week
+        // reassignment — and only if that plate actually exists in the
+        // master data.
+        const vehicleReg = get("vehicleReg");
+        let vehicleId = driverRecord?.vehicle?.id;
+        if (vehicleReg) {
+          const vehicle = await findVehicleByReg(vehicleReg, caches.vehicle);
+          if (vehicle) {
+            vehicleId = vehicle.id;
+          } else {
+            results.notes.push({
+              row: rowNum,
+              employeeCode,
+              note: `Vehicle "${vehicleReg}" not found in the master vehicle data — kept this driver's own paired vehicle instead.`,
+            });
+          }
+        }
         const campaign = get("campaign") || get("batch");
 
         let route;
@@ -2987,7 +3042,7 @@ const processBulkUploadJob = async (
         let routeCreated = false;
         try {
           const routeResult = await findOrCreateRouteAndTrip(
-            areaName,
+            areaRecord,
             vehicleType,
             shiftTiming,
             campaign,
@@ -3231,10 +3286,8 @@ const processBulkUploadJob = async (
  * long-running upload just because its own HTTP request timed out, since
  * the job keeps running server-side and the status endpoint reflects that.
  *
- * NOTE on vehicles: the sheet only gives a Vehicle Type (e.g. "Hiace"), never
- * a real vehicle number/plate, so we deliberately do NOT auto-create a
- * Vehicle record here — that field feeds the Route name instead. If you want
- * vehicleId populated too, the sheet needs an actual vehicle-number column.
+ * NOTE on vehicles: every seeded Driver already has its Vehicle paired —
+ * see the NOTE on vehicles above processBulkUploadJob for details.
  */
 /**
  * POST /weekly-schedule/validate-upload
@@ -3492,7 +3545,22 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
       }).length;
     }
 
-    const jobId = createBulkUploadJob(totalRows, batchSize);
+    const jobResult = createBulkUploadJob(totalRows, batchSize, weekStartDate);
+    if (jobResult.conflict) {
+      const response = {
+        status: { code: 409, status: false },
+        message:
+          `A bulk upload for the week of ${weekStart} is already running (job ` +
+          `${jobResult.existingJobId}). Wait for it to finish before starting another — ` +
+          `uploading the same week twice at once can cause some rows to fail with a ` +
+          `duplicate-schedule error, since both uploads race to write the same employees' ` +
+          `schedules. Poll GET /weekly-schedule/bulk-upload-status/${jobResult.existingJobId} ` +
+          `for its progress, then re-upload once it's done if you still need to.`,
+        data: { existingJobId: jobResult.existingJobId },
+      };
+      return res.status(response.status.code).json(response);
+    }
+    const jobId = jobResult.jobId;
 
     // Fire-and-forget: intentionally not awaited. Any error the worker
     // throws is caught here so the job is always marked "failed" rather
