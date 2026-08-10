@@ -632,6 +632,8 @@ const assignEmployeeToTrip = async (req, res, next) => {
 const getAllRoutes = async (req, res, next) => {
   try {
     const { skip = 0, take = 10, status, areaId, serviceType } = req.query;
+    const offset = Math.max(Number.parseInt(skip, 10) || 0, 0);
+    const limit = Math.min(Math.max(Number.parseInt(take, 10) || 10, 1), 100);
 
     const where = {};
     if (status) where.status = status;
@@ -641,6 +643,8 @@ const getAllRoutes = async (req, res, next) => {
     const [routes, total] = await Promise.all([
       prisma.route.findMany({
         where,
+        // skip: offset,
+        // take: limit,
 
         include: {
           area: { select: { id: true, name: true } },
@@ -665,6 +669,11 @@ const getAllRoutes = async (req, res, next) => {
     const response = okResponse(
       {
         routes,
+        // pagination: {
+        //   total,
+        //   limit,
+        //   offset,
+        // },
       },
       "Routes retrieved successfully.",
     );

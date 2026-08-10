@@ -866,16 +866,72 @@ const resolveConflictFreeAssignment = async ({
   minCapacity,
   excludeEmployeeId,
   caches,
+  options,
 }) => {
   const notes = [];
-  let driverId = proposedDriverId;
-  let vehicleId = proposedVehicleId;
+  // FIX (real-world bug): this used to start from ONLY this row's own
+  // proposed driver/vehicle (parsed from THIS row's sheet cell). On a
+  // structured sheet where a route/shift group shares one trip (capacity
+  // fill — see findOrCreateTripOnRoute), it's completely normal for the
+  // driver's name to be listed on only the first row of the group, or for
+  // a later row's own cell to be blank/unmatched. Previously that meant
+  // every row without its OWN explicit driver fell straight into
+  // fleet-wide "least loaded available driver" auto-assignment — ignoring
+  // the driver already sitting on the trip this row just landed on — which
+  // could silently overwrite Trip.driverId with a different person and
+  // leave earlier employees' already-saved WeeklySchedule.driverId out of
+  // sync with the trip they're actually riding on.
+  //
+  // Now: the trip's own current driver/vehicle (if any) is authoritative
+  // and WINS over a differing proposedDriverId/proposedVehicleId — a Trip
+  // is one vehicle run with one driver, so once a trip has a driver, a
+  // later row that names someone else must not overwrite it. (An earlier
+  // version of this fix let proposedDriverId win instead, which silently
+  // reassigned the whole trip's driver mid-job and left earlier riders'
+  // already-saved WeeklySchedule.driverId out of sync with the trip they
+  // were actually riding — each employee showed whichever driver was
+  // current at the moment THEIR row was processed, not the trip's real
+  // one.) A row's own proposed driver/vehicle is only used to seed a trip
+  // that doesn't have one yet; fleet-wide auto-assignment below is
+  // reserved for trips that still have no driver/vehicle after that. A
+  // mismatch against an already-set trip driver/vehicle is still surfaced
+  // as a note so it isn't silently lost.
+  let driverId = trip.driverId || proposedDriverId || undefined;
+  let vehicleId = trip.vehicleId || proposedVehicleId || undefined;
+  if (
+    proposedDriverId &&
+    trip.driverId &&
+    proposedDriverId !== trip.driverId
+  ) {
+    notes.push(
+      `This row named a different driver than the one already assigned to Trip #${trip.tripNumber ?? ""} on this route — kept the trip's assigned driver so every rider on the same vehicle run shows the same driver.`,
+    );
+  }
+  if (
+    proposedVehicleId &&
+    trip.vehicleId &&
+    proposedVehicleId !== trip.vehicleId
+  ) {
+    notes.push(
+      `This row named a different vehicle than the one already assigned to Trip #${trip.tripNumber ?? ""} on this route — kept the trip's assigned vehicle.`,
+    );
+  }
   let autoAssignedDriver = false;
   let autoAssignedVehicle = false;
   const shiftTiming =
     candidateShiftTiming || trip.shiftTiming || trip.route?.shiftTiming;
 
-  if (driverId) {
+  // FIX (temporary, per business request — trustProposedDriver): the sheet
+  // already tells us which driver each employee rides with; that's ground
+  // truth, not a suggestion to be second-guessed. Previously ANY flagged
+  // conflict (real or a false positive from a driver legitimately running
+  // more than one shift in a day) silently cleared the requested driver
+  // and handed the row to fleet-wide auto-assignment instead — which is
+  // exactly the "software makes its own assignment instead of following
+  // the sheet" behavior reported. With trustProposedDriver, a flagged
+  // conflict/hours issue no longer clears driverId/vehicleId; it's kept as
+  // given and surfaced as a note for manual review instead.
+  if (driverId && !options?.trustProposedDriver) {
     const conflict = await findDriverConflict(
       driverId,
       weekStartDate,
@@ -890,9 +946,23 @@ const resolveConflictFreeAssignment = async ({
       );
       driverId = undefined;
     }
+  } else if (driverId && options?.trustProposedDriver) {
+    const conflict = await findDriverConflict(
+      driverId,
+      weekStartDate,
+      shiftTiming,
+      trip.id,
+      excludeEmployeeId,
+      caches,
+    );
+    if (conflict) {
+      notes.push(
+        `This driver's shift may overlap (or not leave enough rest around) route "${conflict.route?.routeCode ?? conflict.routeId}" this week — kept as assigned in the sheet; please double-check manually.`,
+      );
+    }
   }
 
-  if (driverId) {
+  if (driverId && !options?.trustProposedDriver) {
     const hoursCheck = await checkDriverWorkingHours(
       prisma,
       driverId,
@@ -908,9 +978,24 @@ const resolveConflictFreeAssignment = async ({
       );
       driverId = undefined;
     }
+  } else if (driverId && options?.trustProposedDriver) {
+    const hoursCheck = await checkDriverWorkingHours(
+      prisma,
+      driverId,
+      weekStartDate,
+      shiftTiming,
+      undefined,
+      excludeEmployeeId,
+      caches,
+    );
+    if (!hoursCheck.ok) {
+      notes.push(
+        `Driver may exceed working-hours limits this week — ${hoursCheck.reason} Kept as assigned in the sheet; please double-check manually.`,
+      );
+    }
   }
 
-  if (vehicleId) {
+  if (vehicleId && !options?.trustProposedDriver) {
     const conflict = await findVehicleConflict(
       vehicleId,
       weekStartDate,
@@ -924,6 +1009,20 @@ const resolveConflictFreeAssignment = async ({
         `Requested vehicle's shift overlaps route "${conflict.route?.routeCode ?? conflict.routeId}" this week — auto-assigned a different available vehicle instead.`,
       );
       vehicleId = undefined;
+    }
+  } else if (vehicleId && options?.trustProposedDriver) {
+    const conflict = await findVehicleConflict(
+      vehicleId,
+      weekStartDate,
+      shiftTiming,
+      trip.id,
+      excludeEmployeeId,
+      caches,
+    );
+    if (conflict) {
+      notes.push(
+        `This vehicle's shift may overlap route "${conflict.route?.routeCode ?? conflict.routeId}" this week — kept as assigned in the sheet; please double-check manually.`,
+      );
     }
   }
 
@@ -977,12 +1076,13 @@ const resolveConflictFreeAssignment = async ({
     driverId !== (trip.driverId || undefined) ||
     vehicleId !== (trip.vehicleId || undefined)
   ) {
-    await prisma.trip.update({
+    const updatedTrip = await prisma.trip.update({
       where: { id: trip.id },
       data: {
         driverId: driverId || null,
         vehicleId: vehicleId || null,
       },
+      include: { vehicle: true, route: true },
     });
     await syncRouteFromTrips(trip.routeId, caches);
     // The trip we just patched, and the route's cached trip list, are now
@@ -990,6 +1090,21 @@ const resolveConflictFreeAssignment = async ({
     // that resolves a trip on it re-reads real data instead of acting on
     // driver/vehicle info from before this reassignment.
     caches?.tripsByRoute?.delete(trip.routeId);
+
+    // FIX (real-world bug — Area-fragmentation, see findOrCreateRouteAndTrip
+    // and findExistingTripForDriverThisWeek): this is the OTHER place a
+    // trip's driver becomes authoritative — auto-assignment for a brand-new
+    // trip, or correcting a proposed driver that turned out to conflict.
+    // Without updating these caches here too, a driver auto-assigned here
+    // wouldn't be found by the next row for the same driver/shift, and
+    // that row would fall through to Area-based matching and potentially
+    // fragment again.
+    if (driverId) caches?.tripIdByDriver?.set(driverId, trip.id);
+    caches?.tripById?.set(trip.id, updatedTrip);
+  } else {
+    // Nothing changed, but the trip's driver (already correct) should
+    // still be discoverable for the next row on the same driver/shift.
+    if (driverId) caches?.tripIdByDriver?.set(driverId, trip.id);
   }
 
   return {
@@ -1184,6 +1299,87 @@ const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
 };
 
 /**
+ * "Does this driver already have a live, same-shift, not-yet-full Trip THIS
+ * WEEK" — checked regardless of which Route/Area it's attached to. This is
+ * the fix for the Area-fragmentation bug documented on
+ * findOrCreateRouteAndTrip: a driver's one real van run legitimately
+ * carries riders from several different home Areas, so "same trip" has to
+ * be decided by (driver + shift), not by (Area + shift).
+ *
+ * Relies on caches.tripIdByDriver, a driverId -> tripId map that's seeded
+ * from the week's existing roster at job start and kept current by every
+ * call site that finalizes a trip's driver (findOrCreateTripOnRoute,
+ * resolveConflictFreeAssignment) — see the writes to it in both. Without
+ * `caches` (single-row call sites like reassign-one), this simply can't
+ * look anything up and falls through to the Area-based path, same as
+ * before; that's fine, since those call sites only ever move one row at a
+ * time and don't have a "this week's rows so far" set to search anyway.
+ */
+const findExistingTripForDriverThisWeek = async (
+  driverId,
+  shiftTiming,
+  vehicleType,
+  weekStartDate,
+  excludeEmployeeId,
+  caches,
+  options = {},
+) => {
+  if (!driverId || !caches?.tripIdByDriver) return null;
+  const tripId = caches.tripIdByDriver.get(driverId);
+  if (!tripId) return null;
+
+  let trip = caches?.tripById?.get(tripId);
+  if (!trip) {
+    trip = await prisma.trip.findUnique({
+      where: { id: tripId },
+      include: { vehicle: true, route: { include: { area: true } } },
+    });
+    if (trip) caches?.tripById?.set(tripId, trip);
+  }
+  if (!trip || trip.status !== "ACTIVE" || trip.driverId !== driverId) {
+    // Stale mapping (trip cancelled, or driver moved off it since) —
+    // don't reuse; let the caller fall through to normal resolution.
+    return null;
+  }
+
+  // Must be the SAME shift — a driver can legitimately run more than one
+  // distinct shift/trip in a week, so this only reuses the trip that
+  // matches THIS row's shift, not just "any trip this driver has."
+  const tripShiftTiming = trip.shiftTiming || trip.route?.shiftTiming;
+  const candidateRange = parseShiftRange(shiftTiming);
+  const tripRange = parseShiftRange(tripShiftTiming);
+  const sameShift =
+    candidateRange && tripRange
+      ? candidateRange.start === tripRange.start &&
+        candidateRange.durationMinutes === tripRange.durationMinutes
+      : normalizeShift(shiftTiming) === normalizeShift(tripShiftTiming);
+  if (!sameShift) return null;
+
+  const capacity = trip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
+  const occupancy = caches?.weekRoster
+    ? caches.weekRoster.filter(
+        (r) =>
+          r.tripId === trip.id &&
+          (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
+      ).length
+    : await countTripOccupancy(trip.id, weekStartDate, excludeEmployeeId);
+  const overCapacity = occupancy >= capacity;
+  // FIX (temporary, per business request): when disableMultiTrip is set,
+  // a full trip is no longer a reason to open a second one — the sheet
+  // already says this employee rides with this specific driver, and
+  // opening an auto-picked second trip/driver for them was exactly the
+  // "software making its own assignment" behavior being turned off here.
+  // Instead: keep everyone who belongs together (same driver + same
+  // shift) on the one trip, over capacity if it comes to that, and let
+  // the caller surface it as a note for manual review. Without
+  // disableMultiTrip, this still behaves as before — full means "let a
+  // real second trip open."
+  if (overCapacity && !options.disableMultiTrip) return null;
+
+  return { trip, route: trip.route, overCapacity };
+};
+
+/**
  * Resolves the Route + Trip a sheet row should be assigned to.
  *
  * Takes an already-resolved `areaRecord` (the matched Employee's own
@@ -1196,16 +1392,36 @@ const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
  * longer risks fragmenting into duplicate Area rows or misrouting someone
  * away from their usual corridor.
  *
- * Area + Shift together define a "corridor" — exactly ONE Route row per
- * corridor (no more routeCode-L2/-L3 route "legs"; that pre-Trip pattern is
- * retired). Capacity overflow within a corridor is handled by opening
- * additional Trip rows (tripNumber 2, 3, ...) UNDER that same route, which
- * is what the Trip model exists for.
+ * FIX (real-world bug, confirmed against actual sheet data): a single
+ * driver's one real van run routinely picks up employees from SEVERAL
+ * different home Areas for the same shift — e.g. driver "Azam ..." on the
+ * 6:00 PM-3:00 AM shift carries riders from SADDAR AND Defence View in one
+ * trip. Route (and therefore Trip) used to be looked up ONLY by
+ * (employee's own Area + shiftTiming), so those riders landed on two
+ * DIFFERENT Route/Trip rows purely because they live in different
+ * neighborhoods — even though the sheet explicitly names the same driver
+ * for both. Once split, findDriverConflict then saw "same driver, same
+ * overlapping shift, different route" and treated it as a double-booking,
+ * auto-reassigning a DIFFERENT driver to the second fragment. That's how 4
+ * employees on what is obviously one real trip ended up with 2-3 separate
+ * trips and drivers.
+ *
+ * Fix: when the row names a specific driver, checking "does THIS driver
+ * already have a live, same-shift, not-yet-full trip THIS WEEK" now comes
+ * FIRST — before any Area-based route lookup — and reuses that exact trip
+ * if so, regardless of which Area this particular rider's address falls
+ * under. Area-based matching is now only the fallback for a driver's very
+ * first rider of the week (nothing to reuse yet) or once that driver's
+ * trip is genuinely full (a real second vehicle/driver is needed).
  *
  * Strategy, in order:
- *   1. Find (or create) the single Route for this Area (+ shiftTiming, if
- *      given — matched against Route.shiftTiming, with a routeName
- *      substring fallback for older data).
+ *   0. If a driver was resolved for this row: reuse that driver's existing,
+ *      same-shift, not-yet-full Trip this week, if one exists — regardless
+ *      of Area. See findExistingTripForDriverThisWeek.
+ *   1. Otherwise, find (or create) the single Route for this Area (+
+ *      shiftTiming, if given — matched against Route.shiftTiming by parsed
+ *      time-range equality, with a routeName substring fallback for older
+ *      data).
  *   2. Walk that route's trips in tripNumber order and take the FIRST one
  *      that has free seats (occupancy < trip's vehicle capacity, or a
  *      guessed default if no vehicle is attached yet) AND either no driver
@@ -1227,7 +1443,37 @@ const findOrCreateRouteAndTrip = async (
   weekStartDate,
   excludeEmployeeId,
   caches,
+  options = {},
 ) => {
+  // Step 0: driver-first reuse — see the FIX comment above. This must run
+  // BEFORE any Area-based route lookup, since Area is what fragmented a
+  // single real trip in the first place.
+  if (driverId) {
+    const existingTrip = await findExistingTripForDriverThisWeek(
+      driverId,
+      shiftTiming,
+      vehicleType,
+      weekStartDate,
+      excludeEmployeeId,
+      caches,
+      options,
+    );
+    if (existingTrip) {
+      return {
+        route: existingTrip.route,
+        trip: existingTrip.trip,
+        created: false,
+        newTrip: false,
+        overCapacity: existingTrip.overCapacity || false,
+        notes: existingTrip.overCapacity
+          ? [
+              `Trip #${existingTrip.trip.tripNumber} (driver already on it this week/shift) is at/over its vehicle's capacity — added anyway per current settings; needs manual review.`,
+            ]
+          : [],
+      };
+    }
+  }
+
   let route = null;
   if (areaRecord) {
     // Routes-per-area are also cached per job: once we've loaded a given
@@ -1246,16 +1492,47 @@ const findOrCreateRouteAndTrip = async (
       caches?.routesByArea?.set(areaRecord.id, candidates);
     }
     if (shiftTiming) {
+      // FIX: this used to compare shiftTiming with a raw .trim().toLowerCase()
+      // string, which mis-groups in two ways real sheet data hits:
+      //   1. Trivial formatting noise (extra internal spaces, "6:00PM" vs
+      //      "6:00 PM", case) — normalizeShift() handles this part fine.
+      //   2. Genuinely different STRING representations of the identical
+      //      shift — e.g. "6:00 PM - 3:00 AM" vs "18:00 - 03:00" (12hr vs
+      //      24hr). These normalize to different strings under
+      //      normalizeShift() (different characters), so that alone still
+      //      fragments one corridor into two Route rows.
+      // parseShiftRange() (already used for driver/vehicle overlap checks
+      // elsewhere in this file) converts a shift string into
+      // {start, durationMinutes} in absolute minutes-from-midnight —
+      // format-independent. Comparing on that first catches case 2 as well;
+      // normalizeShift() string equality is kept only as the fallback for
+      // shift labels that don't parse as a time range at all (e.g. "Night A").
+      const candidateRange = parseShiftRange(shiftTiming);
+      const shiftNorm = normalizeShift(shiftTiming);
       const shiftLower = shiftTiming.trim().toLowerCase();
+      const sameShift = (routeShiftTiming) => {
+        if (!routeShiftTiming) return false;
+        const routeRange = parseShiftRange(routeShiftTiming);
+        if (candidateRange && routeRange) {
+          return (
+            candidateRange.start === routeRange.start &&
+            candidateRange.durationMinutes === routeRange.durationMinutes
+          );
+        }
+        // Either side didn't parse as a range (e.g. a plain label) — fall
+        // back to normalized string equality rather than refusing to match.
+        return normalizeShift(routeShiftTiming) === shiftNorm;
+      };
       route =
-        candidates.find(
-          (r) =>
-            (r.shiftTiming &&
-              r.shiftTiming.trim().toLowerCase() === shiftLower) ||
-            String(r.routeName || "")
-              .toLowerCase()
-              .includes(shiftLower),
-        ) || null;
+        candidates.find((r) => sameShift(r.shiftTiming)) ||
+        // Fallback for older data whose Route.shiftTiming is unset/unparsed:
+        // substring-match against the route name, same as before.
+        candidates.find((r) =>
+          String(r.routeName || "")
+            .toLowerCase()
+            .includes(shiftLower),
+        ) ||
+        null;
     } else {
       route = candidates[0] || null;
     }
@@ -1286,7 +1563,12 @@ const findOrCreateRouteAndTrip = async (
     if (areaRecord) caches?.routesByArea?.delete(areaRecord.id);
   }
 
-  const { trip, newTrip } = await findOrCreateTripOnRoute(
+  const {
+    trip,
+    newTrip,
+    overCapacity,
+    notes: tripNotes,
+  } = await findOrCreateTripOnRoute(
     route,
     vehicleType,
     shiftTiming,
@@ -1295,6 +1577,7 @@ const findOrCreateRouteAndTrip = async (
     weekStartDate,
     excludeEmployeeId,
     caches,
+    options,
   );
 
   // FIX (perf): this used to unconditionally re-fetch the route from the
@@ -1305,7 +1588,14 @@ const findOrCreateRouteAndTrip = async (
   // instead of asking the DB again for data we very likely already have.
   route = caches?.routeById?.get(route.id) || route;
 
-  return { route, trip, created: routeCreated, newTrip };
+  return {
+    route,
+    trip,
+    created: routeCreated,
+    newTrip,
+    overCapacity,
+    notes: tripNotes || [],
+  };
 };
 
 /**
@@ -1325,6 +1615,7 @@ const findOrCreateTripOnRoute = async (
   weekStartDate,
   excludeEmployeeId,
   caches,
+  options = {},
 ) => {
   // FIX (perf — this is the main reason bulk upload was taking forever /
   // never finishing on real-size workbooks): this used to run
@@ -1355,22 +1646,74 @@ const findOrCreateTripOnRoute = async (
   const hadExistingTrips = trips.length > 0;
 
   let trip = null;
-  for (const candidate of trips) {
-    const capacity =
-      candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
-    const occupancy = caches?.weekRoster
-      ? caches.weekRoster.filter(
-          (r) =>
-            r.tripId === candidate.id &&
-            (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
-        ).length
-      : await countTripOccupancy(candidate.id, weekStartDate, excludeEmployeeId);
-    const hasRoom = occupancy < capacity;
-    const driverOk =
-      !driverId || !candidate.driverId || candidate.driverId === driverId;
-    if (hasRoom && driverOk) {
-      trip = candidate;
-      break;
+  let overCapacity = false;
+  const notes = [];
+  if (options.disableMultiTrip) {
+    // FIX (temporary, per business request): don't open a second trip on
+    // this route just because the first is full — the sheet already tells
+    // us who rides together; a real capacity overflow needs a human to
+    // decide (bigger vehicle? split into a genuinely separate run?), not
+    // an auto-picked second driver/vehicle. Reuse whatever trip this
+    // route already has and flag it over capacity if it comes to that; a
+    // route with no trip yet still gets its first one created below.
+    trip = trips[0] || null;
+    if (trip) {
+      const capacity = trip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
+      const occupancy = caches?.weekRoster
+        ? caches.weekRoster.filter(
+            (r) =>
+              r.tripId === trip.id &&
+              (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
+          ).length
+        : await countTripOccupancy(trip.id, weekStartDate, excludeEmployeeId);
+      if (occupancy >= capacity) {
+        overCapacity = true;
+        notes.push(
+          `Trip #${trip.tripNumber} on route "${route.routeCode}" is at/over its vehicle's capacity (${capacity} seats) — added anyway per current settings; needs manual review (bigger vehicle or a genuinely separate run).`,
+        );
+      }
+    }
+  } else {
+    // FIX (real-world bug — trip fragmentation): this loop used to also
+    // require `driverOk` (candidate has no driver, or its driver matches
+    // THIS row's own proposed driverId) before it would reuse a candidate
+    // trip — even when the trip had free seats. A route/shift group where
+    // different rows name different drivers (a messy sheet, or drivers
+    // resolved independently per row upstream) therefore never reused trip
+    // #1: row 2's driver name didn't match trip #1's already-assigned
+    // driver, so row 2 forced open trip #2 (its own vehicle/driver) even
+    // though trip #1 still had 3 empty seats — same for rows 3 and 4. Four
+    // employees who all fit in one 4-seat vehicle ended up on four separate
+    // trips with four separate drivers.
+    //
+    // A Trip is one vehicle run; it can only ever have ONE driver. Which
+    // riders share it is a seating/capacity question, not a "does this
+    // rider's requested driver match" question — reconciling a differing
+    // per-row driver name against the trip's actual driver is
+    // resolveConflictFreeAssignment's job (it runs right after this and
+    // now prefers the trip's own current driver — see the FIX comment
+    // there). So trip selection here now looks ONLY at remaining capacity;
+    // a driver-name mismatch is surfaced as a note downstream instead of
+    // silently forking a new trip/vehicle.
+    for (const candidate of trips) {
+      const capacity =
+        candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
+      const occupancy = caches?.weekRoster
+        ? caches.weekRoster.filter(
+            (r) =>
+              r.tripId === candidate.id &&
+              (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
+          ).length
+        : await countTripOccupancy(
+            candidate.id,
+            weekStartDate,
+            excludeEmployeeId,
+          );
+      const hasRoom = occupancy < capacity;
+      if (hasRoom) {
+        trip = candidate;
+        break;
+      }
     }
   }
 
@@ -1387,8 +1730,18 @@ const findOrCreateTripOnRoute = async (
   // resolveConflictFreeAssignment (the single source of truth for
   // conflict-free auto-assignment) pick a real replacement, instead of
   // handing it something to undo.
+  //
+  // FIX (temporary, per business request — trustProposedDriver): when the
+  // sheet already names a real driver for this employee, that's ground
+  // truth, not a suggestion — the conflict check below used to drop it and
+  // let resolveConflictFreeAssignment auto-pick a completely different
+  // driver instead, which is precisely the "software makes its own
+  // assignment instead of following the sheet" behavior being turned off.
+  // With trustProposedDriver, a flagged conflict no longer clears
+  // safeDriverId/safeVehicleId — it's kept as named, and the conflict is
+  // only surfaced as a note for manual review.
   let safeDriverId = driverId || undefined;
-  if (safeDriverId) {
+  if (safeDriverId && !options.trustProposedDriver) {
     const driverConflict = await findDriverConflict(
       safeDriverId,
       weekStartDate,
@@ -1398,9 +1751,23 @@ const findOrCreateTripOnRoute = async (
       caches,
     );
     if (driverConflict) safeDriverId = undefined;
+  } else if (safeDriverId && options.trustProposedDriver) {
+    const driverConflict = await findDriverConflict(
+      safeDriverId,
+      weekStartDate,
+      shiftTiming,
+      trip?.id,
+      excludeEmployeeId,
+      caches,
+    );
+    if (driverConflict) {
+      notes.push(
+        `This driver's shift may overlap (or not leave enough rest around) route "${driverConflict.route?.routeCode ?? driverConflict.routeId}" this week — kept as named in the sheet; please double-check manually.`,
+      );
+    }
   }
   let safeVehicleId = vehicleIdHint || undefined;
-  if (safeVehicleId) {
+  if (safeVehicleId && !options.trustProposedDriver) {
     const vehicleConflict = await findVehicleConflict(
       safeVehicleId,
       weekStartDate,
@@ -1410,6 +1777,20 @@ const findOrCreateTripOnRoute = async (
       caches,
     );
     if (vehicleConflict) safeVehicleId = undefined;
+  } else if (safeVehicleId && options.trustProposedDriver) {
+    const vehicleConflict = await findVehicleConflict(
+      safeVehicleId,
+      weekStartDate,
+      shiftTiming,
+      trip?.id,
+      excludeEmployeeId,
+      caches,
+    );
+    if (vehicleConflict) {
+      notes.push(
+        `This vehicle's shift may overlap route "${vehicleConflict.route?.routeCode ?? vehicleConflict.routeId}" this week — kept as named in the sheet; please double-check manually.`,
+      );
+    }
   }
 
   let tripCreated = false;
@@ -1456,7 +1837,24 @@ const findOrCreateTripOnRoute = async (
   if (tripChanged) {
     await syncRouteFromTrips(route.id, caches, trips);
   }
-  return { trip, newTrip: tripCreated && hadExistingTrips };
+  // FIX (real-world bug — Area-fragmentation, see findOrCreateRouteAndTrip's
+  // doc comment): keep tripIdByDriver/tripById current whenever this trip's
+  // driver is known, so the NEXT row for this same driver — even one whose
+  // employee lives in a different Area — finds and reuses this exact trip
+  // via findExistingTripForDriverThisWeek instead of spinning up a sibling
+  // Route/Trip under its own Area and triggering a false double-booking
+  // conflict for the same driver.
+  if (trip.driverId) {
+    caches?.tripIdByDriver?.set(trip.driverId, trip.id);
+  }
+  caches?.tripById?.set(trip.id, trip);
+
+  return {
+    trip,
+    newTrip: tripCreated && hadExistingTrips,
+    overCapacity,
+    notes,
+  };
 };
 
 // ---------- Bulk reassign: shift-mismatched employees, one click ----------
@@ -1900,15 +2298,22 @@ const getAllWeeklySchedules = async (req, res, next) => {
             contactNumber: true,
           },
         },
-        // FIX: previously selected only a handful of route fields (no
-        // shiftTiming/serviceType/status/officeLocation), so the list view
-        // had a routeId but nothing to actually display for "Route" beyond
-        // its name/code. Now returns the full route record.
+        // FIX (audit — same class of bug as the trip-fragmentation/wrong-
+        // driver fix above): this used to also nest `driver` under `route`
+        // (route.driver — Route.driverId, which syncRouteFromTrips only
+        // ever mirrors from trip #1). That field looks like "this row's
+        // driver" but for any employee on trip #2/#3/#4 of a multi-trip
+        // route it's simply wrong. The correct, per-row driver is already
+        // returned below via `trip.driver` (the actual trip this employee
+        // rides) and the denormalized `driver` field on the schedule row
+        // itself — route.driver added nothing but a trap for the frontend
+        // to reach for by mistake, so it's removed here. If a route-level
+        // "primary driver" badge is ever needed again, compute it from
+        // route.trips (all of them) client-side, not from this field.
         route: {
           include: {
             area: true,
             subArea: true,
-            driver: { select: { id: true, name: true, phone: true } },
           },
         },
         // Trip Number / per-trip vehicle so the list view can show which
@@ -2822,6 +3227,20 @@ const processBulkUploadJob = async (
     // that lookup once instead of once per row.
     tripsByRoute: new Map(),
     routeById: new Map(),
+    // FIX (real-world bug — Area-fragmentation, see findOrCreateRouteAndTrip
+    // and findExistingTripForDriverThisWeek's doc comments): driverId ->
+    // tripId, so "does this driver already have a trip this week" is an O(1)
+    // in-memory lookup instead of a query, and — critically — is seeded from
+    // rows ALREADY saved this week (not just ones this job is about to
+    // write), so re-running/continuing an upload for a week that already has
+    // some rows still finds and reuses each driver's existing trip instead
+    // of fragmenting it further.
+    tripIdByDriver: new Map(
+      existingWeekRoster
+        .filter((r) => r.driverId && r.tripId)
+        .map((r) => [r.driverId, r.tripId]),
+    ),
+    tripById: new Map(),
     weekRoster: existingWeekRoster,
     availableDrivers: availableDriversList,
     activeVehicles: activeVehiclesList,
@@ -3041,6 +3460,15 @@ const processBulkUploadJob = async (
         let trip;
         let routeCreated = false;
         try {
+          // TEMPORARY (per business request): bulk upload now trusts the
+          // sheet's own driver/vehicle per employee as ground truth
+          // (trustProposedDriver) instead of quietly swapping in a
+          // different auto-picked driver whenever its own conflict/hours
+          // checks fire — and it no longer opens a second trip just
+          // because the first is full (disableMultiTrip). A route/shift
+          // group that genuinely outgrows one vehicle is flagged via
+          // `overCapacity`/notes below for manual adjustment instead of
+          // being silently split.
           const routeResult = await findOrCreateRouteAndTrip(
             areaRecord,
             vehicleType,
@@ -3051,6 +3479,7 @@ const processBulkUploadJob = async (
             weekStartDate,
             employee.id,
             caches,
+            { disableMultiTrip: true, trustProposedDriver: true },
           );
           route = routeResult.route;
           trip = routeResult.trip;
@@ -3064,6 +3493,17 @@ const processBulkUploadJob = async (
               note: `Area/shift was at capacity — opened Trip #${trip.tripNumber} on route "${route.routeCode}" for this driver.`,
             });
           }
+          if (routeResult.overCapacity) {
+            results.capacityExceeded++;
+            results.notes.push({
+              row: rowNum,
+              employeeCode,
+              note: `Trip #${trip.tripNumber} on route "${route.routeCode}" is at/over its vehicle's seat capacity — this employee was still added (no new trip opened automatically); please review manually and adjust (bigger vehicle, or split into a separate run) if needed.`,
+            });
+          }
+          (routeResult.notes || []).forEach((note) => {
+            results.notes.push({ row: rowNum, employeeCode, note });
+          });
           // Verification: a routeId AND tripId must exist on every row from here on.
           if (!route?.id || !trip?.id) {
             await skipRow(
@@ -3093,7 +3533,9 @@ const processBulkUploadJob = async (
         // This is the same resolver used by reassign/optimize, so bulk
         // upload now gets the identical conflict/auto-assign/hours guarantees,
         // and it checks REAL shift-time overlap (+ minimum rest) rather than
-        // just "any other route this week."
+        // just "any other route this week." trustProposedDriver keeps the
+        // sheet's named driver/vehicle even when a conflict/hours check
+        // fires — flagged as a note, not silently swapped for someone else.
         const assignment = await resolveConflictFreeAssignment({
           trip,
           weekStartDate,
@@ -3104,6 +3546,7 @@ const processBulkUploadJob = async (
           minCapacity: undefined,
           excludeEmployeeId: employee.id,
           caches,
+          options: { trustProposedDriver: true },
         });
         driverId = assignment.driverId;
         vehicleId = assignment.vehicleId;
