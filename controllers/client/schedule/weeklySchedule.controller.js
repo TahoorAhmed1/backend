@@ -45,6 +45,34 @@ const toDateOnly = (d) => {
 
 const formatDateOnly = (d) => new Date(d).toISOString().slice(0, 10);
 
+// Monday of the current week (UTC-based, matching toDateOnly's reasoning
+// above — local-time Date math here would silently drift the "week" by a
+// day around midnight depending on server timezone). Shared by
+// getCurrentWeekSchedules and the getScheduleTable* endpoints so "this
+// week" always means the exact same Monday everywhere in this file.
+const mondayOfCurrentWeek = () => {
+  const now = new Date();
+  const utcToday = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+  // Sunday=0..Saturday=6 -> "days since Monday".
+  const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
+  return new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
+};
+
+// Field names of WeeklySchedule's seven day-status columns, in week order —
+// used to project a schedule row into a Mon-Sun DayStatus[] pattern array
+// for the Schedule Table UI.
+const DAY_FIELD_KEYS = [
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+  "sunday",
+];
+
 // normalizeShift / parseShiftRange / shiftTimesOverlap now live in
 // utils/shiftTime.js (imported above) so route_controller.js can share the
 // exact same overlap logic for its own driver/vehicle conflict checks.
@@ -2464,19 +2492,7 @@ const deleteWeeklySchedule = async (req, res, next) => {
 
 const getCurrentWeekSchedules = async (req, res, next) => {
   try {
-    const now = new Date();
-    const utcToday = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-    );
-    // weekStart is always a Monday (see schema). Convert Sunday=0..Saturday=6
-    // into "days since Monday" so this lines up with every other Monday-based
-    // weekStart in the app (e.g. the frontend's own default-week-start calc),
-    // instead of the previous Sunday-based start which pointed at the wrong
-    // week entirely whenever this ran on a Sunday.
-    const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
-    const startOfWeek = new Date(
-      utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000,
-    );
+    const startOfWeek = mondayOfCurrentWeek();
 
     const schedules = await prisma.weeklySchedule.findMany({
       where: {
@@ -2837,15 +2853,31 @@ const getScheduleStats = async (req, res, next) => {
 /**
  * Returns the four stat-card figures the Schedule page header shows:
  * active employees, total areas, available drivers, active vehicles.
+ * Also includes how many of the active employees actually have a
+ * schedule for the requested week, so "Active Employees: 1,615" next to
+ * "Scheduled: 1,201" makes an assignment gap visible at a glance instead
+ * of only showing up buried in the row list below.
+ *
+ * Query params:
+ *   weekStart - Monday of the week to check "scheduled" against (defaults
+ *               to the current week, same Monday-based calc as
+ *               getCurrentWeekSchedules).
  */
 const getScheduleTableStats = async (req, res, next) => {
   try {
-    const [activeEmployees, areasCount, availableDrivers, activeVehicles] =
+    const weekStartDate = req.query.weekStart
+      ? toDateOnly(req.query.weekStart)
+      : mondayOfCurrentWeek();
+
+    const [activeEmployees, areasCount, availableDrivers, activeVehicles, scheduledThisWeek] =
       await Promise.all([
         prisma.employee.count({ where: { status: "ACTIVE" } }),
         prisma.area.count(),
         prisma.driver.count({ where: { status: "AVAILABLE" } }),
         prisma.vehicle.count({ where: { status: "ACTIVE" } }),
+        prisma.weeklySchedule.count({
+          where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
+        }),
       ]);
 
     const response = okResponse(
@@ -2854,6 +2886,8 @@ const getScheduleTableStats = async (req, res, next) => {
         areas: areasCount,
         availableDrivers,
         activeVehicles,
+        scheduledThisWeek,
+        weekStart: weekStartDate.toISOString().slice(0, 10),
       },
       "Schedule table stats retrieved successfully.",
     );
@@ -2865,16 +2899,32 @@ const getScheduleTableStats = async (req, res, next) => {
 };
 
 /**
- * Returns active employees grouped by Area, shaped exactly for the
- * Schedule Table UI: area -> { employeeCount, rows[] }.
+ * Returns active employees grouped by Area for a given week, shaped for
+ * the Schedule Table UI: area -> { employeeCount, rows[] }.
+ *
+ * Each row carries that employee's ACTUAL weekly schedule for the
+ * requested week (shift timing, driver, vehicle, route, and the Mon-Sun
+ * day pattern) when one exists — previously this only echoed static
+ * Employee master-data fields (Employee.shiftTiming, which the master
+ * sheet never actually populates) and never touched WeeklySchedule/Route/
+ * Trip/Driver/Vehicle at all, so "Shift" was blank for almost everyone and
+ * there was no way to see who's actually riding with whom.
+ *
+ * An employee with NO schedule row for the requested week is still
+ * listed (so a coverage gap is visible, not silently hidden) with
+ * scheduled: false and everything else null.
  *
  * Query params:
- *   search - filters by employee name/code, area name, or department name
- *   areaId - restrict to a single area
+ *   search    - filters by employee name/code, area name, or department name
+ *   areaId    - restrict to a single area
+ *   weekStart - Monday of the week to show (defaults to the current week)
  */
 const getScheduleTableGroupedByArea = async (req, res, next) => {
   try {
     const { search, areaId } = req.query;
+    const weekStartDate = req.query.weekStart
+      ? toDateOnly(req.query.weekStart)
+      : mondayOfCurrentWeek();
 
     const where = { status: "ACTIVE" };
     if (areaId) where.areaId = areaId;
@@ -2892,6 +2942,16 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
       include: {
         area: { select: { id: true, name: true } },
         department: { select: { id: true, name: true } },
+        weeklySchedules: {
+          where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
+          take: 1, // @@unique([employeeId, weekStart]) — at most one anyway
+          include: {
+            route: { select: { id: true, routeName: true, routeCode: true } },
+            trip: { select: { id: true, tripNumber: true } },
+            driver: { select: { id: true, name: true, phone: true } },
+            vehicle: { select: { id: true, vehicleNumber: true, type: true } },
+          },
+        },
       },
       orderBy: [{ area: { name: "asc" } }, { name: "asc" }],
     });
@@ -2909,26 +2969,50 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
         });
       }
 
+      const schedule = emp.weeklySchedules[0] || null;
+
       areaMap.get(areaKey).rows.push({
-        id: emp.id,
+        id: schedule?.id ?? emp.id,
         empId: emp.employeeCode,
         name: emp.name,
         department: emp.department?.name ?? "-",
         location: emp.officeLocation ?? "-",
         entity: emp.entity ?? "-",
-        shift: emp.shiftTiming ?? null,
-        service: emp.serviceType,
         contact: emp.contactNumber ?? "-",
+
+        // Weekly-schedule-derived fields — null/"-" when this employee has
+        // no schedule row for the requested week (see doc comment above).
+        scheduled: Boolean(schedule),
+        scheduleStatus: schedule?.status ?? null, // ACTIVE | DRAFT | null
+        service: schedule?.serviceType ?? emp.serviceType,
+        shift: schedule?.shiftTiming ?? null,
+        pickupTime: schedule?.pickupTime ?? null,
+        dropTime: schedule?.dropTime ?? null,
+        offDay: schedule?.offDay ?? null,
+        route: schedule?.route
+          ? { id: schedule.route.id, name: schedule.route.routeName, code: schedule.route.routeCode }
+          : null,
+        tripNumber: schedule?.trip?.tripNumber ?? null,
+        driver: schedule?.driver
+          ? { id: schedule.driver.id, name: schedule.driver.name, phone: schedule.driver.phone }
+          : null,
+        vehicle: schedule?.vehicle
+          ? { id: schedule.vehicle.id, number: schedule.vehicle.vehicleNumber, type: schedule.vehicle.type }
+          : null,
+        pattern: schedule
+          ? DAY_FIELD_KEYS.map((day) => schedule[day])
+          : null,
       });
     }
 
     const groups = Array.from(areaMap.values()).map((g) => ({
       ...g,
       employeeCount: g.rows.length,
+      scheduledCount: g.rows.filter((r) => r.scheduled).length,
     }));
 
     const response = okResponse(
-      groups,
+      { weekStart: weekStartDate.toISOString().slice(0, 10), groups },
       "Schedule table grouped by area retrieved successfully.",
     );
 

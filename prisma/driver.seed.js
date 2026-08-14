@@ -21,7 +21,9 @@
  *    prisma/seed-data.json (same folder as your schema.prisma).
  * 2. Add to package.json:
  *      "prisma": { "seed": "node prisma/seed.js" }
- * 3. Run:
+ * 3. Install the QR package (see step 5 below):
+ *      npm install qrcode
+ * 4. Run:
  *      npx prisma db seed
  *    (or just `node prisma/seed.js` directly)
  *
@@ -78,11 +80,49 @@
  * Full per-row detail for all of the above is in seed-data.json's
  * driver/vehicle `notes` fields, and in the `issues` array printed by the
  * parser (ask if you want that full list re-surfaced).
+ *
+ * ----------------------------------------------------------------------
+ * 5. DRIVER LOGINS + ATTENDANCE QR CODES (new)
+ * ----------------------------------------------------------------------
+ * Package: `qrcode` (npm install qrcode) — generates the PNG badge
+ * images. Standard, actively maintained, zero native deps.
+ *
+ * Every driver now gets:
+ *   - A User row (role: DRIVER) if it doesn't have one yet, following
+ *     the same pattern as employee_seed.js: email `<seedId>@drivers.ibex.com`,
+ *     a shared default password (hashed once, not per-row), linked via
+ *     Driver.userId.
+ *     NOTE: kept on a separate email subdomain (drivers.ibex.com, not
+ *     ibex.com) so a driver's seedId can never collide with an
+ *     employee's employeeCode in the User.email unique constraint.
+ *   - A `qrCode` token on that User: crypto.randomUUID() — unguessable,
+ *     globally unique, satisfies User.qrCode's @unique constraint.
+ *   - A PNG badge image rendered to
+ *     prisma/qrcodes/drivers/<seedId>.png, encoding that same token,
+ *     for printing physical ID/attendance badges. The DB only ever
+ *     stores the token string — never image bytes.
+ *
+ * Idempotent: a driver that already has a User + qrCode is left alone
+ * (token never changes across re-runs, which matters since printed
+ * badges would otherwise go stale). The PNG is always re-rendered
+ * though, since that's cheap and keeps the file in sync if you ever
+ * change QR styling (size/margin/error-correction level).
+ *
+ * IMPORTANT CAVEAT: Attendance.employeeId is what your Attendance model
+ * actually tracks — there is no Attendance.driverId. If the real-world
+ * flow is "driver scans the employee's badge to mark them present",
+ * the QR code that matters for attendance needs to live on the
+ * EMPLOYEE's User, not the driver's. This block only covers drivers
+ * (badge/ID + optional driver-side login QR) — ask if you also want
+ * the equivalent added to employee_seed.js.
  */
 
 require('dotenv/config')
 const { PrismaClient } = require('@prisma/client')
 const { PrismaPg } = require('@prisma/adapter-pg')
+const { hashPassword } = require('../services/auth.service')
+const QRCode = require('qrcode')
+const crypto = require('crypto')
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -91,6 +131,32 @@ const fs = require("fs");
 const path = require("path");
 
 const DATA_PATH = path.join(__dirname, "driver-data.json");
+const QR_DIR = path.join(__dirname, "qrcodes", "drivers");
+
+const DRIVER_EMAIL_DOMAIN = "drivers.ibex.com";
+const DEFAULT_DRIVER_PASSWORD = "12345678";
+
+// Turns "Asif Jamil Ahmed" into "asif.jamil.ahmed" — lowercase,
+// spaces/repeated whitespace collapsed to single dots, anything that
+// isn't a letter/digit/dot stripped so the result is always a valid
+// email local-part.
+function slugifyName(name) {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ".")
+    .replace(/[^a-z0-9.]/g, "");
+}
+
+// Turns a driver name into a safe filename: spaces removed, and any
+// character that's illegal in Windows/macOS/Linux filenames (notably
+// backslash/slash, which some raw names in this data contain, e.g.
+// "Ali \ Sameer") stripped out too.
+function safeFileName(name) {
+  return name
+    .replace(/\s+/g, "")
+    .replace(/[\\/:*?"<>|]/g, "");
+}
 
 async function main() {
   const { vendors, drivers, vehicles } = JSON.parse(
@@ -101,17 +167,23 @@ async function main() {
     `Seeding ${vendors.length} vendors, ${drivers.length} drivers, ${vehicles.length} vehicles...`,
   );
 
+  fs.mkdirSync(QR_DIR, { recursive: true });
+
   // ---------- 1. Vendors ----------
+  // Skipped — only Driver (+ login/QR) is being (re)seeded this run.
+  // Kept as an empty Map so the Driver loop below still resolves
+  // vendorId to undefined instead of throwing, on the assumption Vendor
+  // already exists in the DB from a prior run.
   const vendorIdByName = new Map();
-  for (const v of vendors) {
-    const vendor = await prisma.vendor.upsert({
-      where: { name: v.name },
-      update: {},
-      create: { name: v.name },
-    });
-    vendorIdByName.set(v.name, vendor.id);
-  }
-  console.log(`  Vendors ready: ${vendorIdByName.size}`);
+  // for (const v of vendors) {
+  //   const vendor = await prisma.vendor.upsert({
+  //     where: { name: v.name },
+  //     update: {},
+  //     create: { name: v.name },
+  //   });
+  //   vendorIdByName.set(v.name, vendor.id);
+  // }
+  // console.log(`  Vendors ready: ${vendorIdByName.size}`);
 
   // ---------- 2. Drivers ----------
   // seedId (from seed-data.json) -> real DB id, so step 3 can pair
@@ -119,6 +191,16 @@ async function main() {
   const driverIdBySeedId = new Map();
   let driversCreated = 0;
   let driversMatched = 0;
+
+  // Hashed once up front: every generated driver login shares the same
+  // plaintext starting password, so there's no reason to hash it per row.
+  const defaultDriverPasswordHash = await hashPassword(DEFAULT_DRIVER_PASSWORD);
+
+  let usersCreated = 0;
+  let usersSkipped = 0;
+  let userErrors = 0;
+  let qrGenerated = 0;
+  const usedFileNames = new Set();
 
   for (const d of drivers) {
     const vendorId = d.vendor ? vendorIdByName.get(d.vendor) : undefined;
@@ -145,62 +227,184 @@ async function main() {
         where: { cnic: d.cnic },
         update: data,
         create: data,
+        include: { user: true },
       });
     } else {
       // No CNIC on this row — match ONLY on this driver's own seed tag,
       // never on name/vendor (see header comment).
       const existing = await prisma.driver.findFirst({
         where: { notes: { contains: seedTag } },
+        include: { user: true },
       });
       if (existing) {
-        driver = await prisma.driver.update({ where: { id: existing.id }, data });
+        driver = await prisma.driver.update({
+          where: { id: existing.id },
+          data,
+          include: { user: true },
+        });
         driversMatched++;
       } else {
-        driver = await prisma.driver.create({ data });
+        driver = await prisma.driver.create({ data, include: { user: true } });
         driversCreated++;
       }
     }
     driverIdBySeedId.set(d.seedId, driver.id);
-  }
-  console.log(
-    `  Drivers ready: ${driverIdBySeedId.size} (created/updated via upsert or matched by name+vendor)`,
-  );
 
-  // ---------- 3. Vehicles (+ pair each to its primary driver) ----------
-  let vehiclesCreated = 0;
-  let vehiclesUpdated = 0;
+    // ---------- Login + attendance QR code ----------
+    // Attach a User (with qrCode token) for any driver that doesn't have
+    // one yet — covers both drivers just created above and pre-existing
+    // ones seeded before logins/QR codes existed.
+    let qrToken = driver.user?.qrCode;
 
-  for (const v of vehicles) {
-    const vendorId = v.vendor ? vendorIdByName.get(v.vendor) : undefined;
-    const driverId = v.primaryDriverSeedId
-      ? driverIdBySeedId.get(v.primaryDriverSeedId)
-      : undefined;
+    if (!driver.user) {
+      // Name-based email, e.g. "Asif Jamil Ahmed" -> asif.jamil.ahmed@...
+      // Per the header comment, ~42 name+vendor combos in this data are
+      // DIFFERENT real people sharing a name — colliding them onto the
+      // same email would upsert the SAME User row for both, and the
+      // second driver.update({ userId }) would then throw (Driver.userId
+      // is @unique), leaving that driver without a login. An in-memory
+      // "already used this run" Set isn't enough to catch this, since
+      // the SAME collision can just as easily happen across separate
+      // runs (e.g. one Imran got imran@... last week, a different Imran
+      // shows up today with no user yet) — so check the DB directly:
+      // only reuse a base email if nobody else already owns it.
+      const baseSlug = slugifyName(d.name) || d.seedId;
+      let email = `${baseSlug}@${DRIVER_EMAIL_DOMAIN}`;
+      const emailOwner = await prisma.user.findUnique({
+        where: { email },
+        include: { driver: true },
+      });
+      if (emailOwner && emailOwner.driver && emailOwner.driver.id !== driver.id) {
+        // Taken by a genuinely different driver — seedId is unique per
+        // driver, so this suffixed form is guaranteed free.
+        email = `${baseSlug}.${d.seedId}@${DRIVER_EMAIL_DOMAIN}`;
+      }
 
-    const data = {
-      type: v.type,
-      make: v.make || undefined,
-      model: v.model || undefined,
-      capacity: v.capacity,
-      status: v.status || "ACTIVE",
-      vendorId: vendorId || undefined,
-      driverId: driverId || undefined,
-      notes: v.notes || undefined,
-    };
+      qrToken = crypto.randomUUID();
 
-    const existing = await prisma.vehicle.findUnique({
-      where: { vehicleNumber: v.vehicleNumber },
-    });
-    if (existing) {
-      await prisma.vehicle.update({ where: { id: existing.id }, data });
-      vehiclesUpdated++;
+      try {
+        const user = await prisma.user.upsert({
+          where: { email },
+          update: {},
+          create: {
+            email,
+            name: driver.name,
+            passwordHash: defaultDriverPasswordHash,
+            role: "DRIVER",
+            qrCode: qrToken,
+          },
+        });
+
+        await prisma.driver.update({
+          where: { id: driver.id },
+          data: { userId: user.id },
+        });
+
+        // In case the user row already existed (e.g. re-run after a
+        // partial failure) but its qrCode was never set.
+        qrToken = user.qrCode || qrToken;
+
+        usersCreated++;
+      } catch (err) {
+        // Don't let one bad row (e.g. an email collision) abort the
+        // whole run — log it and keep going.
+        userErrors++;
+        qrToken = undefined;
+        console.error(
+          `  Login setup failed for seedId=${d.seedId} (${email}):`,
+          err.message,
+        );
+      }
+    } else if (!driver.user.qrCode) {
+      // Backfill: driver already had a User (unlikely today, but possible
+      // after future changes) that predates the qrCode column being used.
+      qrToken = crypto.randomUUID();
+      try {
+        await prisma.user.update({
+          where: { id: driver.user.id },
+          data: { qrCode: qrToken },
+        });
+        usersSkipped++; // login already existed; only the QR was backfilled
+      } catch (err) {
+        userErrors++;
+        qrToken = undefined;
+        console.error(
+          `  QR backfill failed for seedId=${d.seedId}:`,
+          err.message,
+        );
+      }
     } else {
-      await prisma.vehicle.create({ data: { vehicleNumber: v.vehicleNumber, ...data } });
-      vehiclesCreated++;
+      usersSkipped++;
+    }
+
+    // Always (re-)render the badge PNG so the file on disk matches
+    // whatever token is currently in the DB, even on re-runs.
+    if (qrToken) {
+      let fileBase = safeFileName(d.name) || d.seedId;
+      if (usedFileNames.has(fileBase)) {
+        fileBase = `${fileBase}.${d.seedId}`;
+      }
+      usedFileNames.add(fileBase);
+      const qrPath = path.join(QR_DIR, `${fileBase}.png`);
+      try {
+        await QRCode.toFile(qrPath, qrToken, {
+          width: 400,
+          margin: 2,
+          errorCorrectionLevel: "M",
+        });
+        qrGenerated++;
+      } catch (err) {
+        console.error(`  QR image generation failed for seedId=${d.seedId}:`, err.message);
+      }
     }
   }
+
   console.log(
-    `  Vehicles ready: ${vehiclesCreated} created, ${vehiclesUpdated} updated`,
+    `  Drivers ready: ${driverIdBySeedId.size} (${driversCreated} created, ${driversMatched} matched by seed tag)`,
   );
+  console.log(
+    `  Driver logins: ${usersCreated} created, ${usersSkipped} already had one, ${userErrors} failed`,
+  );
+  console.log(`  QR badges rendered: ${qrGenerated} -> ${QR_DIR}`);
+
+  // ---------- 3. Vehicles (+ pair each to its primary driver) ----------
+  // Skipped — only Driver (+ login/QR) is being (re)seeded this run.
+  // driverIdBySeedId is still built in step 2 above so this block can be
+  // re-enabled later without touching the Driver loop.
+  // let vehiclesCreated = 0;
+  // let vehiclesUpdated = 0;
+  //
+  // for (const v of vehicles) {
+  //   const vendorId = v.vendor ? vendorIdByName.get(v.vendor) : undefined;
+  //   const driverId = v.primaryDriverSeedId
+  //     ? driverIdBySeedId.get(v.primaryDriverSeedId)
+  //     : undefined;
+  //
+  //   const data = {
+  //     type: v.type,
+  //     make: v.make || undefined,
+  //     model: v.model || undefined,
+  //     capacity: v.capacity,
+  //     status: v.status || "ACTIVE",
+  //     vendorId: vendorId || undefined,
+  //     driverId: driverId || undefined,
+  //     notes: v.notes || undefined,
+  //   };
+  //
+  //   const existing = await prisma.vehicle.findUnique({
+  //     where: { vehicleNumber: v.vehicleNumber },
+  //   });
+  //   if (existing) {
+  //     await prisma.vehicle.update({ where: { id: existing.id }, data });
+  //     vehiclesUpdated++;
+  //   } else {
+  //     await prisma.vehicle.create({ data: { vehicleNumber: v.vehicleNumber, ...data } });
+  //     vehiclesCreated++;
+  //   }
+  // }
+  // console.log(
+  //   `  Vehicles ready: ${vehiclesCreated} created, ${vehiclesUpdated} updated`,
+  // );
 
   console.log("Seed complete.");
 }

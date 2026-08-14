@@ -70,8 +70,7 @@ const getAllDrivers = async (req, res, next) => {
 
     const options = { 
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+   
       include: {
         vendor: { select: { id: true, name: true } },
         vehicle: { select: { id: true, vehicleNumber: true } },
@@ -221,6 +220,7 @@ const deleteDriver = async (req, res, next) => {
     });
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };

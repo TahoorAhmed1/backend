@@ -342,44 +342,44 @@ const routeCreateSchema = Joi.object({
   }),
 });
 
-  const routeUpdateSchema = Joi.object({
-    query: Joi.object({}),
+const routeUpdateSchema = Joi.object({
+  query: Joi.object({}),
 
-    params: Joi.object({
-      id: Joi.string().uuid().required(),
-    }),
+  params: Joi.object({
+    id: Joi.string().uuid().required(),
+  }),
 
-    body: Joi.object({
-      routeCode: Joi.string().optional().min(2).max(50),
+  body: Joi.object({
+    routeCode: Joi.string().optional().min(2).max(50),
 
-      routeName: Joi.string().optional().min(2).max(100),
+    routeName: Joi.string().optional().min(2).max(100),
 
-      areaId: Joi.string().uuid().optional().allow(null, ""),
+    areaId: Joi.string().uuid().optional().allow(null, ""),
 
-      subAreaId: Joi.string().uuid().optional().allow(null, ""),
+    subAreaId: Joi.string().uuid().optional().allow(null, ""),
 
-      officeLocation: Joi.string()
-        .optional()
-        .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
-        .allow(null, ""),
+    officeLocation: Joi.string()
+      .optional()
+      .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
+      .allow(null, ""),
 
-      serviceType: Joi.string()
-        .optional()
-        .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
+    serviceType: Joi.string()
+      .optional()
+      .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
 
-      maxCapacity: Joi.number().optional().min(1),
+    maxCapacity: Joi.number().optional().min(1),
 
-      driverId: Joi.string().uuid().optional().allow(null, ""),
+    driverId: Joi.string().uuid().optional().allow(null, ""),
 
-      shiftTiming: Joi.string().optional().allow(null, ""),
+    shiftTiming: Joi.string().optional().allow(null, ""),
 
-      pickupStartTime: Joi.date().optional().allow(null, ""),
+    pickupStartTime: Joi.date().optional().allow(null, ""),
 
-      dropTime: Joi.date().optional().allow(null, ""),
+    dropTime: Joi.date().optional().allow(null, ""),
 
-      status: Joi.string().optional().valid("ACTIVE", "INACTIVE"),
-    }),
-  });
+    status: Joi.string().optional().valid("ACTIVE", "INACTIVE"),
+  }),
+});
 
 const rideCreateSchema = Joi.object({
   query: Joi.object({}),
@@ -617,6 +617,155 @@ const weeklyScheduleUpdateSchema = Joi.object({
   }),
 });
 
+const uuid = () => Joi.string().uuid({ version: "uuidv4" });
+const phone = () =>
+  Joi.string()
+    .trim()
+    .pattern(/^[0-9+\-\s()]{7,20}$/);
+const empty = () => Joi.object({});
+
+const updateDriverProfileSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    name: Joi.string().trim().min(2).max(100),
+    phone: phone(),
+  }).min(1),
+});
+
+const rideIdParamSchema = Joi.object({
+  query: empty(),
+  params: Joi.object({ id: uuid().required() }),
+  body: empty(),
+});
+
+const updateRideStatusSchema = Joi.object({
+  query: empty(),
+  params: Joi.object({ id: uuid().required() }),
+  body: Joi.object({
+    status: Joi.string()
+      .valid("STARTED", "ARRIVED", "COMPLETED", "CANCELLED")
+      .required(),
+  }),
+});
+
+const markAttendanceSchema = Joi.object({
+  query: empty(),
+  params: Joi.object({ id: uuid().required() }),
+  body: Joi.object({
+    employeeId: uuid(),
+    qrCode: Joi.string().trim(),
+    status: Joi.string()
+      .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW")
+      .default("PRESENT"),
+  })
+    .or("employeeId", "qrCode")
+    .messages({
+      "object.missing": "Either employeeId or qrCode is required.",
+    }),
+});
+
+const driverComplaintSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    category: Joi.string()
+      .valid(
+        "DRIVER_BEHAVIOUR",
+        "VEHICLE_CONDITION",
+        "ROUTE_ISSUE",
+        "TIMING_DELAY",
+        "SCHEDULING",
+        "OTHER",
+      )
+      .default("OTHER"),
+    title: Joi.string().trim().min(3).max(150).required(),
+    description: Joi.string().trim().max(2000).allow("", null),
+    rideId: uuid(),
+    vehicleId: uuid(),
+  }),
+});
+
+const updateEmployeeProfileSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    name: Joi.string().trim().min(2).max(100),
+    contactNumber: phone(),
+    cnic: Joi.string()
+      .trim()
+      .pattern(/^\d{13}$|^\d{5}-\d{7}-\d$/)
+      .messages({
+        "string.pattern.base": "cnic must be a valid CNIC number.",
+      }),
+    gender: Joi.string().valid("MALE", "FEMALE", "OTHER"),
+    address: Joi.string().trim().max(300),
+  }).min(1),
+});
+
+const confirmRideSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    confirmed: Joi.boolean().required(),
+  }),
+});
+
+const weeklyScheduleQuerySchema = Joi.object({
+  query: Joi.object({
+    weekStart: Joi.date().iso(),
+  }),
+  params: empty(),
+  body: empty(),
+});
+
+const markMyAttendanceSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    status: Joi.string().valid("PRESENT", "LATE").default("PRESENT"),
+  }),
+});
+
+const listQuerySchema = Joi.object({
+  query: Joi.object({
+    skip: Joi.number().integer().min(0).default(0),
+    take: Joi.number().integer().min(1).max(100).default(10),
+    status: Joi.string(),
+    limit: Joi.number().integer().min(1).max(100).default(10),
+  }),
+  params: empty(),
+  body: empty(),
+});
+
+const employeeComplaintSchema = Joi.object({
+  query: empty(),
+  params: empty(),
+  body: Joi.object({
+    category: Joi.string()
+      .valid(
+        "DRIVER_BEHAVIOUR",
+        "VEHICLE_CONDITION",
+        "ROUTE_ISSUE",
+        "TIMING_DELAY",
+        "SCHEDULING",
+        "OTHER",
+      )
+      .default("OTHER"),
+    title: Joi.string().trim().min(3).max(150).required(),
+    description: Joi.string().trim().min(3).max(2000).required(),
+    rideId: uuid(),
+  }),
+});
+
+const recentRidesQuerySchema = Joi.object({
+  query: Joi.object({
+    take: Joi.number().integer().min(1).max(50).default(5),
+  }),
+  params: empty(),
+  body: empty(),
+});
+
 module.exports = {
   areaCreateSchema,
   areaUpdateSchema,
@@ -660,4 +809,16 @@ module.exports = {
 
   weeklyScheduleCreateSchema,
   weeklyScheduleUpdateSchema,
+  updateDriverProfileSchema,
+  rideIdParamSchema,
+  updateRideStatusSchema,
+  markAttendanceSchema,
+  driverComplaintSchema,
+  updateEmployeeProfileSchema,
+  confirmRideSchema,
+  weeklyScheduleQuerySchema,
+  markMyAttendanceSchema,
+  listQuerySchema,
+  employeeComplaintSchema,
+  recentRidesQuerySchema,
 };
