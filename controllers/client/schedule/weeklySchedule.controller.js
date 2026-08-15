@@ -16,6 +16,10 @@ const {
   parseShiftRange,
   shiftTimesOverlap,
 } = require("../../../utils/shiftTime");
+const {
+  syncPendingRidesForWeek,
+  syncPendingRidesForWeekBestEffort,
+} = require("../../../lib/rideplaing");
 
 const DAY_KEYS = [
   "monday",
@@ -2019,6 +2023,15 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       }
     }
 
+    // Ride Provisioning: this path writes driverId/vehicleId/routeId/tripId
+    // directly and, unlike create/update above, never calls
+    // optimizeWeekAssignments — so without this call, a reassignment here
+    // would leave any already-provisioned PENDING rides pointing at the
+    // employees' OLD route/driver until something else happened to sync.
+    if (results.updated > 0) {
+      await syncPendingRidesForWeekBestEffort(weekStartDate);
+    }
+
     const response = okResponse(
       results,
       `Reassigned ${results.updated} employee(s) off "${route.routeCode}" onto their correct shift's route.`,
@@ -2156,6 +2169,14 @@ const optimizeWeekAssignments = async (weekStartDate) => {
     }
   }
 
+  // Ride Provisioning: this function is also invoked standalone (the
+  // "Optimize now" endpoint below, and any cron/queue worker wired to it),
+  // not only inline from create/update — so it needs its own sync call
+  // rather than relying on the caller to do it. Redundant when called
+  // inline from create/update (which sync again right after) but that's a
+  // cheap, idempotent no-op, not a correctness issue.
+  await syncPendingRidesForWeekBestEffort(weekStartDate);
+
   return summary;
 };
 
@@ -2178,6 +2199,44 @@ const optimizeRouteAssignments = async (req, res, next) => {
     const response = okResponse(
       summary,
       "Route assignments optimized for the week.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /admin/weekly-schedule/resync-rides — manual trigger for
+// syncPendingRidesForWeek. Every write path (create/update/delete/
+// reassign/optimize/bulk-upload) already calls this automatically, so
+// under normal operation you should never need to hit this yourself.
+// It exists for two situations:
+//   1. Diagnosing/repairing a week whose schedules were written before
+//      this ride-provisioning feature was deployed, so nothing ever
+//      triggered a sync for them — a driver has a WeeklySchedule but no
+//      Ride ever got created.
+//   2. Recovering from a sync that silently failed (the six inline call
+//      sites all use the best-effort wrapper, which logs and swallows
+//      errors so a ride-sync hiccup never fails an otherwise-successful
+//      schedule write — check server logs for
+//      "[ridePlanning] Failed to sync PENDING rides" if you suspect this).
+// Unlike those, THIS endpoint uses the throwing version deliberately —
+// a manually-triggered resync should surface its own failures directly
+// to whoever clicked the button, not swallow them.
+const resyncPendingRides = async (req, res, next) => {
+  try {
+    const { weekStart } = req.body;
+    if (!weekStart) {
+      const response = badRequestResponse("weekStart is required.");
+      return res.status(response.status.code).json(response);
+    }
+    const results = await syncPendingRidesForWeek(toDateOnly(weekStart));
+    const created = results.filter((r) => r.rideId && !r.skipped).length;
+    const cancelled = results.filter((r) => r.cancelled).length;
+    const skipped = results.filter((r) => r.skipped).length;
+    const response = okResponse(
+      { results, created, cancelled, skipped },
+      `Synced PENDING rides for the week: ${created} created/refreshed, ${cancelled} cancelled (schedule removed), ${skipped} left alone (already live/finished).`,
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -2266,6 +2325,15 @@ const createWeeklySchedule = async (req, res, next) => {
         // create that already succeeded.
       }
     }
+
+    // Ride Provisioning: create/refresh the PENDING Ride the driver app
+    // will see, from whatever the schedule looks like now (post-optimize,
+    // if it ran above). Best-effort — see ridePlanning.js's header comment
+    // for why one call site handles this instead of building the Ride
+    // inline here. Not gated on `routeId` like optimize above: even a
+    // schedule created without a route yet still needs this call so it's
+    // correctly a no-op (no driver+vehicle => nothing to provision).
+    await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -2464,6 +2532,15 @@ const updateWeeklySchedule = async (req, res, next) => {
       }
     }
 
+    // Ride Provisioning: unlike the optimize call above, this runs on
+    // EVERY update, not just ones that touch route/trip/driver/vehicle —
+    // toggling a day's status (e.g. monday BOTH -> OFF), flipping status
+    // to CANCELLED, or reassigning the employee's status all change who
+    // should be riding, and a stale PENDING ride would otherwise linger
+    // with the wrong passenger list until something else happened to
+    // trigger a sync.
+    await syncPendingRidesForWeekBestEffort(updateData.weekStart || schedule.weekStart);
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -2484,6 +2561,13 @@ const deleteWeeklySchedule = async (req, res, next) => {
     }
 
     const response = await deleteRecord(prisma.weeklySchedule, id);
+
+    // Ride Provisioning: the deleted employee needs to come off any
+    // PENDING ride for their days. If they were the only assigned
+    // employee that day, syncPendingRidesForWeek cancels the now-empty
+    // ride rather than leaving it dangling.
+    await syncPendingRidesForWeekBestEffort(schedule.weekStart);
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -3786,6 +3870,16 @@ const processBulkUploadJob = async (
     partialResult: JSON.parse(JSON.stringify(results)),
   });
 
+  // Ride Provisioning: one sync for the whole job rather than per-row —
+  // a workbook can be hundreds of rows for the same week, and
+  // syncPendingRidesForWeek already re-derives the correct state from
+  // whatever's in the DB by the time it runs, so doing it per-row would
+  // just be redundant work repeated hundreds of times for the same
+  // outcome. This already runs inside the background job (see
+  // bulkUploadWeeklySchedule's fire-and-forget call below), so it doesn't
+  // block the HTTP response either way.
+  await syncPendingRidesForWeekBestEffort(weekStartDate);
+
   return results;
 };
 
@@ -4135,4 +4229,5 @@ module.exports = {
   getBulkUploadStatus, // new — poll for progress/result of a bulk-upload job
   reassignMismatchedShiftEmployees, // new
   optimizeRouteAssignments, // new
+  resyncPendingRides, // new — manual repair/diagnostic trigger, see comment above its definition
 };

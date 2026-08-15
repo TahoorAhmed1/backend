@@ -120,17 +120,15 @@ const updateMyProfile = async (req, res, next) => {
 // Today's ride
 // ---------------------------------------------------------------------------
 
-// Maps JS Date#getUTCDay() (0 = Sunday) to WeeklySchedule's day columns.
-const DAY_KEYS = [
-  "sunday",
-  "monday",
-  "tuesday",
-  "wednesday",
-  "thursday",
-  "friday",
-  "saturday",
-];
-
+// The Ride (PENDING or later) is provisioned by dispatch the moment the
+// WeeklySchedule is assigned (see services/ridePlanning.js), so — same as
+// driver_controller's getTodayRide — there is no WeeklySchedule fallback
+// here anymore. Employee and driver now read from the exact same source
+// of truth for "does a ride exist today", so they can no longer disagree
+// about whether today has a ride. A missing Ride is a normal "day off /
+// not dispatched yet" state, not an error, so this returns 200 + null
+// rather than a 400 (matching driver_controller's convention) so the app
+// can render its empty state instead of an error banner.
 const getTodayRide = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -162,53 +160,14 @@ const getTodayRide = async (req, res, next) => {
       },
     });
 
-    // Live ride already exists (dispatch/driver has started today's run) —
-    // this is the authoritative, trackable version.
-    if (ridePassenger) {
-      const response = okResponse(
-        { ...ridePassenger.ride, source: "RIDE" },
-        "Today's ride retrieved successfully.",
-      );
+    if (!ridePassenger) {
+      const response = okResponse(null, "No ride scheduled for today.");
       return res.status(response.status.code).json(response);
     }
 
-    // No live Ride yet. Fall back to this week's WeeklySchedule so the
-    // employee can still see today's planned pickup/drop, route, driver,
-    // and vehicle ahead of dispatch actually creating the Ride row.
-    const weekStart = mondayOf();
-    const schedule = await prisma.weeklySchedule.findUnique({
-      where: { employeeId_weekStart: { employeeId: employee.id, weekStart } },
-      include: {
-        route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
-        },
-        driver: { select: { id: true, name: true, phone: true } },
-        vehicle: { select: { id: true, vehicleNumber: true } },
-      },
-    });
-
-    const todayKey = DAY_KEYS[new Date().getUTCDay()];
-    const todayStatus = schedule?.[todayKey];
-
-    if (!schedule || !todayStatus || todayStatus === "OFF" || schedule.status !== "ACTIVE") {
-      const errorResponse = badRequestResponse("No ride scheduled for today.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
     const response = okResponse(
-      {
-        id: null,
-        rideDate: startOfDay(),
-        status: "SCHEDULED",
-        dayStatus: todayStatus,
-        pickupTime: schedule.pickupTime,
-        dropTime: schedule.dropTime,
-        route: schedule.route,
-        driver: schedule.driver,
-        vehicle: schedule.vehicle,
-        source: "SCHEDULE",
-      },
-      "Today's scheduled ride retrieved successfully.",
+      { ...ridePassenger.ride, source: "RIDE" },
+      "Today's ride retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -409,6 +368,13 @@ const rejectRide = (req, res, next) => setRideResponse(req, res, next, { confirm
 // Weekly schedule
 // ---------------------------------------------------------------------------
 
+// A missing WeeklySchedule row (week not planned yet, employee is new,
+// or the requested week is simply in the past/future with nothing
+// assigned) is a normal empty state, not an error — same convention as
+// getTodayRide above. Returning 400 here made every client call for an
+// unplanned week fail, which surfaced as a false "API error" banner on
+// the home screen and made it impossible to render "no schedule yet"
+// as a normal UI state instead of an error.
 const getWeeklySchedule = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -431,10 +397,8 @@ const getWeeklySchedule = async (req, res, next) => {
     });
 
     if (!schedule) {
-      const errorResponse = badRequestResponse(
-        "No schedule found for that week.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
+      const response = okResponse(null, "No schedule found for that week.");
+      return res.status(response.status.code).json(response);
     }
 
     const response = okResponse(

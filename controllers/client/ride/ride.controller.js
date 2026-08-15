@@ -56,14 +56,12 @@ const getAllRides = async (req, res, next) => {
     const { skip = 0, take = 10, status, routeId, driverId } = req.query;
 
     const where = {};
-    if (status) where.status = status;
     if (routeId) where.routeId = routeId;
     if (driverId) where.driverId = driverId;
 
     const options = {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+
       include: {
         route: { select: { id: true, routeName: true } },
         driver: { select: { id: true, name: true } },

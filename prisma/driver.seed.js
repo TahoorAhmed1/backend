@@ -117,45 +117,31 @@
  * the equivalent added to employee_seed.js.
  */
 
-require('dotenv/config')
-const { PrismaClient } = require('@prisma/client')
-const { PrismaPg } = require('@prisma/adapter-pg')
-const { hashPassword } = require('../services/auth.service')
-const QRCode = require('qrcode')
-const crypto = require('crypto')
+require("dotenv/config");
+const { PrismaClient } = require("@prisma/client");
+const { PrismaPg } = require("@prisma/adapter-pg");
+const { hashPassword } = require("../services/auth.service");
+const QRCode = require("qrcode");
+const crypto = require("crypto");
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
-const prisma = new PrismaClient({ adapter })
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const prisma = new PrismaClient({ adapter });
 
 const fs = require("fs");
 const path = require("path");
 
 const DATA_PATH = path.join(__dirname, "driver-data.json");
-const QR_DIR = path.join(__dirname, "qrcodes", "drivers");
+const QR_DIR = path.join(__dirname, "..", "qrcodes", "drivers");
 
-const DRIVER_EMAIL_DOMAIN = "drivers.ibex.com";
+const DRIVER_EMAIL_DOMAIN = "ibex.com";
 const DEFAULT_DRIVER_PASSWORD = "12345678";
-
-// Turns "Asif Jamil Ahmed" into "asif.jamil.ahmed" — lowercase,
-// spaces/repeated whitespace collapsed to single dots, anything that
-// isn't a letter/digit/dot stripped so the result is always a valid
-// email local-part.
-function slugifyName(name) {
-  return name
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ".")
-    .replace(/[^a-z0-9.]/g, "");
-}
 
 // Turns a driver name into a safe filename: spaces removed, and any
 // character that's illegal in Windows/macOS/Linux filenames (notably
 // backslash/slash, which some raw names in this data contain, e.g.
 // "Ali \ Sameer") stripped out too.
 function safeFileName(name) {
-  return name
-    .replace(/\s+/g, "")
-    .replace(/[\\/:*?"<>|]/g, "");
+  return name.replace(/\s+/g, "").replace(/[\\/:*?"<>|]/g, "");
 }
 
 async function main() {
@@ -200,7 +186,6 @@ async function main() {
   let usersSkipped = 0;
   let userErrors = 0;
   let qrGenerated = 0;
-  const usedFileNames = new Set();
 
   for (const d of drivers) {
     const vendorId = d.vendor ? vendorIdByName.get(d.vendor) : undefined;
@@ -257,28 +242,21 @@ async function main() {
     let qrToken = driver.user?.qrCode;
 
     if (!driver.user) {
-      // Name-based email, e.g. "Asif Jamil Ahmed" -> asif.jamil.ahmed@...
-      // Per the header comment, ~42 name+vendor combos in this data are
-      // DIFFERENT real people sharing a name — colliding them onto the
-      // same email would upsert the SAME User row for both, and the
-      // second driver.update({ userId }) would then throw (Driver.userId
-      // is @unique), leaving that driver without a login. An in-memory
-      // "already used this run" Set isn't enough to catch this, since
-      // the SAME collision can just as easily happen across separate
-      // runs (e.g. one Imran got imran@... last week, a different Imran
-      // shows up today with no user yet) — so check the DB directly:
-      // only reuse a base email if nobody else already owns it.
-      const baseSlug = slugifyName(d.name) || d.seedId;
-      let email = `${baseSlug}@${DRIVER_EMAIL_DOMAIN}`;
-      const emailOwner = await prisma.user.findUnique({
-        where: { email },
-        include: { driver: true },
-      });
-      if (emailOwner && emailOwner.driver && emailOwner.driver.id !== driver.id) {
-        // Taken by a genuinely different driver — seedId is unique per
-        // driver, so this suffixed form is guaranteed free.
-        email = `${baseSlug}.${d.seedId}@${DRIVER_EMAIL_DOMAIN}`;
-      }
+      // seedId-based email, e.g. seedId "d0142" -> d0142@drivers.ibex.com.
+      // Previously this was slugifyName(d.name) with seedId only bolted
+      // on AFTER a collision was detected — which meant whichever driver
+      // with a given name happened to be processed FIRST in a run claimed
+      // the plain name@ email, and every other same-named driver got a
+      // suffixed one. That's order-dependent and not reproducible run to
+      // run (row order in driver-data.json isn't guaranteed stable), so
+      // there was no way to predict — or later explain — which real
+      // person a given login/QR badge actually belonged to. That's the
+      // mismatch showing up on mobile.
+      //
+      // seedId is already documented above as stable and unique per
+      // driver, so it's guaranteed collision-free on its own — no DB
+      // lookup or suffix dance needed.
+      const email = `${d.seedId.toLowerCase()}@${DRIVER_EMAIL_DOMAIN}`;
 
       qrToken = crypto.randomUUID();
 
@@ -339,12 +317,15 @@ async function main() {
 
     // Always (re-)render the badge PNG so the file on disk matches
     // whatever token is currently in the DB, even on re-runs.
+    // Filename is name-first (for a human glancing at the folder) but
+    // seedId-anchored, e.g. "Bilal-d0142.png" — never bare "Bilal.png".
+    // A name-only filename has the same collision problem the email fix
+    // above addresses, but worse here: `usedFileNames` only tracks
+    // collisions WITHIN this run, not across separate runs, so two
+    // same-named drivers seeded on different days could silently
+    // overwrite each other's already-printed badge PNG.
     if (qrToken) {
-      let fileBase = safeFileName(d.name) || d.seedId;
-      if (usedFileNames.has(fileBase)) {
-        fileBase = `${fileBase}.${d.seedId}`;
-      }
-      usedFileNames.add(fileBase);
+      const fileBase = `${safeFileName(d.name) || "driver"}-${d.seedId}`;
       const qrPath = path.join(QR_DIR, `${fileBase}.png`);
       try {
         await QRCode.toFile(qrPath, qrToken, {
@@ -354,7 +335,10 @@ async function main() {
         });
         qrGenerated++;
       } catch (err) {
-        console.error(`  QR image generation failed for seedId=${d.seedId}:`, err.message);
+        console.error(
+          `  QR image generation failed for seedId=${d.seedId}:`,
+          err.message,
+        );
       }
     }
   }

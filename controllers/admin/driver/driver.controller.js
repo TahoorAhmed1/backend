@@ -38,25 +38,11 @@ const endOfDay = (date = new Date()) => {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
 };
 
-// Normalizes any date to the Monday of its week (UTC), matching how
-// WeeklySchedule.weekStart is stored.
-const mondayOf = (date = new Date()) => {
-  const d = new Date(date);
-  const day = d.getUTCDay();
-  const diff = day === 0 ? -6 : 1 - day;
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diff, 0, 0, 0, 0));
-};
-
-// Maps JS Date#getUTCDay() (0 = Sunday) to WeeklySchedule's day columns.
-const DAY_KEYS = [
-  "sunday",
-  "monday",
-  "tuesday",
-  "wednesday",
-  "thursday",
-  "friday",
-  "saturday",
-];
+// Note: the Monday-of-week / weekday-key helpers that used to live here
+// were only needed for the WeeklySchedule fallback logic in getTodayRide
+// and startTodayRide. That logic now lives in services/ridePlanning.js,
+// which runs when dispatch assigns the schedule rather than when the
+// driver opens the app — see that file for the equivalent helpers.
 
 // ---------------------------------------------------------------------------
 // Profile
@@ -192,6 +178,10 @@ const getTodayRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    // The Ride is now provisioned as PENDING the moment dispatch assigns
+    // the WeeklySchedule (see services/ridePlanning.js), so there is no
+    // more "fall back to WeeklySchedule" branch here — if nothing comes
+    // back, dispatch simply hasn't assigned this driver a route today.
     const ride = await prisma.ride.findFirst({
       where: {
         driverId: driver.id,
@@ -209,95 +199,18 @@ const getTodayRide = async (req, res, next) => {
       orderBy: { createdAt: "desc" },
     });
 
-    // Live Ride already exists — authoritative, trackable version.
-    if (ride) {
-      const response = okResponse(
-        { ...ride, passengerCount: ride.passengers.length, source: "RIDE" },
-        "Today's ride retrieved successfully.",
-      );
+    // No ride is a normal, everyday state now (day off, or dispatch hasn't
+    // assigned a route yet) rather than an edge case — return it as a
+    // successful "nothing today" response, not an error, so the app can
+    // render its empty state instead of an error banner.
+    if (!ride) {
+      const response = okResponse(null, "No ride scheduled for today.");
       return res.status(response.status.code).json(response);
     }
 
-    // No live Ride yet. Fall back to today's WeeklySchedule entries for
-    // this driver so the app can show the planned route/vehicle and the
-    // actual employee list, plus offer a "Start Ride" action, before
-    // dispatch/the driver actually creates the Ride row.
-    //
-    // Exact-equality on a DateTime column is brittle — if this row's
-    // weekStart was ever written with a different time-of-day (e.g. local
-    // midnight instead of UTC midnight), an exact match silently returns
-    // zero rows forever even though the schedule clearly exists. Match a
-    // day-range instead, same approach rideDate uses above.
-    const weekStart = mondayOf();
-    const todayKey = DAY_KEYS[new Date().getUTCDay()];
-
-    const schedules = await prisma.weeklySchedule.findMany({
-      where: {
-        driverId: driver.id,
-        weekStart: { gte: startOfDay(weekStart), lte: endOfDay(weekStart) },
-        status: "ACTIVE",
-        NOT: { [todayKey]: "OFF" },
-      },
-      include: {
-        route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
-        },
-        vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
-        employee: {
-          select: {
-            id: true,
-            name: true,
-            contactNumber: true,
-            address: true,
-            status: true,
-            area: { select: { id: true, name: true } },
-          },
-        },
-      },
-    });
-
-    // Same eligibility rule startTodayRide uses when it actually creates
-    // the Ride/RidePassenger rows — keeping these in sync means the
-    // passenger count/list shown here matches what gets created once the
-    // driver taps Start.
-    const activeSchedules = schedules.filter(
-      (s) => s[todayKey] !== "ABSENT" && s.employee?.status === "ACTIVE",
-    );
-
-    if (activeSchedules.length === 0) {
-      const errorResponse = badRequestResponse("No ride scheduled for today.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const primary = activeSchedules[0];
-
-    // No live Ride/RidePassenger/Attendance rows exist yet, so every
-    // passenger here is inherently "PENDING" — nobody can have been
-    // scanned before the ride starts.
-    const passengers = activeSchedules.map((s) => ({
-      employeeId: s.employee.id,
-      employeeName: s.employee.name,
-      contact: s.employee.contactNumber,
-      address: s.employee.address,
-      areaName: s.employee.area?.name ?? null,
-      service: s[todayKey],
-      status: "PENDING",
-    }));
-
     const response = okResponse(
-      {
-        id: null,
-        rideDate: startOfDay(),
-        status: "SCHEDULED",
-        pickupTime: primary.pickupTime,
-        dropTime: primary.dropTime,
-        route: primary.route,
-        vehicle: primary.vehicle,
-        passengerCount: activeSchedules.length,
-        passengers,
-        source: "SCHEDULE",
-      },
-      "Today's scheduled ride retrieved successfully.",
+      { ...ride, passengerCount: ride?.passengers?.length, source: "RIDE" },
+      "Today's ride retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -422,12 +335,14 @@ const startRide = async (req, res, next) => {
   }
 };
 
-// POST /rides/today/start — the actual ride-creation entry point. Until
-// now nothing ever created a Ride row; dispatch only set up WeeklySchedule
-// (the plan). This turns today's schedule into a live Ride the moment the
-// driver starts their shift, then applies the normal PENDING -> STARTED
-// transition. Safe to call more than once: if a Ride already exists for
-// today it's reused instead of creating a duplicate.
+// POST /rides/today/start — convenience endpoint so the mobile app doesn't
+// need to know today's ride id up front. This NO LONGER creates a Ride:
+// the Ride is provisioned as PENDING by dispatch when the WeeklySchedule
+// is assigned (see services/ridePlanning.js). The driver's only action is
+// the normal PENDING -> STARTED transition on that existing row. If no
+// Ride exists yet, that means dispatch hasn't assigned this driver a
+// route today — the app should show that state rather than the driver
+// being able to conjure a ride into existence.
 const startTodayRide = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -450,109 +365,30 @@ const startTodayRide = async (req, res, next) => {
       },
     });
 
-    if (existingRide) {
-      if (existingRide.status === "PENDING") {
-        const { error, response } = await applyRideStatusTransition({
-          driver,
-          rideId: existingRide.id,
-          nextStatus: "STARTED",
-        });
-        if (error) return res.status(error.status.code).json(error);
-        return res.status(response.status.code).json(response);
-      }
+    if (!existingRide) {
+      const errorResponse = badRequestResponse(
+        "No ride has been assigned for today yet. Contact dispatch.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
 
+    if (existingRide.status !== "PENDING") {
       const response = okResponse(
         { ...existingRide, passengerCount: existingRide.passengers.length, source: "RIDE" },
-        "Today's ride is already in progress.",
+        existingRide.status === "STARTED"
+          ? "Today's ride is already in progress."
+          : "Today's ride is no longer pending.",
       );
       return res.status(response.status.code).json(response);
     }
 
-    // Same day-range fix as getTodayRide — exact equality on this DateTime
-    // column silently returns zero rows if weekStart wasn't written at
-    // precisely UTC midnight.
-    const weekStart = mondayOf();
-    const todayKey = DAY_KEYS[new Date().getUTCDay()];
-
-    const schedules = await prisma.weeklySchedule.findMany({
-      where: {
-        driverId: driver.id,
-        weekStart: { gte: startOfDay(weekStart), lte: endOfDay(weekStart) },
-        status: "ACTIVE",
-        NOT: { [todayKey]: "OFF" },
-      },
-      include: {
-        employee: {
-          select: { id: true, name: true, contactNumber: true, address: true, status: true },
-        },
-      },
+    const { error, response } = await applyRideStatusTransition({
+      driver,
+      rideId: existingRide.id,
+      nextStatus: "STARTED",
     });
+    if (error) return res.status(error.status.code).json(error);
 
-    const activeSchedules = schedules.filter(
-      (s) => s[todayKey] !== "ABSENT" && s.employee?.status === "ACTIVE",
-    );
-
-    if (activeSchedules.length === 0) {
-      const errorResponse = badRequestResponse("No ride scheduled for today.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    // All of a driver's schedule rows for the same day are expected to
-    // share the same route/vehicle/trip assignment — use the first as the
-    // ride's source of truth.
-    const primary = activeSchedules[0];
-
-    const createdRideId = await prisma.$transaction(async (tx) => {
-      const ride = await tx.ride.create({
-        data: {
-          rideDate: startOfDay(),
-          routeId: primary.routeId,
-          driverId: driver.id,
-          vehicleId: primary.vehicleId,
-          vendorId: primary.vendorId,
-          pickupTime: primary.pickupTime,
-          dropTime: primary.dropTime,
-          status: "STARTED",
-        },
-      });
-
-      await tx.ridePassenger.createMany({
-        data: activeSchedules.map((s) => ({
-          rideId: ride.id,
-          employeeId: s.employeeId,
-          address: s.employee.address,
-          contact: s.employee.contactNumber,
-        })),
-      });
-
-      return ride.id;
-    });
-
-    const ride = await prisma.ride.findUnique({
-      where: { id: createdRideId },
-      include: {
-        route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
-        },
-        vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
-        passengers: { select: { id: true } },
-      },
-    });
-
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "RIDE_CREATED_AND_STARTED_BY_DRIVER",
-        model: "Ride",
-        recordId: ride.id,
-        after: { driverId: driver.id, passengerCount: ride.passengers.length },
-      },
-    });
-
-    const response = okResponse(
-      { ...ride, passengerCount: ride.passengers.length, source: "RIDE" },
-      "Ride created and started successfully.",
-    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1255,10 +1091,8 @@ const getDashboardSummary = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-    const endOfToday = new Date();
-    endOfToday.setHours(23, 59, 59, 999);
+    const startOfToday = startOfDay();
+    const endOfToday = endOfDay();
 
     const [totalRides, pendingRides, completedRides] = await Promise.all([
       prisma.ride.count({
@@ -1306,12 +1140,8 @@ const getDriverStats = async (req, res, next) => {
 
     const { startDate, endDate } = req.query;
 
-    const rangeEnd = endDate ? new Date(endDate) : new Date();
-    rangeEnd.setHours(23, 59, 59, 999);
-
-    const rangeStart = startDate ? new Date(startDate) : new Date(rangeEnd);
-    if (!startDate) rangeStart.setDate(rangeStart.getDate() - 30);
-    rangeStart.setHours(0, 0, 0, 0);
+    const rangeEnd = endDate ? endOfDay(new Date(endDate)) : endOfDay();
+    const rangeStart = startDate ? startOfDay(new Date(startDate)) : startOfDay(new Date(rangeEnd.getTime() - 30 * 24 * 60 * 60 * 1000));
 
     const rides = await prisma.ride.findMany({
       where: {
