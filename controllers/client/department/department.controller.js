@@ -37,8 +37,7 @@ const getAllDepartments = async (req, res, next) => {
   try {
     const { skip = 0, take = 10 } = req.query;
     const departments = await prisma.department.findMany({
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
 
       orderBy: { createdAt: "desc" },
     });
@@ -46,7 +45,7 @@ const getAllDepartments = async (req, res, next) => {
       departments,
       "Departments retrieved successfully.",
     );
-    console.log('response', response)
+    
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);

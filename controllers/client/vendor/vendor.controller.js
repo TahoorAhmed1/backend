@@ -48,8 +48,7 @@ const getAllVendors = async (req, res, next) => {
 
     const options = {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         vehicles: { select: { id: true, vehicleNumber: true } },
         drivers: { select: { id: true, name: true } },

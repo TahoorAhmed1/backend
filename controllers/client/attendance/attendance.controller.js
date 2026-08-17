@@ -124,8 +124,7 @@ const getAllAttendance = async (req, res, next) => {
 
     const options = {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         employee: {
           select: { id: true, name: true, employeeCode: true },

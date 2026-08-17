@@ -100,8 +100,7 @@ const getAllEmployees = async (req, res, next) => {
 
     const options = {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         department: { select: { id: true, name: true } },
         area: { select: { id: true, name: true } },

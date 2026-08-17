@@ -27,8 +27,7 @@ const getAllSubAreas = async (req, res, next) => {
 
     const response = await getRecords(prisma.subArea, {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         area: { select: { id: true, name: true } },
         blocks: { select: { id: true, name: true } },

@@ -460,21 +460,51 @@ const parseDriverEntry = (raw) => parseDriverEntries(raw)[0] || null;
  * over with a fresh throwaway Driver row (which is exactly what used to
  * happen, and is how the master data got messy in the first place).
  *
- * Matches by name only (case-insensitive) — the master seed already
- * carries phone/CNIC/vendor, so there's nothing to fill in from the
- * sheet's row on a hit, unlike the old create path.
+ * BUG THIS FIXES: this used to match on name alone via findFirst(), which
+ * silently returns whichever same-named driver Postgres happens to return
+ * first. The master data documents ~66 first names and 42 name+vendor
+ * combos that are genuinely DIFFERENT real people (see prisma/seed.js's
+ * header comment — the exact same identity-collision problem that seed
+ * script was written to avoid for driver *records*). Matching schedule
+ * ROWS by name alone had the same bug one level up: every sheet row
+ * naming e.g. "Azam" — regardless of which real Azam, which vendor, which
+ * route — collapsed onto ONE Driver row, so that one driver ended up with
+ * every other same-named driver's routes on their schedule (and, via
+ * ridePlanning.js's syncPendingRidesForWeek, on their ride list too).
+ *
+ * Fix: the sheet's "drivers" cell always carries a phone number right
+ * alongside the name (see parseDriverEntries) — use it to disambiguate
+ * when more than one driver shares that name. If it's still ambiguous
+ * (multiple same-named drivers, no phone match), return null — an
+ * unmatched row surfaces for manual review instead of silently landing
+ * on the wrong person.
  */
-const findDriver = async (name, cache, extraCaches) => {
-  const trimmed = String(name || "").trim();
-  if (!trimmed) return null;
-  const key = trimmed.toLowerCase();
-  if (cache?.has(key)) return cache.get(key);
+const findDriver = async (name, phone, cache, extraCaches) => {
+  const trimmedName = String(name || "").trim();
+  if (!trimmedName) return null;
 
-  const driver = await prisma.driver.findFirst({
-    where: { name: { equals: trimmed, mode: "insensitive" } },
+  const normalizedPhone = String(phone || "").replace(/\D/g, "");
+  const cacheKey = `${trimmedName.toLowerCase()}::${normalizedPhone}`;
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
+
+  const candidates = await prisma.driver.findMany({
+    where: { name: { equals: trimmedName, mode: "insensitive" } },
     include: { vehicle: true },
   });
-  cache?.set(key, driver || null);
+
+  let driver = null;
+  if (candidates.length === 1) {
+    driver = candidates[0];
+  } else if (candidates.length > 1 && normalizedPhone) {
+    // Compare last 10 digits so e.g. "923001234567" and "03001234567"
+    // (with/without country code) still match the same real number.
+    driver =
+      candidates.find((c) =>
+        String(c.phone || "").replace(/\D/g, "").endsWith(normalizedPhone.slice(-10)),
+      ) || null;
+  }
+
+  cache?.set(cacheKey, driver || null);
   if (driver) extraCaches?.driverById?.set(driver.id, driver);
   return driver;
 };
@@ -2383,8 +2413,7 @@ const getAllWeeklySchedules = async (req, res, next) => {
 
     const options = {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         employee: {
           select: {
@@ -3312,6 +3341,13 @@ const processBulkUploadJob = async (
     // data or the sheet) rather than re-uploading and hoping.
     employeesNotFound: 0,
     driversNotFound: 0,
+    // Rows where the sheet's driver name matched MORE than one real
+    // driver in the master data and the row's phone number didn't
+    // disambiguate which one — see findDriver's doc comment. Counted
+    // separately from driversNotFound because "nobody by this name
+    // exists" and "several different people have this name" call for
+    // different fixes at the source.
+    driversAmbiguous: 0,
     vendorsNotFound: 0,
     routesCreated: 0,
     routeLegsOpenedForOverflow: 0,
@@ -3558,16 +3594,33 @@ const processBulkUploadJob = async (
         for (let d = 0; d < driverEntries.length; d++) {
           const driver = await findDriver(
             driverEntries[d].name,
+            driverEntries[d].phone,
             caches.driver,
             caches,
           );
           if (!driver) {
-            results.driversNotFound++;
-            results.notes.push({
-              row: rowNum,
-              employeeCode,
-              note: `Driver "${driverEntries[d].name}" not found in the master driver data — not assigned. Add them via the driver seed, or fix the name if it's a typo.`,
+            // Could be genuinely unmatched, or matched-but-ambiguous (same
+            // name, no phone hit) — check which, so the two get fixed
+            // differently at the source (typo/missing driver vs. a real
+            // name collision that needs the sheet's phone number corrected).
+            const nameOnlyMatches = await prisma.driver.count({
+              where: { name: { equals: driverEntries[d].name.trim(), mode: "insensitive" } },
             });
+            if (nameOnlyMatches > 1) {
+              results.driversAmbiguous++;
+              results.notes.push({
+                row: rowNum,
+                employeeCode,
+                note: `Driver "${driverEntries[d].name}" matches ${nameOnlyMatches} different drivers in the master data and the phone number on this row didn't match any of them — not assigned. Check the phone number in this cell.`,
+              });
+            } else {
+              results.driversNotFound++;
+              results.notes.push({
+                row: rowNum,
+                employeeCode,
+                note: `Driver "${driverEntries[d].name}" not found in the master driver data — not assigned. Add them via the driver seed, or fix the name if it's a typo.`,
+              });
+            }
             continue;
           }
           if (!driverId) {

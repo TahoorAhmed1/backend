@@ -39,20 +39,14 @@ const getAllAreas = async (req, res, next) => {
     const { skip = 0, take = 10 } = req.query;
 
     const options = {
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         subAreas: {
           include: {
             blocks: true,
           },
         },
-        employees: {
-          select: { id: true, name: true },
-        },
-        routes: {
-          select: { id: true, routeName: true },
-        },
+       
       },
       orderBy: { createdAt: "desc" },
     };

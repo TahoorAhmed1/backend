@@ -233,8 +233,7 @@ const getMyRides = async (req, res, next) => {
         driverId: driver.id,
         ...(status && { status }),
       },
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         route: { select: { id: true, routeName: true } },
         vehicle: { select: { id: true, vehicleNumber: true } },
@@ -803,8 +802,7 @@ const getMyComplaints = async (req, res, next) => {
         driverId: driver.id,
         ...(status && { status }),
       },
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       orderBy: { createdAt: "desc" },
     };
 

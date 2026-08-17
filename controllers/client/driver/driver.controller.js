@@ -80,7 +80,7 @@ const getAllDrivers = async (req, res, next) => {
     };
 
     const response = await getRecords(prisma.driver, options);
-    console.log('response', response)
+    
     return res.status(response.status.code).json(response);
   } catch (error) {
     console.log('error', error)
@@ -236,8 +236,7 @@ const getDriverRides = async (req, res, next) => {
     const [rides, total] = await Promise.all([
       prisma.ride.findMany({
         where,
-        skip: parseInt(skip),
-        take: parseInt(take),
+
         include: {
           route: { select: { id: true, routeName: true } },
           vehicle: { select: { id: true, vehicleNumber: true } },
@@ -251,11 +250,11 @@ const getDriverRides = async (req, res, next) => {
       {
         driverId: id,
         rides,
-        pagination: {
-          total,
-          limit: parseInt(take),
-          offset: parseInt(skip),
-        },
+        // pagination: {
+        //   total,
+        //   limit: parseInt(take),
+        //   offset: parseInt(skip),
+        // },
       },
       "Driver rides retrieved successfully.",
     );

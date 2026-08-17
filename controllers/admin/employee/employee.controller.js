@@ -257,8 +257,7 @@ const getMyRides = async (req, res, next) => {
           }),
         },
       },
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       orderBy: { ride: { rideDate: "desc" } },
       include: {
         ride: {
@@ -593,8 +592,7 @@ const getMyComplaints = async (req, res, next) => {
         employeeId: employee.id,
         ...(status && { status }),
       },
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       orderBy: { createdAt: "desc" },
     };
 

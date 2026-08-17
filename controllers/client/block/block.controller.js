@@ -27,8 +27,7 @@ const getAllBlocks = async (req, res, next) => {
 
     const response = await getRecords(prisma.block, {
       where,
-      skip: parseInt(skip),
-      take: parseInt(take),
+  
       include: {
         subArea: {
           select: { id: true, name: true },
