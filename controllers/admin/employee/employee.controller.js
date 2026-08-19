@@ -41,6 +41,45 @@ const mondayOf = (date = new Date()) => {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diff, 0, 0, 0, 0));
 };
 
+// Pickup times are free-text (e.g. "6:00 PM", "8:00AM", "1: 30PM" — see the
+// same tolerant parsing in home.tsx on the driver app). Grace period before
+// a scan counts as LATE rather than PRESENT.
+const LATE_GRACE_MINUTES = 10;
+
+function parsePickupTimeToMinutes(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/\s+/g, "").toUpperCase();
+  const match = s.match(/^(\d{1,2}):?(\d{2})?:?(AM|PM)?$/);
+  if (!match) return null;
+  let hour = parseInt(match[1], 10);
+  const minute = match[2] ? parseInt(match[2], 10) : 0;
+  const meridiem = match[3];
+  if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59) return null;
+  if (meridiem === "PM" && hour !== 12) hour += 12;
+  if (meridiem === "AM" && hour === 12) hour = 0;
+  return hour * 60 + minute;
+}
+
+// Decides PRESENT vs LATE from the ride's scheduled pickup time rather than
+// trusting whatever status the client sends — a scan is proof of *when*
+// someone showed up, so the server should be the one deciding what that
+// means, not the app. Unparsable/missing pickup times fall back to PRESENT
+// rather than guessing.
+//
+// NOTE: pickupTime strings ("6:00 PM" etc.) are operational/local times, so
+// this compares against the server's local wall clock, not UTC — unlike
+// startOfDay/endOfDay above, which deliberately use UTC for date-bucketing.
+// If this server ever runs with TZ=UTC while pickup times are meant in
+// local (e.g. Asia/Karachi) time, this comparison will be off by the UTC
+// offset — worth confirming your deployment's TZ env var before relying on
+// this in production.
+function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
+  const scheduledMinutes = parsePickupTimeToMinutes(pickupTime);
+  if (scheduledMinutes === null) return "PRESENT";
+  const scannedMinutes = scannedAt.getHours() * 60 + scannedAt.getMinutes();
+  return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES ? "LATE" : "PRESENT";
+}
+
 // ---------------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------------
@@ -175,10 +214,11 @@ const getTodayRide = async (req, res, next) => {
   }
 };
 
-// Pickup confirmation isn't tracked by its own model/column yet — we log
-// it to AuditLog (generic action/before/after trail) so dispatch has a
-// record without needing a schema change. Swap this for a dedicated
-// column/table if confirmations need to drive other logic later.
+// Confirmation now lives on RidePassenger.confirmationStatus (see
+// schema.prisma) instead of only being logged to AuditLog — the AuditLog
+// write stays for the historical "who/when" trail, but confirmationStatus
+// is what the app actually reads back, so tapping Confirm/Decline has a
+// visible, persistent effect.
 const confirmTodayRide = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -200,7 +240,7 @@ const confirmTodayRide = async (req, res, next) => {
         employeeId: employee.id,
         ride: { rideDate: { gte: startOfDay(), lte: endOfDay() } },
       },
-      select: { rideId: true },
+      select: { id: true, rideId: true },
     });
 
     if (!ridePassenger) {
@@ -209,6 +249,14 @@ const confirmTodayRide = async (req, res, next) => {
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
+    const updated = await prisma.ridePassenger.update({
+      where: { id: ridePassenger.id },
+      data: {
+        confirmationStatus: confirmed ? "CONFIRMED" : "DECLINED",
+        confirmedAt: new Date(),
+      },
+    });
 
     await prisma.auditLog.create({
       data: {
@@ -221,7 +269,12 @@ const confirmTodayRide = async (req, res, next) => {
     });
 
     const response = okResponse(
-      { rideId: ridePassenger.rideId, confirmed },
+      {
+        rideId: ridePassenger.rideId,
+        confirmed,
+        confirmationStatus: updated.confirmationStatus,
+        confirmedAt: updated.confirmedAt,
+      },
       confirmed
         ? "Pickup confirmed."
         : "Pickup declined. Dispatch has been notified.",
@@ -385,23 +438,59 @@ const getWeeklySchedule = async (req, res, next) => {
     const weekStart = req.query.weekStart
       ? mondayOf(new Date(req.query.weekStart))
       : mondayOf();
+    const weekEnd = new Date(weekStart);
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
 
-    const schedule = await prisma.weeklySchedule.findUnique({
-      where: { employeeId_weekStart: { employeeId: employee.id, weekStart } },
-      include: {
-        route: { select: { id: true, routeName: true } },
-        driver: { select: { id: true, name: true, phone: true } },
-        vehicle: { select: { id: true, vehicleNumber: true } },
-      },
-    });
+    const [schedule, attendances] = await Promise.all([
+      prisma.weeklySchedule.findUnique({
+        where: { employeeId_weekStart: { employeeId: employee.id, weekStart } },
+        include: {
+          route: { select: { id: true, routeName: true } },
+          driver: { select: { id: true, name: true, phone: true } },
+          vehicle: { select: { id: true, vehicleNumber: true } },
+        },
+      }),
+      // The schedule's own day fields (PICKUP/DROP/BOTH/OFF) only describe
+      // the plan, not what actually happened — pull real Attendance rows
+      // for the week so the client can show a day as genuinely completed
+      // (PRESENT/LATE), missed (NO_SHOW), or absent, instead of just
+      // echoing back the static plan forever, even for days long past.
+      prisma.attendance.findMany({
+        where: {
+          employeeId: employee.id,
+          rideDate: { gte: weekStart, lte: endOfDay(weekEnd) },
+        },
+        select: { rideDate: true, status: true },
+      }),
+    ]);
 
     if (!schedule) {
       const response = okResponse(null, "No schedule found for that week.");
       return res.status(response.status.code).json(response);
     }
 
+    // weekStart is always a Monday (see mondayOf), so the offset in days
+    // from weekStart maps directly onto this fixed field order — no need
+    // to look at the actual weekday of rideDate.
+    const WEEK_FIELD_ORDER = [
+      "monday",
+      "tuesday",
+      "wednesday",
+      "thursday",
+      "friday",
+      "saturday",
+      "sunday",
+    ];
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+    const attendanceByDay = {};
+    for (const a of attendances) {
+      const offset = Math.round((startOfDay(a.rideDate).getTime() - weekStart.getTime()) / MS_PER_DAY);
+      const key = WEEK_FIELD_ORDER[offset];
+      if (key) attendanceByDay[key] = a.status;
+    }
+
     const response = okResponse(
-      schedule,
+      { ...schedule, attendanceByDay },
       "Weekly schedule retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
@@ -476,6 +565,92 @@ const getWeekSummary = async (req, res, next) => {
 // Attendance (self-scan)
 // ---------------------------------------------------------------------------
 
+// POST /employees/me/attendance/scan — employee scans the DRIVER's QR code
+// (shown on the driver's own /scan screen) with their camera. This is a
+// stronger disambiguation than markMyAttendance below: instead of inferring
+// "which ride" from the employee's own schedule for today (which still
+// needs a fallback if they're somehow a passenger on more than one active
+// ride), the scanned code identifies the exact driver standing in front of
+// them, and from there their exact active ride — there's no guessing.
+const markAttendanceByQr = async (req, res, next) => {
+  try {
+    const employee = await getEmployeeFromReq(req);
+    if (!employee) {
+      const errorResponse = badRequestResponse("Employee profile not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const { qrCode } = req.body;
+    if (!qrCode) {
+      const errorResponse = badRequestResponse("No QR code was scanned.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Resolve the scanned code to a driver. User.qrCode is the same token
+    // rendered on GET /drivers/me/qr-code (driver_controller.js), so this
+    // is the driver's badge, not the employee's own.
+    const scannedUser = await prisma.user.findUnique({
+      where: { qrCode },
+      include: { driver: { select: { id: true, name: true } } },
+    });
+
+    if (!scannedUser?.driver) {
+      const errorResponse = badRequestResponse(
+        "That doesn't look like a driver's QR code. Ask your driver to show their attendance code.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // A driver can only ever have ONE ride STARTED/ARRIVED at a time
+    // (enforced in driver_controller.js's applyRideStatusTransition), so
+    // this is guaranteed to resolve to at most one ride.
+    const ride = await prisma.ride.findFirst({
+      where: {
+        driverId: scannedUser.driver.id,
+        status: { in: ["STARTED", "ARRIVED"] },
+      },
+      select: { id: true, rideDate: true, pickupTime: true, route: { select: { routeName: true } } },
+    });
+
+    if (!ride) {
+      const errorResponse = badRequestResponse(
+        `${scannedUser.driver.name} doesn't have a ride in progress right now.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const passenger = await prisma.ridePassenger.findUnique({
+      where: { rideId_employeeId: { rideId: ride.id, employeeId: employee.id } },
+    });
+    if (!passenger) {
+      const errorResponse = badRequestResponse(
+        `You're not listed as a passenger on ${scannedUser.driver.name}'s ride. Contact dispatch if this looks wrong.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const now = new Date();
+    const status = computeArrivalStatus(ride.pickupTime, now);
+    const rideDate = startOfDay(ride.rideDate);
+
+    const attendance = await prisma.attendance.upsert({
+      where: { employeeId_rideDate: { employeeId: employee.id, rideDate } },
+      update: { status, rideId: ride.id, arrivalTime: now },
+      create: { employeeId: employee.id, rideId: ride.id, rideDate, status, arrivalTime: now },
+    });
+
+    const response = okResponse(
+      { ...attendance, routeName: ride.route?.routeName, driverName: scannedUser.driver.name },
+      status === "LATE"
+        ? `Marked present (late) for ${ride.route?.routeName ?? "your ride"}.`
+        : `Marked present for ${ride.route?.routeName ?? "your ride"}.`,
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 const markMyAttendance = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -490,20 +665,43 @@ const markMyAttendance = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const ridePassenger = await prisma.ridePassenger.findFirst({
+    // Only match against a ride that's actually STARTED/ARRIVED right now.
+    // A driver can only ever have one active ride at a time (enforced in
+    // driver_controller.js's applyRideStatusTransition), so filtering on
+    // that status is what guarantees at most one candidate here — matching
+    // on "any ride today" (the old behavior) was the root cause of
+    // attendance silently landing on the wrong ride when an employee
+    // happened to be listed on more than one trip for the day.
+    const ridePassengers = await prisma.ridePassenger.findMany({
       where: {
         employeeId: employee.id,
-        ride: { rideDate: { gte: startOfDay(), lte: endOfDay() } },
+        ride: {
+          rideDate: { gte: startOfDay(), lte: endOfDay() },
+          status: { in: ["STARTED", "ARRIVED"] },
+        },
       },
       select: { rideId: true },
     });
 
-    if (!ridePassenger) {
+    if (ridePassengers.length === 0) {
       const errorResponse = badRequestResponse(
-        "Today's ride hasn't been dispatched yet, so attendance can't be scanned.",
+        "No ride is currently in progress for you — attendance can only be scanned once your driver has started the ride.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
+    if (ridePassengers.length > 1) {
+      // Should be effectively impossible given the one-active-ride-per-driver
+      // rule, but if two different drivers somehow have active rides that
+      // both list this employee, don't guess — surface it as a scheduling
+      // conflict instead of silently picking one.
+      const errorResponse = badRequestResponse(
+        "You're listed on more than one active ride right now — this is a scheduling conflict. Please contact dispatch before marking attendance.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const ridePassenger = ridePassengers[0];
 
     const rideDate = startOfDay();
 
@@ -692,8 +890,9 @@ module.exports = {
   getWeeklySchedule,
   getWeekSummary,
   markMyAttendance,
+  markAttendanceByQr,
   createComplaint,
   getMyComplaints,
   getRecentRides,
   getNotifications,
-};
+}; 

@@ -31,6 +31,8 @@ const {
   deleteNotification,
   getDashboardSummary,
   getDriverStats,
+  getActiveRide,
+  getMyQrCode,
 } = require("../../../controllers/admin/driver/driver.controller");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const {
@@ -79,6 +81,8 @@ router.get("/rides/:id/stops", getRideStops);
 router.patch("/rides/:id/stops/:stopId", updateStopStatus);
 
 // Attendance
+router.get("/me/active-ride", getActiveRide);
+router.get("/me/qr-code", getMyQrCode);
 router.get("/rides/:id/attendance", getRideAttendance);
 router.post(
   "/rides/:id/attendance",

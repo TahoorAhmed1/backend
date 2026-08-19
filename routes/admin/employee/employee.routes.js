@@ -16,6 +16,7 @@ const {
   getMyComplaints,
   getRecentRides,
   getNotifications,
+  markAttendanceByQr,
 } = require("../../../controllers/admin/employee/employee.controller.js");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const { updateEmployeeProfileSchema, confirmRideSchema, weeklyScheduleQuerySchema, markMyAttendanceSchema, listQuerySchema, employeeComplaintSchema, recentRidesQuerySchema } = require("../../../validations/common");
@@ -35,6 +36,10 @@ router.post(
   "/rides/today/confirm",
   validateRequest(confirmRideSchema),
   confirmTodayRide,
+);
+router.post(
+  "/me/attendance/scan",
+  markAttendanceByQr,
 );
 
 router.get(

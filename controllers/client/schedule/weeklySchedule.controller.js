@@ -1,4 +1,5 @@
 const XLSX = require("xlsx");
+const pLimit = require("p-limit");
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -1115,22 +1116,60 @@ const resolveConflictFreeAssignment = async ({
   }
 
   if (driverId && !vehicleId) {
-    const vehicle = await findBestAvailableVehicle(
-      weekStartDate,
-      shiftTiming,
-      trip.id,
-      capacityFloor,
-      vehicleTypeHint,
-      excludeEmployeeId,
-      caches,
-    );
-    if (vehicle) {
-      vehicleId = vehicle.id;
-      autoAssignedVehicle = true;
-    } else {
-      notes.push(
-        "No available (conflict-free) vehicle found for this row — left unassigned; assign manually.",
+    // Driver's own paired vehicle (1:1, seeded — see prisma/seed.js) is
+    // the source of truth and must be tried BEFORE the fleet-wide "best
+    // available" search below. Without this, any row that reaches here
+    // without an explicit vehicleId (driver came from the trip rather
+    // than this row's own driverRecord lookup, or an earlier conflict
+    // check cleared it) got handed a completely unrelated vehicle from
+    // the general fleet instead of the one this driver actually drives —
+    // which is the "bulk upload adds a separate vehicle" bug.
+    let driverRecord = caches?.driverById?.get(driverId);
+    if (!driverRecord?.vehicle) {
+      driverRecord = await prisma.driver.findUnique({
+        where: { id: driverId },
+        include: { vehicle: true },
+      });
+      if (driverRecord) caches?.driverById?.set(driverId, driverRecord);
+    }
+
+    if (driverRecord?.vehicle && driverRecord.vehicle.status === "ACTIVE") {
+      const ownVehicleConflict = await findVehicleConflict(
+        driverRecord.vehicle.id,
+        weekStartDate,
+        shiftTiming,
+        trip.id,
+        excludeEmployeeId,
+        caches,
       );
+      if (!ownVehicleConflict) {
+        vehicleId = driverRecord.vehicle.id;
+        autoAssignedVehicle = true;
+      } else {
+        notes.push(
+          `This driver's own vehicle overlaps route "${ownVehicleConflict.route?.routeCode ?? ownVehicleConflict.routeId}" this week — auto-assigned a different available vehicle instead.`,
+        );
+      }
+    }
+
+    if (!vehicleId) {
+      const vehicle = await findBestAvailableVehicle(
+        weekStartDate,
+        shiftTiming,
+        trip.id,
+        capacityFloor,
+        vehicleTypeHint,
+        excludeEmployeeId,
+        caches,
+      );
+      if (vehicle) {
+        vehicleId = vehicle.id;
+        autoAssignedVehicle = true;
+      } else {
+        notes.push(
+          "No available (conflict-free) vehicle found for this row — left unassigned; assign manually.",
+        );
+      }
     }
   }
 
@@ -3548,6 +3587,126 @@ const processBulkUploadJob = async (
   }
 
   // ---------- Pass 2: process each row (creates/writes only from here on) ----------
+  //
+  // PERF: rows used to run strictly one-at-a-time (one row's DB writes had
+  // to finish before the next row even started), which is the main reason
+  // a large sheet was slow even after the O(rows^2) roster-refetch fix
+  // above — a 1,000-row sheet is 1,000 sequential network round trips no
+  // matter how good the caches are.
+  //
+  // Fix: rows are grouped by the employee's AREA (the same key
+  // findOrCreateRouteAndTrip uses for caches.routesByArea), then groups run
+  // CONCURRENTLY via p-limit while rows WITHIN a group still run strictly
+  // in order. Two rows in the same area can't run concurrently — they're
+  // exactly the case where route/trip find-or-create would race (two rows
+  // both seeing "no route yet" and both creating one) — but two rows in
+  // DIFFERENT areas never touch the same route/trip/driver-hours state, so
+  // there's no correctness reason to make them wait on each other.
+  // Was 8. Each "unit of concurrency" here is a row awaiting a DB round
+  // trip (findOrCreate route/trip, then create/update the schedule row),
+  // not CPU work — so raising this mostly just means "how many in-flight
+  // queries the DB connection pool is allowed to serve at once," not more
+  // load on the Node process itself. 8 was leaving most of that pool idle.
+  //
+  // CAUTION — this number is only safe up to your Prisma connection pool
+  // size (Prisma's default is num_cpus*2+1, i.e. as low as 9-13 on a small
+  // box). Going above the pool size doesn't add real parallelism, it just
+  // makes rows queue up waiting for a free connection instead of running —
+  // so raising this without ALSO raising the pool ceiling won't help much
+  // past ~pool_size. Set it explicitly via `?connection_limit=N` on
+  // DATABASE_URL (or Prisma's `directUrl`/datasource config), and keep
+  // ROW_GROUP_CONCURRENCY comfortably under that ceiling — leave headroom
+  // for the other concurrent requests this app serves, since this job
+  // shares the same pool with everything else.
+  // 24 against a pool sized ~40-50 is a reasonable starting point to
+  // benchmark from; push higher only after confirming the DB itself
+  // (CPU/IO on the Postgres box) isn't the new bottleneck.
+  const ROW_GROUP_CONCURRENCY = 24;
+  const limit = pLimit(ROW_GROUP_CONCURRENCY);
+
+  // ---------- Batched writes (perf) ----------
+  //
+  // Every row used to do its OWN awaited create/update. Outside an explicit
+  // transaction, each of those is its own implicit BEGIN/COMMIT round trip
+  // to Postgres — so 1,000 rows was 1,000 separate transactions, not just
+  // 1,000 writes. Queuing rows and flushing them together in ONE explicit
+  // $transaction([...]) turns that into one BEGIN/COMMIT per FLUSH_SIZE
+  // rows, with the individual statements pipelined instead of each one
+  // waiting on the full round trip of the last.
+  //
+  // TRADE-OFF, and how it's handled: batching changes failure isolation.
+  // Previously one bad row (a genuine data problem) failed ONLY that row.
+  // A single $transaction is atomic — if one row in the batch throws (e.g.
+  // a DB constraint violation), Postgres rolls back the WHOLE batch. To
+  // keep the old per-row guarantee, flushPendingWrites() below falls back
+  // to running that batch's rows one-by-one — skipRow-ing only the actual
+  // offender — whenever the batched attempt throws. So the fast path is
+  // batched, correctness never regresses, and only a batch containing an
+  // actual bad row pays the slow-path cost.
+  const PENDING_WRITE_FLUSH_SIZE = 25;
+  const pendingWrites = []; // { employee, existing, scheduleData, dayFields, route, sheetName, rowNum, employeeCode, raw }
+  // employeeId -> index into pendingWrites, for rows not yet flushed —
+  // lets a duplicate employeeCode within the same unflushed window update
+  // the queued row in place instead of queuing a second write for the same
+  // employee (which would otherwise violate the employeeId/weekStart
+  // uniqueness the app relies on).
+  const pendingByEmployeeId = new Map();
+
+  const applyCacheEffects = (savedSchedule, { employee, scheduleData, dayFields, route }) => {
+    caches.scheduleByEmployeeId.set(employee.id, savedSchedule);
+    upsertRosterEntry(caches, {
+      employeeId: employee.id,
+      tripId: scheduleData.tripId,
+      routeId: scheduleData.routeId,
+      driverId: scheduleData.driverId || null,
+      vehicleId: scheduleData.vehicleId || null,
+      shiftTiming: scheduleData.shiftTiming,
+      route,
+      ...dayFields,
+    });
+  };
+
+  const flushPendingWrites = async () => {
+    if (!pendingWrites.length) return;
+    const batch = pendingWrites.splice(0, pendingWrites.length);
+    pendingByEmployeeId.clear();
+    try {
+      const saved = await prisma.$transaction(
+        batch.map((item) =>
+          item.existing
+            ? prisma.weeklySchedule.update({
+                where: { id: item.existing.id },
+                data: item.scheduleData,
+              })
+            : prisma.weeklySchedule.create({ data: item.scheduleData }),
+        ),
+      );
+      saved.forEach((savedSchedule, i) => applyCacheEffects(savedSchedule, batch[i]));
+    } catch (batchError) {
+      // One bad row shouldn't sink the whole batch — replay it one at a
+      // time so only the actual offender gets skipped.
+      for (const item of batch) {
+        const { employee, existing, scheduleData, sheetName, rowNum, employeeCode, raw } = item;
+        try {
+          const savedSchedule = existing
+            ? await prisma.weeklySchedule.update({
+                where: { id: existing.id },
+                data: scheduleData,
+              })
+            : await prisma.weeklySchedule.create({ data: scheduleData });
+          applyCacheEffects(savedSchedule, item);
+        } catch (rowError) {
+          // This row genuinely failed to persist — undo its optimistic
+          // created/updated count and report it like any other skipped row.
+          if (existing) results.updated--;
+          else results.created--;
+          await skipRow(sheetName, rowNum, employeeCode, rowError.message, raw);
+        }
+      }
+    }
+  };
+
+  const rowGroups = new Map(); // areaKey -> [{ sheetName, raw, rowNum, colIndex }]
   for (const {
     sheetName,
     colIndex,
@@ -3557,6 +3716,33 @@ const processBulkUploadJob = async (
     for (let i = 0; i < dataRows.length; i++) {
       const raw = dataRows[i];
       const rowNum = headerRowIndex + i + 2; // 1-indexed sheet row, for error messages
+      const empCodeCol = colIndex.employeeCode;
+      const employeeCode =
+        empCodeCol !== undefined ? String(raw[empCodeCol] ?? "").trim() : "";
+      // Skip blank rows and the sheet's repeated header rows (Employee ID isn't numeric there).
+      if (!employeeCode || !/^\d+$/.test(employeeCode)) continue;
+
+      // Grouping key is read straight from the cache populated in Pass 1
+      // (no DB call here) — an employee not found in master data still
+      // gets a bucket key so their row is handled (and reported as
+      // employeesNotFound) inside processRow like before, just grouped
+      // under a shared "no area" bucket with everything else that can't
+      // be keyed by a real area.
+      const areaKey = caches.employee.get(employeeCode)?.area?.id || "__no_area__";
+      if (!rowGroups.has(areaKey)) rowGroups.set(areaKey, []);
+      rowGroups.get(areaKey).push({ sheetName, raw, rowNum, colIndex });
+    }
+  }
+
+  /**
+   * Processes exactly one data row: look up employee/driver/vendor/vehicle,
+   * find-or-create the route/trip, run the conflict-free assignment
+   * resolver, and write the WeeklySchedule row. Identical logic to the
+   * previous inline loop body — only the `continue`s that used to skip to
+   * the next row became `return`s, since "skip this row" now just means
+   * "return from this call" instead of advancing a shared loop index.
+   */
+  const processRow = async (sheetName, raw, rowNum, colIndex) => {
       const get = (key) =>
         colIndex[key] !== undefined
           ? String(raw[colIndex[key]] ?? "").trim()
@@ -3564,7 +3750,7 @@ const processBulkUploadJob = async (
 
       const employeeCode = get("employeeCode");
       // Skip blank rows and the sheet's repeated header rows (Employee ID isn't numeric there).
-      if (!employeeCode || !/^\d+$/.test(employeeCode)) continue;
+      if (!employeeCode || !/^\d+$/.test(employeeCode)) return;
 
       try {
         // OPTIMIZATION: employee/driver/vendor/vehicle are seeded master
@@ -3580,7 +3766,7 @@ const processBulkUploadJob = async (
             `Employee code ${employeeCode} not found in the master employee data — add them via the employee seed first, or check for a typo in this sheet.`,
             raw,
           );
-          continue;
+          return;
         }
 
         // A row can list more than one driver (e.g. "Tariq 03043160572Shahrukh
@@ -3734,7 +3920,7 @@ const processBulkUploadJob = async (
               "Route/Trip could not be created/found even with fallback — check Route/Trip model required fields.",
               raw,
             );
-            continue;
+            return;
           }
         } catch (routeError) {
           await skipRow(
@@ -3744,7 +3930,7 @@ const processBulkUploadJob = async (
             `Route/Trip creation failed: ${routeError.message}`,
             raw,
           );
-          continue;
+          return;
         }
 
         // Conflict-free assignment: previously this step was skipped for bulk
@@ -3843,9 +4029,19 @@ const processBulkUploadJob = async (
         // instead.
         const existing = caches.scheduleByEmployeeId.get(employee.id) || null;
 
-        let savedSchedule;
-        if (existing) {
-          if (existing.isLocked) {
+        // Queue the write instead of awaiting it directly — see the
+        // batched-write comment above processRow for why, and how
+        // per-row failure isolation is preserved despite batching.
+        const pendingIdx = pendingByEmployeeId.get(employee.id);
+        if (pendingIdx !== undefined) {
+          // Duplicate employeeCode within this same unflushed window:
+          // overwrite the queued row's data ("last row wins", same as
+          // before) instead of queuing a second write.
+          pendingWrites[pendingIdx].scheduleData = scheduleData;
+          pendingWrites[pendingIdx].dayFields = dayFields;
+          pendingWrites[pendingIdx].route = route;
+        } else {
+          if (existing?.isLocked) {
             await skipRow(
               sheetName,
               rowNum,
@@ -3853,29 +4049,35 @@ const processBulkUploadJob = async (
               "Schedule is locked.",
               raw,
             );
-            continue;
+            return;
           }
-          savedSchedule = await prisma.weeklySchedule.update({
-            where: { id: existing.id },
-            data: scheduleData,
+          if (existing) results.updated++;
+          else results.created++;
+          pendingByEmployeeId.set(employee.id, pendingWrites.length);
+          pendingWrites.push({
+            employee,
+            existing,
+            scheduleData,
+            dayFields,
+            route,
+            sheetName,
+            rowNum,
+            employeeCode,
+            raw,
           });
-          results.updated++;
-        } else {
-          savedSchedule = await prisma.weeklySchedule.create({
-            data: scheduleData,
-          });
-          results.created++;
         }
-        // Keep the O(1) existing-row cache current with the row we just
-        // wrote (full record, so a LATER duplicate employeeCode in this
-        // same workbook — or the isLocked check above — still has
-        // everything it needs without another DB round trip).
-        caches.scheduleByEmployeeId.set(employee.id, savedSchedule);
 
-        // Keep the in-memory week roster in sync so the NEXT row in this
-        // same job sees this assignment immediately (no DB round trip),
-        // which is what keeps driver/vehicle conflict + working-hours
-        // checks fast and accurate as the job progresses.
+        // Update the in-memory caches immediately — NOT waiting for the
+        // batched DB flush — since these are what the NEXT row's
+        // duplicate/conflict checks read. `id` is left undefined for a
+        // brand-new row until the flush fills it in with the real one;
+        // nothing before the flush needs the real id (isLocked can only
+        // be true on a row that already existed before this job started).
+        caches.scheduleByEmployeeId.set(employee.id, {
+          ...(existing || {}),
+          ...scheduleData,
+          id: existing?.id,
+        });
         upsertRosterEntry(caches, {
           employeeId: employee.id,
           tripId: scheduleData.tripId,
@@ -3886,6 +4088,10 @@ const processBulkUploadJob = async (
           route,
           ...dayFields,
         });
+
+        if (pendingWrites.length >= PENDING_WRITE_FLUSH_SIZE) {
+          await flushPendingWrites();
+        }
       } catch (rowError) {
         await skipRow(sheetName, rowNum, employeeCode, rowError.message, raw);
       } finally {
@@ -3910,8 +4116,19 @@ const processBulkUploadJob = async (
           await new Promise((resolve) => setImmediate(resolve));
         }
       }
-    }
-  } // end per-sheet loop
+  };
+
+  // Run every area's rows in order within that area, but let up to
+  // ROW_GROUP_CONCURRENCY different areas run at the same time.
+  await Promise.all(
+    Array.from(rowGroups.values()).map((groupRows) =>
+      limit(async () => {
+        for (const { sheetName, raw, rowNum, colIndex } of groupRows) {
+          await processRow(sheetName, raw, rowNum, colIndex);
+        }
+      }),
+    ),
+  );
 
   // Final partial snapshot for any rows since the last batch boundary,
   // plus whatever fraction of a batch the job ended on.

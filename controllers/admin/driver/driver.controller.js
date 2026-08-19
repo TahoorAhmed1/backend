@@ -182,7 +182,15 @@ const getTodayRide = async (req, res, next) => {
     // the WeeklySchedule (see services/ridePlanning.js), so there is no
     // more "fall back to WeeklySchedule" branch here — if nothing comes
     // back, dispatch simply hasn't assigned this driver a route today.
-    const ride = await prisma.ride.findFirst({
+    //
+    // IMPORTANT: findFirst() used to live here, which silently discarded
+    // every ride but one whenever a driver had more than one route/trip
+    // assigned for today (a real case — e.g. a morning run and an evening
+    // run, or several distinct routes on the same day). Ride identity is
+    // per (driver, trip, day) in ridePlanning.js, not per (driver, day), so
+    // nothing elsewhere assumes a driver has at most one ride today.
+    // findMany() here so the app can show all of them.
+    const rides = await prisma.ride.findMany({
       where: {
         driverId: driver.id,
         rideDate: { gte: startOfDay(), lte: endOfDay() },
@@ -196,21 +204,18 @@ const getTodayRide = async (req, res, next) => {
         },
         passengers: { select: { id: true } },
       },
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
     });
 
-    // No ride is a normal, everyday state now (day off, or dispatch hasn't
-    // assigned a route yet) rather than an edge case — return it as a
-    // successful "nothing today" response, not an error, so the app can
-    // render its empty state instead of an error banner.
-    if (!ride) {
-      const response = okResponse(null, "No ride scheduled for today.");
-      return res.status(response.status.code).json(response);
-    }
-
+    // No rides is a normal, everyday state now (day off, or dispatch hasn't
+    // assigned a route yet) rather than an edge case — return an empty list
+    // as a successful response, not an error, so the app can render its
+    // empty state instead of an error banner.
     const response = okResponse(
-      { ...ride, passengerCount: ride?.passengers?.length, source: "RIDE" },
-      "Today's ride retrieved successfully.",
+      rides.map((ride) => ({ ...ride, passengerCount: ride.passengers?.length, source: "RIDE" })),
+      rides.length
+        ? "Today's rides retrieved successfully."
+        : "No ride scheduled for today.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -257,6 +262,10 @@ const RIDE_STATUS_TRANSITIONS = {
   CANCELLED: [],
 };
 
+// Ride statuses that count as "currently active" for a driver — i.e. the
+// driver is out on this ride and it isn't done yet.
+const ACTIVE_RIDE_STATUSES = ["STARTED", "ARRIVED"];
+
 // Shared by updateRideStatus and the start/complete/cancel convenience
 // endpoints below, so the transition rules only live in one place.
 const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData = {} }) => {
@@ -272,6 +281,31 @@ const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData
         `Cannot move ride from ${ride.status} to ${nextStatus}.`,
       ),
     };
+  }
+
+  // A driver can have several rides queued up today (see getTodayRide), but
+  // can only ever be physically out on ONE of them at a time. Without this
+  // check a driver could hit "Start" on two PENDING rides back to back and
+  // the app would then have two STARTED rides with no way to tell which one
+  // a QR scan belongs to — that's the root cause of the "which ride is this
+  // attendance for" confusion. Block starting a new ride until the current
+  // one is finished (COMPLETED) or called off (CANCELLED).
+  if (nextStatus === "STARTED") {
+    const otherActiveRide = await prisma.ride.findFirst({
+      where: {
+        driverId: driver.id,
+        id: { not: rideId },
+        status: { in: ACTIVE_RIDE_STATUSES },
+      },
+      select: { id: true, route: { select: { routeName: true } } },
+    });
+    if (otherActiveRide) {
+      return {
+        error: badRequestResponse(
+          `You already have a ride in progress (${otherActiveRide.route?.routeName ?? "another route"}). Complete it before starting a new one.`,
+        ),
+      };
+    }
   }
 
   const response = await updateRecord(prisma.ride, rideId, {
@@ -350,7 +384,7 @@ const startTodayRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const existingRide = await prisma.ride.findFirst({
+    const todaysRides = await prisma.ride.findMany({
       where: {
         driverId: driver.id,
         rideDate: { gte: startOfDay(), lte: endOfDay() },
@@ -362,14 +396,31 @@ const startTodayRide = async (req, res, next) => {
         vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
         passengers: { select: { id: true } },
       },
+      orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
     });
 
-    if (!existingRide) {
+    if (todaysRides.length === 0) {
       const errorResponse = badRequestResponse(
         "No ride has been assigned for today yet. Contact dispatch.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
+    // This endpoint only knows how to act on ONE ride, but a driver can
+    // have several today (see getTodayRide above — this used to be a
+    // findFirst() that quietly grabbed whichever row Postgres returned
+    // first, which meant "start today's ride" could start the WRONG ride
+    // for a driver with multiple routes). Rather than guess, require the
+    // caller to disambiguate via the normal per-ride /rides/:id/start
+    // endpoint whenever there's more than one candidate.
+    if (todaysRides.length > 1) {
+      const errorResponse = badRequestResponse(
+        "You have multiple rides today — start the specific ride from your ride list instead.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const existingRide = todaysRides[0];
 
     if (existingRide.status !== "PENDING") {
       const response = okResponse(
@@ -402,9 +453,46 @@ const completeRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    const rideId = req.params.id;
+
+    // Pull the ride's passenger list alongside whatever attendance rows
+    // already exist for it, so we can tell PENDING (no row yet) apart from
+    // a resolved outcome. This is a completeness check, not a timer — the
+    // "5 minute buffer" the driver gets before giving up on a no-show is a
+    // real-world habit, not something the backend clocks; once the driver
+    // marks the straggler ABSENT/NO_SHOW (via markAttendance or
+    // updateStopStatus) they show up here as resolved and stop blocking
+    // completion.
+    const ride = await prisma.ride.findUnique({
+      where: { id: rideId },
+      include: {
+        passengers: {
+          include: { employee: { select: { id: true, name: true } } },
+        },
+        attendances: { select: { employeeId: true } },
+      },
+    });
+    if (!ride || ride.driverId !== driver.id) {
+      const errorResponse = badRequestResponse("Ride not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const resolvedEmployeeIds = new Set(ride.attendances.map((a) => a.employeeId));
+    const pendingPassengers = ride.passengers.filter(
+      (p) => !resolvedEmployeeIds.has(p.employee.id),
+    );
+
+    if (pendingPassengers.length > 0) {
+      const names = pendingPassengers.map((p) => p.employee.name).join(", ");
+      const errorResponse = badRequestResponse(
+        `${pendingPassengers.length} passenger(s) still need attendance recorded before this ride can be completed: ${names}. Mark any no-shows as Absent, then complete the ride.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
     const { error, response } = await applyRideStatusTransition({
       driver,
-      rideId: req.params.id,
+      rideId,
       nextStatus: "COMPLETED",
     });
     if (error) return res.status(error.status.code).json(error);
@@ -564,6 +652,35 @@ const getRideStops = async (req, res, next) => {
 
 const ATTENDANCE_STATUSES = ["PRESENT", "LATE", "ABSENT", "NO_SHOW"];
 
+// Pickup times are free-text ("6:00 PM", "8:00AM", etc. — see the same
+// tolerant parsing on the home.tsx shift-grouping logic). Grace period
+// before a scan counts as LATE instead of PRESENT when no explicit status
+// is given by the caller.
+const LATE_GRACE_MINUTES = 10;
+
+function parsePickupTimeToMinutes(raw) {
+  if (!raw) return null;
+  const s = String(raw).replace(/\s+/g, "").toUpperCase();
+  const match = s.match(/^(\d{1,2}):?(\d{2})?:?(AM|PM)?$/);
+  if (!match) return null;
+  let hour = parseInt(match[1], 10);
+  const minute = match[2] ? parseInt(match[2], 10) : 0;
+  const meridiem = match[3];
+  if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59) return null;
+  if (meridiem === "PM" && hour !== 12) hour += 12;
+  if (meridiem === "AM" && hour === 12) hour = 0;
+  return hour * 60 + minute;
+}
+
+// Same NOTE as employee_controller.js: compares against server local wall
+// clock since pickupTime strings are operational/local times, not UTC.
+function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
+  const scheduledMinutes = parsePickupTimeToMinutes(pickupTime);
+  if (scheduledMinutes === null) return "PRESENT";
+  const scannedMinutes = scannedAt.getHours() * 60 + scannedAt.getMinutes();
+  return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES ? "LATE" : "PRESENT";
+}
+
 // Shared by markAttendance (QR scan), updateStopStatus, and updateAttendance
 // — all three end up doing the same upsert against Attendance, just
 // resolving the target employee a different way.
@@ -602,9 +719,9 @@ const markAttendance = async (req, res, next) => {
     }
 
     const { id: rideId } = req.params;
-    const { employeeId, qrCode, status = "PRESENT" } = req.body;
+    const { employeeId, qrCode, status: explicitStatus } = req.body;
 
-    if (!ATTENDANCE_STATUSES.includes(status)) {
+    if (explicitStatus && !ATTENDANCE_STATUSES.includes(explicitStatus)) {
       const errorResponse = badRequestResponse("Invalid attendance status.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -614,6 +731,27 @@ const markAttendance = async (req, res, next) => {
       const errorResponse = badRequestResponse("Ride not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
+    // A QR scan only makes sense against the ride the driver is physically
+    // running right now. Requiring STARTED/ARRIVED (rather than accepting
+    // any of today's rides) is what makes "which ride is this attendance
+    // for" unambiguous end to end: since applyRideStatusTransition only
+    // ever lets ONE ride be STARTED/ARRIVED per driver at a time, this
+    // check guarantees there is exactly one valid target ride whenever a
+    // scan is allowed to succeed.
+    if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+      const errorResponse = badRequestResponse(
+        ride.status === "PENDING"
+          ? "Start this ride before scanning attendance for it."
+          : `This ride is already ${ride.status.toLowerCase()} — attendance can no longer be scanned for it.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Only auto-compute PRESENT/LATE from the scan time when the caller
+    // didn't explicitly ask for something else — a driver correcting a
+    // no-show or absence still needs to be able to say so directly.
+    const status = explicitStatus ?? computeArrivalStatus(ride.pickupTime);
 
     let resolvedEmployeeId = employeeId;
     if (!resolvedEmployeeId && qrCode) {
@@ -645,6 +783,45 @@ const markAttendance = async (req, res, next) => {
   }
 };
 
+// GET /drivers/me/active-ride — returns the single ride (if any) this
+// driver currently has STARTED/ARRIVED, so the mobile app's "Scan QR" CTA
+// always knows exactly which ride to attach the scan to instead of asking
+// the driver to pick from a list or guessing. Returns { data: null } when
+// nothing is active (e.g. driver hasn't started a ride yet, or already
+// completed all of today's rides) rather than erroring, since "no active
+// ride" is a normal, expected state, not a failure.
+const getActiveRide = async (req, res, next) => {
+  try {
+    const driver = await getDriverFromReq(req);
+    if (!driver) {
+      const errorResponse = badRequestResponse("Driver profile not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const activeRide = await prisma.ride.findFirst({
+      where: {
+        driverId: driver.id,
+        status: { in: ACTIVE_RIDE_STATUSES },
+      },
+      include: {
+        route: { select: { id: true, routeName: true, routeCode: true, officeLocation: true } },
+        vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
+        passengers: { select: { id: true } },
+      },
+    });
+
+    const response = okResponse(
+      activeRide
+        ? { ...activeRide, passengerCount: activeRide.passengers.length }
+        : null,
+      activeRide ? "Active ride retrieved successfully." : "No active ride right now.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 // PATCH /rides/:id/stops/:employeeId — mark a specific stop's outcome
 // (e.g. from the route-stops list) without going through a QR scan.
 const updateStopStatus = async (req, res, next) => {
@@ -666,6 +843,17 @@ const updateStopStatus = async (req, res, next) => {
     const ride = await prisma.ride.findUnique({ where: { id: rideId } });
     if (!ride || ride.driverId !== driver.id) {
       const errorResponse = badRequestResponse("Ride not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Same reasoning as markAttendance: a stop outcome only makes sense
+    // once the ride is actually underway.
+    if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+      const errorResponse = badRequestResponse(
+        ride.status === "PENDING"
+          ? "Start this ride before updating stop status."
+          : `This ride is already ${ride.status.toLowerCase()} — stops can no longer be updated.`,
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -1193,6 +1381,7 @@ module.exports = {
   getRideStops,
   updateStopStatus,
   markAttendance,
+  getActiveRide,
   getRideAttendance,
   updateAttendance,
   createComplaint,

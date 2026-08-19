@@ -155,6 +155,7 @@ model SubArea {
   blocks    Block[]
   employees Employee[]
   routes    Route[]
+  rides     Ride[]
 
   @@unique([name, areaId])
   @@index([areaId])
@@ -326,6 +327,7 @@ model Trip {
   driver          Driver?          @relation(fields: [driverId], references: [id])
   vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id])
   weeklySchedules WeeklySchedule[]
+  rides           Ride[]
 
   @@unique([routeId, tripNumber])
   @@index([routeId])
@@ -427,16 +429,24 @@ model WeeklySchedule {
   @@index([weekStart])
   @@index([employeeId])
   @@index([tripId])
+  // Matches the exact filter shape syncPendingRidesForWeek uses
+  // (weekStart range + status + routeId not null) — without this, that
+  // query falls back to scanning every schedule row for the week.
+  @@index([weekStart, status, routeId])
 }
 
 model Ride {
-  id         String     @id @default(uuid())
-  rideDate   DateTime
-  routeId    String
-  driverId   String?
-  vehicleId  String?
-  vendorId   String?
+  id        String   @id @default(uuid())
+  rideDate  DateTime
+  routeId   String
+  driverId  String?
+  vehicleId String?
+  vendorId  String?
+  tripId    String?
+  trip      Trip?    @relation(fields: [tripId], references: [id])
+
   areaId     String?
+  subAreaId  String?
   pickupTime String?
   dropTime   String?
   status     RideStatus @default(PENDING)
@@ -449,17 +459,49 @@ model Ride {
   vehicle     Vehicle?        @relation(fields: [vehicleId], references: [id])
   vendor      Vendor?         @relation(fields: [vendorId], references: [id])
   area        Area?           @relation(fields: [areaId], references: [id])
+  subArea     SubArea?        @relation(fields: [subAreaId], references: [id])
   passengers  RidePassenger[]
   attendances Attendance[]
   complaints  Complaint[]
+
+  @@unique([driverId, tripId, rideDate], name: "ride_driver_trip_date_unique")
+  @@index([routeId, rideDate])
+  @@index([rideDate])
+}
+
+enum RideConfirmationStatus {
+  PENDING
+  CONFIRMED
+  DECLINED
 }
 
 model RidePassenger {
-  id         String  @id @default(uuid())
+  id         String @id @default(uuid())
   rideId     String
   employeeId String
-  address    String?
-  contact    String?
+
+  // Snapshot of employee-facing details as of the moment this row was
+  // (re)written by syncPendingRidesForWeek. Deliberately denormalized:
+  // Employee.name/address/area/subArea can change after the ride is
+  // created (employee moves, gets renamed, changes area), but a Ride is a
+  // historical record of what dispatch actually knew and acted on that
+  // day — it shouldn't silently rewrite itself when Employee changes
+  // later. Rewritten in full every sync while the ride is still PENDING;
+  // frozen once the ride moves past PENDING, same as the rest of the ride.
+  employeeName String?
+  address      String?
+  contact      String?
+  area         String?
+  subArea      String?
+
+  // Was previously ONLY logged to AuditLog (RIDE_PICKUP_CONFIRMATION) —
+  // nothing on this row or the Ride ever reflected it, so an employee
+  // tapping "Confirm" had no observable effect anywhere the app could
+  // read back. This is the actual, queryable state the confirm/decline
+  // buttons drive; AuditLog stays as the append-only history of who did
+  // what and when, this is "what's true right now".
+  confirmationStatus RideConfirmationStatus @default(PENDING)
+  confirmedAt        DateTime?
 
   ride     Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
   employee Employee @relation(fields: [employeeId], references: [id])
@@ -519,8 +561,9 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  employee Employee? @relation("EmployeeUser")
-  driver   Driver?   @relation("DriverUser")
+  employee      Employee?      @relation("EmployeeUser")
+  driver        Driver?        @relation("DriverUser")
+  notifications Notification[]
 }
 
 model AuditLog {
@@ -556,4 +599,9 @@ model Notification {
   status    NotificationStatus @default(UNREAD)
   link      String?
   createdAt DateTime           @default(now())
+
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
