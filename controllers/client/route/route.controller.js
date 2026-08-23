@@ -14,6 +14,39 @@ const toDateOnly = (d) => {
   );
 };
 
+/**
+ * Monday (UTC, date-only) of the week containing "now". Mirrors the
+ * frontend's mondayOf() so "current week" means the same thing on both
+ * sides. Used to give every trip a real assigned/remaining seat count
+ * wherever trips are listed, instead of requiring a second per-route
+ * weekly-view call just to avoid showing a false "0/capacity".
+ */
+const currentWeekMonday = () => {
+  const now = new Date();
+  const d = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+  );
+  const day = d.getUTCDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d;
+};
+
+/** Shapes a Trip (with its vehicle + weeklySchedules already loaded) into
+ * the capacity/assigned/remaining triple the UI needs, everywhere trips are
+ * listed — the single source of truth for "how full is this trip", so the
+ * route list, stats, and weekly view all agree instead of each computing it
+ * (or not computing it) slightly differently. */
+const shapeTripOccupancy = (trip) => {
+  const capacity = trip.vehicle?.capacity || 0;
+  const assigned = trip.weeklySchedules?.length || 0;
+  return {
+    capacity,
+    assignedEmployees: assigned,
+    remainingSeats: Math.max(capacity - assigned, 0),
+  };
+};
+
 const cleanString = (v) =>
   v === undefined || v === null ? "" : String(v).trim();
 
@@ -640,6 +673,26 @@ const getAllRoutes = async (req, res, next) => {
     if (areaId) where.areaId = areaId;
     if (serviceType) where.serviceType = serviceType;
 
+    // Which week counts as "current" for the seats-badge on every route
+    // card. Default to today's real week, but if nobody anywhere has been
+    // scheduled for that exact week yet (e.g. rosters were set up for a
+    // different week), fall back to the most recent week that actually has
+    // active assignments — one query for the whole list rather than
+    // resolving per route, so this stays cheap regardless of page size.
+    let occupancyWeekStart = currentWeekMonday();
+    const hasCurrentWeekData =
+      (await prisma.weeklySchedule.count({
+        where: { weekStart: occupancyWeekStart, status: { not: "CANCELLED" } },
+      })) > 0;
+    if (!hasCurrentWeekData) {
+      const mostRecent = await prisma.weeklySchedule.findFirst({
+        where: { status: { not: "CANCELLED" } },
+        orderBy: { weekStart: "desc" },
+        select: { weekStart: true },
+      });
+      if (mostRecent) occupancyWeekStart = mostRecent.weekStart;
+    }
+
     const [routes, total] = await Promise.all([
       prisma.route.findMany({
         where,
@@ -649,13 +702,26 @@ const getAllRoutes = async (req, res, next) => {
         include: {
           area: { select: { id: true, name: true } },
           subArea: { select: { id: true, name: true } },
-          driver: { select: { id: true, name: true } },
           trips: {
             where: { status: "ACTIVE" },
             include: {
+              // Trip owns driver/vehicle now — Route.driver is only kept
+              // around for legacy back-compat writes (see schema comment),
+              // it's not selected here since every current-flow route's
+              // "who's driving" answer comes from its trips.
               driver: { select: { id: true, name: true } },
               vehicle: {
                 select: { id: true, vehicleNumber: true, capacity: true },
+              },
+              // Occupancy for occupancyWeekStart (resolved above), computed
+              // once here so every route card can show real
+              // "assigned/capacity" seats without a second round trip.
+              weeklySchedules: {
+                where: {
+                  weekStart: occupancyWeekStart,
+                  status: { not: "CANCELLED" },
+                },
+                select: { id: true },
               },
             },
             orderBy: { tripNumber: "asc" },
@@ -666,9 +732,17 @@ const getAllRoutes = async (req, res, next) => {
       prisma.route.count({ where }),
     ]);
 
+    const shapedRoutes = routes.map((route) => ({
+      ...route,
+      trips: route.trips.map((trip) => ({
+        ...trip,
+        ...shapeTripOccupancy(trip),
+      })),
+    }));
+
     const response = okResponse(
       {
-        routes,
+        routes: shapedRoutes,
         // pagination: {
         //   total,
         //   limit,
@@ -828,7 +902,16 @@ const getRouteEmployees = async (req, res, next) => {
                 contactNumber: true,
               },
             },
-            trip: { select: { id: true, tripNumber: true } },
+            // Driver is read off the employee's Trip, not the schedule's
+            // own denormalized driverId/route — Trip is the source of
+            // truth for "who's actually driving this employee".
+            trip: {
+              select: {
+                id: true,
+                tripNumber: true,
+                driver: { select: { id: true, name: true, phone: true } },
+              },
+            },
           },
         },
       },
@@ -846,6 +929,7 @@ const getRouteEmployees = async (req, res, next) => {
         employees: route.weeklySchedules.map((schedule) => ({
           ...schedule.employee,
           tripNumber: schedule.trip?.tripNumber ?? null,
+          driver: schedule.trip?.driver ?? null,
           schedule,
         })),
       },
@@ -929,8 +1013,7 @@ const getRouteStats = async (req, res, next) => {
       tripNumber: trip.tripNumber,
       driver: trip.driver,
       vehicle: trip.vehicle,
-      capacity: trip.vehicle?.capacity || 0,
-      assignedEmployees: trip.weeklySchedules.length,
+      ...shapeTripOccupancy(trip),
     }));
 
     const stats = {
@@ -963,17 +1046,12 @@ const getRouteStats = async (req, res, next) => {
  * count, and remaining seats — in one call.
  *
  * Route param: routeId
- * Query: weekStart (required)
+ * Query: weekStart (optional — see resolution below)
  */
 const getRouteWeeklyView = async (req, res, next) => {
   try {
     const { routeId } = req.params;
     const { weekStart } = req.query;
-    if (!weekStart) {
-      const response = badRequestResponse("weekStart query param is required.");
-      return res.status(response.status.code).json(response);
-    }
-    const weekStartDate = toDateOnly(weekStart);
 
     const route = await prisma.route.findUnique({
       where: { id: routeId },
@@ -988,6 +1066,43 @@ const getRouteWeeklyView = async (req, res, next) => {
     if (!route) {
       const response = badRequestResponse("Route not found.");
       return res.status(response.status.code).json(response);
+    }
+
+    // Resolve which week to show. An explicit weekStart is always honored —
+    // the caller is intentionally looking at that week. Otherwise, default
+    // to "today's" week, but if that week has zero assignments for this
+    // route while some OTHER week does, show the most recent week that
+    // actually has assignments instead. Without this, a route whose roster
+    // was scheduled for a different week (e.g. seeded/demo data, or a
+    // roster set up ahead of/behind the literal calendar week) silently
+    // renders as "0/N seats" even though people really are assigned —
+    // indistinguishable from a genuinely empty trip.
+    let weekStartDate = weekStart ? toDateOnly(weekStart) : currentWeekMonday();
+    let resolvedAutomatically = false;
+
+    if (!weekStart) {
+      const tripIds = route.trips.map((t) => t.id);
+      const hasCurrentWeekData =
+        tripIds.length > 0 &&
+        (await prisma.weeklySchedule.count({
+          where: {
+            tripId: { in: tripIds },
+            weekStart: weekStartDate,
+            status: { not: "CANCELLED" },
+          },
+        })) > 0;
+
+      if (!hasCurrentWeekData && tripIds.length > 0) {
+        const mostRecent = await prisma.weeklySchedule.findFirst({
+          where: { tripId: { in: tripIds }, status: { not: "CANCELLED" } },
+          orderBy: { weekStart: "desc" },
+          select: { weekStart: true },
+        });
+        if (mostRecent) {
+          weekStartDate = mostRecent.weekStart;
+          resolvedAutomatically = true;
+        }
+      }
     }
 
     const trips = await Promise.all(
@@ -1021,6 +1136,11 @@ const getRouteWeeklyView = async (req, res, next) => {
         routeCode: route.routeCode,
         shiftTiming: route.shiftTiming,
         multiTrip: trips.length > 1,
+        // The actual week these numbers reflect — always echoed back so the
+        // UI can label it, since it may not be the caller's requested/
+        // assumed week when resolvedAutomatically is true.
+        weekStart: weekStartDate.toISOString().slice(0, 10),
+        resolvedAutomatically,
         trips,
       },
       "Route weekly view retrieved successfully.",
