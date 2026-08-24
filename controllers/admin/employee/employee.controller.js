@@ -205,7 +205,15 @@ const getTodayRide = async (req, res, next) => {
     }
 
     const response = okResponse(
-      { ...ridePassenger.ride, source: "RIDE" },
+      {
+        ...ridePassenger.ride,
+        // These live on RidePassenger, not Ride — this is the employee's own
+        // pickup confirmation, separate from the ride's dispatch status
+        // (Ride.status), so it has to be spread in explicitly here.
+        confirmationStatus: ridePassenger.confirmationStatus,
+        confirmedAt: ridePassenger.confirmedAt,
+        source: "RIDE",
+      },
       "Today's ride retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
@@ -500,7 +508,9 @@ const getWeeklySchedule = async (req, res, next) => {
 };
 
 // This-week snapshot for the home screen: rides completed/remaining and
-// attendance rate, derived from Attendance rows in the current week.
+// attendance rate. "Completed" is driven by the ride's own Ride.status
+// (only true once the driver ends the ride), not by this employee's
+// Attendance row alone — attendance PRESENT/LATE just confirms pickup.
 const getWeekSummary = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -519,12 +529,29 @@ const getWeekSummary = async (req, res, next) => {
         employeeId: employee.id,
         rideDate: { gte: weekStart, lte: weekEnd },
       },
-      select: { status: true },
+      select: {
+        status: true,
+        // Need the linked ride's own status to tell "employee scanned in"
+        // apart from "ride is actually finished" — see `completed` below.
+        ride: { select: { status: true } },
+      },
     });
 
     const totalMarked = attendances.length;
     const present = attendances.filter((a) =>
       ["PRESENT", "LATE"].includes(a.status),
+    ).length;
+
+    // A ride only counts as "completed" once the driver has actually
+    // ended it (Ride.status === "COMPLETED"). Attendance being
+    // PRESENT/LATE only means this employee's QR scan was recorded at
+    // pickup — the ride can still be STARTED/ARRIVED for a while after
+    // that, so it must not be counted as completed yet. (Attendance
+    // rows created before Trips/rideId linking existed may have no
+    // `ride` at all; those can't be confirmed completed, so they're
+    // excluded here same as an in-progress ride would be.)
+    const completed = attendances.filter(
+      (a) => ["PRESENT", "LATE"].includes(a.status) && a.ride?.status === "COMPLETED",
     ).length;
 
     const schedule = await prisma.weeklySchedule.findUnique({
@@ -546,7 +573,7 @@ const getWeekSummary = async (req, res, next) => {
 
     const response = okResponse(
       {
-        ridesCompleted: present,
+        ridesCompleted: completed,
         ridesRemaining: Math.max(0, scheduledDayCount - totalMarked),
         attendanceRate:
           totalMarked > 0
@@ -739,6 +766,7 @@ const createComplaint = async (req, res, next) => {
     }
 
     const { category, title, description, rideId } = req.body;
+    const resolvedCategory = category || "OTHER";
 
     if (!title || !title.trim()) {
       const errorResponse = badRequestResponse("Title is required.");
@@ -749,9 +777,32 @@ const createComplaint = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    // Driver/vehicle complaints are only useful if we know *which* driver
+    // or vehicle — and the only source of truth for that is the selected
+    // ride (Complaint has no other way to point at a specific driver).
+    // Without this, these categories would save with a title/description
+    // but no driverId/vehicleId, same as the bug that was happening before.
+    if (["DRIVER_BEHAVIOUR", "VEHICLE_CONDITION"].includes(resolvedCategory) && !rideId) {
+      const errorResponse = badRequestResponse(
+        resolvedCategory === "DRIVER_BEHAVIOUR"
+          ? "Please select the related ride so we know which driver this is about."
+          : "Please select the related ride so we know which vehicle this is about.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    let driverId;
+    let vehicleId;
+
     if (rideId) {
+      // Also pulls the ride's driverId/vehicleId so the complaint can be
+      // attached to them directly. Derived server-side from the validated
+      // ride record rather than trusted from the client — the client has
+      // no reliable way to know these IDs, and shouldn't be able to set
+      // them directly on a Complaint anyway.
       const ridePassenger = await prisma.ridePassenger.findUnique({
         where: { rideId_employeeId: { rideId, employeeId: employee.id } },
+        include: { ride: { select: { driverId: true, vehicleId: true } } },
       });
       if (!ridePassenger) {
         const errorResponse = badRequestResponse(
@@ -759,14 +810,18 @@ const createComplaint = async (req, res, next) => {
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
+      driverId = ridePassenger.ride.driverId ?? undefined;
+      vehicleId = ridePassenger.ride.vehicleId ?? undefined;
     }
 
     const response = await createRecord(prisma.complaint, {
       employeeId: employee.id,
-      category: category || "OTHER",
+      category: resolvedCategory,
       title: title.trim(),
       description: description.trim(),
       ...(rideId && { rideId }),
+      ...(driverId && { driverId }),
+      ...(vehicleId && { vehicleId }),
     });
 
     return res.status(response.status.code).json(response);
@@ -823,6 +878,8 @@ const getRecentRides = async (req, res, next) => {
             id: true,
             rideDate: true,
             route: { select: { routeName: true } },
+            driver: { select: { id: true, name: true } },
+            vehicle: { select: { id: true, vehicleNumber: true } },
           },
         },
       },
@@ -832,6 +889,10 @@ const getRecentRides = async (req, res, next) => {
       id: rp.ride.id,
       rideDate: rp.ride.rideDate,
       routeName: rp.ride.route.routeName,
+      driver: rp.ride.driver ? { id: rp.ride.driver.id, name: rp.ride.driver.name } : null,
+      vehicle: rp.ride.vehicle
+        ? { id: rp.ride.vehicle.id, vehicleNumber: rp.ride.vehicle.vehicleNumber }
+        : null,
     }));
 
     const response = okResponse(rides, "Recent rides retrieved successfully.");
@@ -873,7 +934,7 @@ const getNotifications = async (req, res, next) => {
     });
 
     const response = okResponse(
-      { data:notifications, total, limit: parseInt(limit), skip: parseInt(skip) },
+      { data:notifications ?? [], total, limit: parseInt(limit), skip: parseInt(skip) },
       "Notifications retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
@@ -895,4 +956,4 @@ module.exports = {
   getMyComplaints,
   getRecentRides,
   getNotifications,
-}; 
+};

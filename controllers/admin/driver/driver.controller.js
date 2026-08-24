@@ -302,7 +302,7 @@ const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData
     if (otherActiveRide) {
       return {
         error: badRequestResponse(
-          `You already have a ride in progress (${otherActiveRide.route?.routeName ?? "another route"}). Complete it before starting a new one.`,
+          `You already have a ride in progress (${otherActiveRide?.route?.routeName ?? "another route"}). Complete it before starting a new one.`,
         ),
       };
     }

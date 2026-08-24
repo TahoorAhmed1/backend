@@ -28,7 +28,7 @@ router.patch("/:id/status", updateComplaintStatus);
 
 router.get("/:id", getComplaintById);
 
-router.put("/:id", validateRequest(complaintUpdateSchema), updateComplaint);
+router.put("/:id", updateComplaint);
 
 router.delete("/:id", deleteComplaint);
 

@@ -1,5 +1,3 @@
-
-
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -107,7 +105,11 @@ const getComplaintById = async (req, res, next) => {
 const updateComplaint = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { title, description, category, status, resolution } = req.body;
+    const {
+  
+      status,
+   
+    } = req.body;
 
     
     const complaint = await prisma.complaint.findUnique({ where: { id } });
@@ -117,11 +119,11 @@ const updateComplaint = async (req, res, next) => {
     }
 
     const updateData = {};
-    if (title) updateData.title = title;
-    if (description !== undefined) updateData.description = description;
-    if (category) updateData.category = category;
     if (status) updateData.status = status;
-    if (resolution !== undefined) updateData.resolution = resolution;
+
+
+
+
 
     const response = await updateRecord(prisma.complaint, id, updateData, {
       employee: true,

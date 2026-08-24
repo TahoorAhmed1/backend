@@ -1,5 +1,3 @@
-
-
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -8,14 +6,16 @@ const {
   updateRecord,
   deleteRecord,
 } = require("../../../utils/crudHelper");
-const { badRequestResponse, okResponse } = require("../../../constants/responses");
+const {
+  badRequestResponse,
+  okResponse,
+} = require("../../../constants/responses");
 
 const createAttendance = async (req, res, next) => {
   try {
     const { rideDate, employeeId, rideId, arrivalTime, delayMinutes, status } =
       req.body;
 
-    
     const existingRecord = await prisma.attendance.findUnique({
       where: {
         employeeId_rideDate: {
@@ -27,7 +27,7 @@ const createAttendance = async (req, res, next) => {
 
     if (existingRecord) {
       const response = badRequestResponse(
-        "Attendance record already exists for this employee on this date."
+        "Attendance record already exists for this employee on this date.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -49,7 +49,15 @@ const createAttendance = async (req, res, next) => {
 
 const scanAttendanceByQrCode = async (req, res, next) => {
   try {
-    const { employeeId, driverQrCode, rideId, rideDate, arrivalTime, delayMinutes, status } = req.body;
+    const {
+      employeeId,
+      driverQrCode,
+      rideId,
+      rideDate,
+      arrivalTime,
+      delayMinutes,
+      status,
+    } = req.body;
 
     const driverUser = await prisma.user.findUnique({
       where: { qr_code: driverQrCode },
@@ -73,7 +81,7 @@ const scanAttendanceByQrCode = async (req, res, next) => {
 
     if (existingRecord) {
       const response = badRequestResponse(
-        "Attendance record already exists for this employee on this date."
+        "Attendance record already exists for this employee on this date.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -98,7 +106,7 @@ const scanAttendanceByQrCode = async (req, res, next) => {
           qrCode: driverUser.qrCode,
         },
       },
-      "Attendance scanned successfully."
+      "Attendance scanned successfully.",
     );
 
     return res.status(response.status.code).json(response);
@@ -109,36 +117,155 @@ const scanAttendanceByQrCode = async (req, res, next) => {
 
 const getAllAttendance = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10, employeeId, status, startDate, endDate } =
-      req.query;
+    // const {
+    //   skip = 0,
+    //   take = 10,
+    //   employeeId,
+    //   status,
+    //   startDate,
+    //   endDate,
+    // } = req.query;
 
     const where = {};
-    if (employeeId) where.employeeId = employeeId;
-    if (status) where.status = status;
-    if (startDate && endDate) {
-      where.rideDate = {
-        gte: new Date(startDate),
-        lte: new Date(endDate),
-      };
-    }
+    // if (employeeId) where.employeeId = employeeId;
+    // if (status) where.status = status;
+    // if (startDate && endDate) {
+    //   where.rideDate = {
+    //     gte: new Date(startDate),
+    //     lte: new Date(endDate),
+    //   };
+    // }
 
     const options = {
-      where,
-  
+      // where,
+
       include: {
         employee: {
-          select: { id: true, name: true, employeeCode: true },
+          select: { 
+            id: true, 
+            name: true, 
+            employeeCode: true,
+            area: {
+              select: { name: true }
+            },
+            subArea: {
+              select: { name: true }
+            }
+          },
         },
+        
         ride: {
-          select: { id: true, rideDate: true },
+          select: { 
+            id: true, 
+            rideDate: true,
+            routeId: true,
+            pickupTime: true,
+            dropTime: true,
+            status: true,
+            
+            // Include driver details from the ride
+            driver: {
+              select: {
+                id: true,
+                name: true,
+                phone: true,
+                licenseNumber: true,
+                cnic: true,
+                status: true,
+                shiftType: true,
+              }
+            },
+            
+            // Include vehicle details
+            vehicle: {
+              select: {
+                id: true,
+                vehicleNumber: true,
+                type: true,
+                make: true,
+                model: true,
+                capacity: true,
+              }
+            },
+            
+            // Include route details
+            route: {
+              select: {
+                id: true,
+                routeCode: true,
+                routeName: true,
+                serviceType: true,
+              }
+            },
+            
+            // Include vendor if needed
+            vendor: {
+              select: {
+                id: true,
+                name: true,
+                shortName: true,
+              }
+            },
+            
+            // Include trip details
+            trip: {
+              select: {
+                id: true,
+                tripNumber: true,
+                shiftTiming: true,
+              }
+            }
+          },
         },
       },
       orderBy: { rideDate: "desc" },
     };
 
     const response = await getRecords(prisma.attendance, options);
-    return res.status(response.status.code).json(response);
+    
+    const transformedData = response?.data?.data?.map(record => ({
+      ...record,
+      employeeDetails: {
+        name: record.employee?.name,
+        code: record.employee?.employeeCode,  
+        area: record.employee?.area?.name,
+        subArea: record.employee?.subArea?.name,
+      },
+      rideDetails: {
+        rideDate: record.ride?.rideDate,
+        pickupTime: record.ride?.pickupTime,
+        dropTime: record.ride?.dropTime,
+        rideStatus: record.ride?.status,
+        route: {
+          code: record.ride?.route?.routeCode,
+          name: record.ride?.route?.routeName,
+          serviceType: record.ride?.route?.serviceType,
+        },
+        driver: {
+          name: record.ride?.driver?.name,
+          phone: record.ride?.driver?.phone,
+          licenseNumber: record.ride?.driver?.licenseNumber,
+          status: record.ride?.driver?.status,
+          shiftType: record.ride?.driver?.shiftType,
+        },
+        vehicle: {
+          number: record.ride?.vehicle?.vehicleNumber,
+          type: record.ride?.vehicle?.type,
+          make: record.ride?.vehicle?.make,
+          model: record.ride?.vehicle?.model,
+        },
+        vendor: record.ride?.vendor?.name,
+        tripNumber: record.ride?.trip?.tripNumber,
+      },
+    }));
+
+    
+    return res.status(response.status.code).json({
+      ...response,
+      data: transformedData
+    });
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -173,7 +300,6 @@ const updateAttendance = async (req, res, next) => {
     const { id } = req.params;
     const { arrivalTime, delayMinutes, status, rideId } = req.body;
 
-    
     const attendance = await prisma.attendance.findUnique({ where: { id } });
     if (!attendance) {
       const errorResponse = badRequestResponse("Attendance record not found.");
@@ -223,7 +349,7 @@ const getAttendanceSummary = async (req, res, next) => {
 
     if (!startDate || !endDate) {
       const response = badRequestResponse(
-        "startDate and endDate are required."
+        "startDate and endDate are required.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -244,7 +370,6 @@ const getAttendanceSummary = async (req, res, next) => {
       },
     });
 
-    
     const summary = {
       totalRecords: records.length,
       present: records.filter((r) => r.status === "PRESENT").length,
@@ -253,11 +378,14 @@ const getAttendanceSummary = async (req, res, next) => {
       noShow: records.filter((r) => r.status === "NO_SHOW").length,
       avgDelayMinutes: Math.round(
         records.reduce((sum, r) => sum + (r.delayMinutes || 0), 0) /
-          records.length
+          records.length,
       ),
     };
 
-    const response = okResponse(summary, "Attendance summary retrieved successfully.");
+    const response = okResponse(
+      summary,
+      "Attendance summary retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);

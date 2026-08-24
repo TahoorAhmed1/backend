@@ -691,13 +691,13 @@ const updateEmployeeProfileSchema = Joi.object({
   params: empty(),
   body: Joi.object({
     name: Joi.string().trim().min(2).max(100),
-    contactNumber: phone(),
+    contactNumber: phone().allow(null, ""),
     cnic: Joi.string()
       .trim()
       .pattern(/^\d{13}$|^\d{5}-\d{7}-\d$/)
       .messages({
         "string.pattern.base": "cnic must be a valid CNIC number.",
-      }),
+      }).allow(null, ""),
     gender: Joi.string().valid("MALE", "FEMALE", "OTHER"),
     address: Joi.string().trim().max(300),
   }).min(1),
