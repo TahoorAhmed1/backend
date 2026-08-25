@@ -2,63 +2,57 @@ require("dotenv/config");
 const { PrismaClient } = require("@prisma/client");
 const { PrismaPg } = require("@prisma/adapter-pg");
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL,
+});
+
 const prisma = new PrismaClient({ adapter });
 
-/**
- * Wipes Ride, Route, and WeeklySchedule data, plus the tables that hold
- * hard (non-cascading) foreign keys into them, so the deletes don't fail
- * on constraint violations.
- *
- * Deletion order and why:
- *  1. Complaint     - has rideId (no cascade) -> must go before Ride
- *  2. Attendance     - has rideId (no cascade) -> must go before Ride
- *  3. RidePassenger  - has rideId (cascade)    -> cleaned explicitly anyway
- *  4. Ride           - has tripId (no cascade) -> must go before Trip
- *  5. WeeklySchedule - has tripId/routeId (no cascade) -> before Trip/Route
- *  6. Trip           - has routeId (cascade)   -> must go before Route
- *  7. Route
- */
 async function deleteRidesRoutesAndSchedules() {
-  return prisma.$transaction([
-    // prisma.attendance.deleteMany({}),
-    prisma.ridePassenger.deleteMany({}),
-    prisma.ride.deleteMany({}),
-    // prisma.weeklySchedule.deleteMany({}),
-    // prisma.trip.deleteMany({}),
-    // prisma.route.deleteMany({}),
-  ],10000);
+  console.log("Starting deletion...\n");
+
+  // 1. Delete records that reference Ride
+  const complaintsDeleted = await prisma.complaint.deleteMany({});
+  console.log(`Complaints deleted:        ${complaintsDeleted.count}`);
+
+  const attendancesDeleted = await prisma.attendance.deleteMany({});
+  console.log(`Attendances deleted:       ${attendancesDeleted.count}`);
+
+  const ridePassengersDeleted = await prisma.ridePassenger.deleteMany({});
+  console.log(`RidePassengers deleted:    ${ridePassengersDeleted.count}`);
+
+  // 2. Delete Ride
+  const ridesDeleted = await prisma.ride.deleteMany({});
+  console.log(`Rides deleted:             ${ridesDeleted.count}`);
+
+  // 3. Delete WeeklySchedule
+  const weeklySchedulesDeleted =
+    await prisma.weeklySchedule.deleteMany({});
+  console.log(
+    `WeeklySchedules deleted:   ${weeklySchedulesDeleted.count}`,
+  );
+
+  // 4. Delete Trip
+  const tripsDeleted = await prisma.trip.deleteMany({});
+  console.log(`Trips deleted:              ${tripsDeleted.count}`);
+
+  // 5. Delete Route
+  const routesDeleted = await prisma.route.deleteMany({});
+  console.log(`Routes deleted:             ${routesDeleted.count}`);
+
+  console.log("\nAll requested data deleted successfully.");
 }
 
 async function main() {
-  console.log("Deleting rides, routes, and weekly schedules...");
-
-  const [
-    // attendancesDeleted,
-    ridePassengersDeleted,
-    ridesDeleted,
-    // weeklySchedulesDeleted,
-    // tripsDeleted,
-    // routesDeleted,
-  ] = await deleteRidesRoutesAndSchedules();
-
-  //   console.log(`Attendances deleted:              ${attendancesDeleted.count}`)
-  console.log(
-    `RidePassengers deleted:           ${ridePassengersDeleted.count}`,
-  );
-  console.log(`Rides deleted:                    ${ridesDeleted.count}`);
-  //   console.log(`WeeklySchedules deleted:          ${weeklySchedulesDeleted.count}`)
-  //   console.log(`Trips deleted:                    ${tripsDeleted.count}`)
-  //   console.log(`Routes deleted:                   ${routesDeleted.count}`)
-
-  console.log("Done.");
+  try {
+    await deleteRidesRoutesAndSchedules();
+  } catch (err) {
+    console.error("\nDelete failed:");
+    console.error(err);
+    process.exitCode = 1;
+  } finally {
+    await prisma.$disconnect();
+  }
 }
 
-main()
-  .catch((err) => {
-    console.error("Seed failed:", err);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+main();

@@ -213,6 +213,7 @@ model Vehicle {
   vendorId      String?
   status        VehicleStatus @default(ACTIVE)
   notes         String?
+  vehicleEntity        Entity?
 
   // one vehicle ↔ one driver
   driverId String? @unique

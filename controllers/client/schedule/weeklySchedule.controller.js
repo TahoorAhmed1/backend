@@ -2926,6 +2926,60 @@ const updateWeeklySchedule = async (req, res, next) => {
   }
 };
 
+// ---------- Trip Driver Update ----------
+// Driver assignment is a Trip-level concept, not a per-employee one — every
+// WeeklySchedule row that rides a given Trip shares its driver. The
+// `driverId` on WeeklySchedule is only a denormalized cache of the trip's
+// driver (see the bulk-upload/reassign flows, which set
+// `driverId: routeResult.trip.driverId || entry.driverId`), so the real
+// edit has to happen here, on the Trip, and then fan out to every row
+// riding it — not on an individual schedule row.
+const updateTripDriver = async (req, res, next) => {
+  try {
+    const { tripId } = req.params;
+    const { driverId, weekStart } = req.body;
+
+    const trip = await prisma.trip.findUnique({ where: { id: tripId } });
+    if (!trip) {
+      const errorResponse = badRequestResponse("Trip not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const safeDriverId = driverId || null;
+
+    // NOTE: Trips are NOT week-scoped — one Trip (a driver+vehicle run on a
+    // route) is reused by every WeeklySchedule row that points at it,
+    // across every week. Changing the driver here changes it for every
+    // week that uses this trip, not just the week currently on screen.
+    const [updatedTrip] = await prisma.$transaction([
+      prisma.trip.update({
+        where: { id: tripId },
+        data: { driverId: safeDriverId },
+        include: { vehicle: true, driver: true, route: true },
+      }),
+      // Keep every WeeklySchedule row's cached driverId in sync with the
+      // trip it actually rides on, mirroring the same denormalization the
+      // bulk-upload/optimize flows already rely on.
+      prisma.weeklySchedule.updateMany({
+        where: { tripId, status: { not: "CANCELLED" } },
+        data: { driverId: safeDriverId },
+      }),
+    ]);
+
+    if (weekStart) {
+      await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
+    }
+
+    const response = okResponse(
+      updatedTrip,
+      "Trip driver updated successfully.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 const deleteWeeklySchedule = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -3153,8 +3207,10 @@ const getGroupedSchedules = async (req, res, next) => {
       if (!routeEntry) continue;
       const existingRiders = routeEntry.tripMap.get(t.id)?.empIds ?? new Set();
       routeEntry.tripMap.set(t.id, {
+        id: t.id,
         tripNumber: t.tripNumber,
         capacity: t.vehicle?.capacity ?? null,
+        driverId: t.driverId ?? null,
         driverName: t.driver?.name ?? null,
         vehicleNumber: t.vehicle?.vehicleNumber ?? null,
         empIds: existingRiders,
@@ -3166,9 +3222,11 @@ const getGroupedSchedules = async (req, res, next) => {
         .filter((t) => t.tripNumber != null)
         .sort((a, b) => a.tripNumber - b.tripNumber)
         .map((t) => ({
+          id: t.id,
           tripNumber: t.tripNumber,
           capacity: t.capacity,
           driver: t.driverName ?? "—",
+          driverId: t.driverId ?? null,
           vehicle: t.vehicleNumber ?? "—",
           assignedEmployees: t.empIds.size,
           remainingSeats:
@@ -4619,6 +4677,42 @@ const processBulkUploadJob = async (
   return results;
 };
 
+// ---------- Driver Options (lightweight list for the schedule edit UI) ----------
+// Deliberately separate from the heavy driver-matching helpers above
+// (findOrCreateVehicleForDriver, checkDriverWorkingHours, etc.) — this is
+// just "give me id+name+status for a dropdown", nothing else.
+
+const getDriverOptions = async (req, res, next) => {
+  try {
+    const drivers = await prisma.driver.findMany({
+      where: {
+        vehicle: {
+          id: {
+            not: null,
+          },
+        },
+      },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+      },
+      orderBy: {
+        name: "asc",
+      },
+    });
+
+    const response = okResponse(
+      drivers,
+      "Available driver options retrieved successfully.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 // ---------- Validate Upload ----------
 
 const validateBulkUploadFile = async (req, res, next) => {
@@ -4821,6 +4915,8 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
 
 module.exports = {
   analyzeAddressMatch,
+  getDriverOptions,
+  updateTripDriver,
   createWeeklySchedule,
   getAllWeeklySchedules,
   getWeeklyScheduleById,

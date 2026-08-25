@@ -1,5 +1,3 @@
-
-
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -8,7 +6,10 @@ const {
   updateRecord,
   deleteRecord,
 } = require("../../../utils/crudHelper");
-const { badRequestResponse, okResponse } = require("../../../constants/responses");
+const {
+  badRequestResponse,
+  okResponse,
+} = require("../../../constants/responses");
 
 const createRide = async (req, res, next) => {
   try {
@@ -25,7 +26,6 @@ const createRide = async (req, res, next) => {
       status,
     } = req.body;
 
-    
     const route = await prisma.route.findUnique({ where: { id: routeId } });
     if (!route) {
       const response = badRequestResponse("Route not found.");
@@ -53,27 +53,66 @@ const createRide = async (req, res, next) => {
 
 const getAllRides = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10, status, routeId, driverId } = req.query;
+    const {
+      skip = 0,
+      take = 200,
+      status,
+      routeId,
+      driverId,
+    } = req.query;
 
     const where = {};
+
+    if (status) where.status = status;
     if (routeId) where.routeId = routeId;
     if (driverId) where.driverId = driverId;
 
     const options = {
       where,
+      skip: Math.max(0, parseInt(skip, 10) || 0),
+      take: Math.max(1, parseInt(take, 10) || 10),
 
       include: {
-        route: { select: { id: true, routeName: true } },
-        driver: { select: { id: true, name: true } },
-        vehicle: { select: { id: true, vehicleNumber: true } },
-        vendor: { select: { id: true, name: true } },
-        area: { select: { id: true, name: true } },
+        route: {
+          select: {
+            id: true,
+            routeName: true,
+          },
+        },
+        driver: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        vehicle: {
+          select: {
+            id: true,
+            vehicleNumber: true,
+          },
+        },
+        vendor: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        area: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
         passengers: true,
       },
-      orderBy: { rideDate: "desc" },
+
+      orderBy: {
+        rideDate: "desc",
+      },
     };
 
     const response = await getRecords(prisma.ride, options);
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -115,7 +154,6 @@ const updateRide = async (req, res, next) => {
     const { id } = req.params;
     const updateData = req.body;
 
-    
     const ride = await prisma.ride.findUnique({ where: { id } });
     if (!ride) {
       const errorResponse = badRequestResponse("Ride not found.");
@@ -138,7 +176,6 @@ const deleteRide = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    
     const ride = await prisma.ride.findUnique({
       where: { id },
       include: { passengers: true, attendances: true },
@@ -149,10 +186,9 @@ const deleteRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    
     if (ride.passengers.length > 0 || ride.attendances.length > 0) {
       const errorResponse = badRequestResponse(
-        "Cannot delete ride with passengers or attendance records."
+        "Cannot delete ride with passengers or attendance records.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -167,16 +203,14 @@ const deleteRide = async (req, res, next) => {
 const addPassengersToRide = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { passengers } = req.body; 
+    const { passengers } = req.body;
 
-    
     const ride = await prisma.ride.findUnique({ where: { id } });
     if (!ride) {
       const response = badRequestResponse("Ride not found.");
       return res.status(response.status.code).json(response);
     }
 
-    
     const createdPassengers = await Promise.all(
       passengers.map((passenger) =>
         prisma.ridePassenger.create({
@@ -189,14 +223,14 @@ const addPassengersToRide = async (req, res, next) => {
           include: {
             employee: { select: { id: true, name: true } },
           },
-        })
-      )
+        }),
+      ),
     );
 
     const { createSuccessResponse } = require("../../../constants/responses");
     const response = createSuccessResponse(
       createdPassengers,
-      `${createdPassengers.length} passengers added to ride.`
+      `${createdPassengers.length} passengers added to ride.`,
     );
 
     return res.status(response.status.code).json(response);
@@ -210,7 +244,13 @@ const updateRideStatus = async (req, res, next) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    const validStatuses = ["PENDING", "STARTED", "ARRIVED", "COMPLETED", "CANCELLED"];
+    const validStatuses = [
+      "PENDING",
+      "STARTED",
+      "ARRIVED",
+      "COMPLETED",
+      "CANCELLED",
+    ];
     if (!validStatuses.includes(status)) {
       const response = badRequestResponse("Invalid ride status.");
       return res.status(response.status.code).json(response);
@@ -255,7 +295,7 @@ const getRidePassengers = async (req, res, next) => {
         rideId: ride.id,
         passengers: ride.passengers,
       },
-      "Ride passengers retrieved successfully."
+      "Ride passengers retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
