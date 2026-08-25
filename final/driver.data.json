@@ -17,16 +17,7 @@
       "name": "CTS"
     }
   ],
-  "entities": [
-    {
-      "id": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
-      "name": "IBEX"
-    },
-    {
-      "id": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
-      "name": "VW"
-    }
-  ],
+
   "drivers": [
     {
       "id": "dc6cc8d6-0a89-4571-8b11-9bf2adce9b93",
@@ -35,14 +26,9 @@
       "licenseNumber": "42201-8488136-5#829",
       "cnic": "42201-8488136-5",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "9b37df6c-2826-4d9b-be28-2517b6a55ad9",
@@ -51,14 +37,10 @@
       "licenseNumber": "42201-8228579-1#975",
       "cnic": "42201-8228579-1",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "0de3e6c5-ea2f-4d0a-a3df-571e7dd4de6a",
@@ -67,14 +49,10 @@
       "licenseNumber": "31202-0289616-5#468",
       "cnic": "31202-0289616-5",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "bedd2471-ecde-449f-875c-1696933b1e42",
@@ -83,14 +61,10 @@
       "licenseNumber": "32301-3132809-5#987",
       "cnic": "32301-3132809-5",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "6af31473-edcd-49e6-9eb5-e77c381c655d",
@@ -99,14 +73,9 @@
       "licenseNumber": "31201-9902081-5#3103",
       "cnic": "31201-9902081-5",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "443768e9-6b6f-4611-9c69-3113b67bbef7",
@@ -115,14 +84,10 @@
       "licenseNumber": "32302-2100054-1#374",
       "cnic": "32302-2100054-1",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "c7fac8c9-cb8f-48bf-aa9a-5dce00cdacb3",
@@ -131,14 +96,10 @@
       "licenseNumber": "31303-6739663-7#455",
       "cnic": "31303-6739663-7",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "c068fbc7-5d23-48f9-a96c-e55444ec8ba3",
@@ -147,14 +108,10 @@
       "licenseNumber": "32301-3628761-1#455",
       "cnic": "32301-3628761-1",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "b5939df3-24df-4ce1-a152-db9bc8fb2907",
@@ -163,14 +120,10 @@
       "licenseNumber": "31301-4391883-3#321",
       "cnic": "31301-4391883-3",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "1a89b8ba-d89d-4f4f-a668-f9143e9343de",
@@ -179,14 +132,10 @@
       "licenseNumber": "42101-77239793#836",
       "cnic": "42101-7723979-3",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "f9b4b98e-da6b-449b-89c1-2430f15a1435",
@@ -195,14 +144,10 @@
       "licenseNumber": "42301-8629442-3#319",
       "cnic": "42301-8629442-3",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "7e9e2b7f-3486-4135-8c7a-54545bcaeba1",
@@ -211,14 +156,10 @@
       "licenseNumber": "42301-1402422-5#511",
       "cnic": "42301-1402422-5",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "9d7b57b4-0cc0-42cb-b2f0-d8cfe8815fda",
@@ -227,14 +168,10 @@
       "licenseNumber": "43105-8516535-9#256",
       "cnic": "43105-8516535-9",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "55ec0924-432d-4dde-85c8-0f7f4e0684cb",
@@ -243,14 +180,10 @@
       "licenseNumber": "42101-5321907-5#315",
       "cnic": "42101-5321907-5",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "5f49952e-548d-4bea-8b5c-6b9c68fffa6f",
@@ -259,14 +192,10 @@
       "licenseNumber": "43503-0359176-3#576",
       "cnic": "43503-0359176-3",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "4fff16b6-229e-40d1-a651-7be6d652c0a3",
@@ -275,14 +204,10 @@
       "licenseNumber": "42301-0237296-3#857",
       "cnic": "42301-0237296-3",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "75deeced-0eda-4c70-805f-3a283b37e1a3",
@@ -291,14 +216,10 @@
       "licenseNumber": "42301-9330542-7#829",
       "cnic": "42301-9330542-7",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "e5d07baa-178b-46f7-885d-a7450a1dee97",
@@ -307,14 +228,10 @@
       "licenseNumber": "42201-8867259-7#462",
       "cnic": "42201-8867259-7",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "1665caed-4f53-495b-b537-db7ef9f9eacf",
@@ -323,14 +240,10 @@
       "licenseNumber": "42201-5225246-7#632",
       "cnic": "42201-5225246-7",
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "fea7e63a-1c84-4b51-b7b1-843e923ea34f",
@@ -339,14 +252,10 @@
       "licenseNumber": "42101-9817480-3 # 846",
       "cnic": "42101-9817480-3",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "2315fa75-6532-4b72-95a7-2c094e86139a",
@@ -355,14 +264,10 @@
       "licenseNumber": "43503-0543997-3#432",
       "cnic": "43503-0543997-3",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "d56dbb86-b1c6-49b2-aa04-f6180ada5e0e",
@@ -371,14 +276,10 @@
       "licenseNumber": "42101-8716598-7 # 946",
       "cnic": "42101-8716598-7",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "TWENTY_FOUR_HOUR",
-      "shiftLabel": "24 hurs",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "shiftLabel": "24 hours",
+      "status": "AVAILABLE"
     },
     {
       "id": "6f1da5c9-e2ed-4ce7-a8a6-03298f311b27",
@@ -387,14 +288,10 @@
       "licenseNumber": "42201-1661816-3#297",
       "cnic": "42201-1661816-3",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "d1c10c3a-b39c-4d89-b3dc-430fb99ec19c",
@@ -403,14 +300,10 @@
       "licenseNumber": "42101-1642871-5#682",
       "cnic": "42101-1642871-5",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "bbe4e471-4685-40fd-a35f-ed4d1ec5149b",
@@ -419,14 +312,10 @@
       "licenseNumber": "36303-5063320-9#789",
       "cnic": "36303-5063320-9",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "e48d1494-02d9-4340-b2bf-f019efef6514",
@@ -435,14 +324,10 @@
       "licenseNumber": "33104-2858111-1#329",
       "cnic": "33104-2858111-1",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "daa8f53c-8f11-441c-bc09-0a927919d5bc",
@@ -451,14 +336,10 @@
       "licenseNumber": "42401-5148592-5#691",
       "cnic": "42401-5148592-5",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "8a11a0a8-d5e9-4e31-9f1d-23bff6488b64",
@@ -467,14 +348,10 @@
       "licenseNumber": "42301-7821911-7#329",
       "cnic": "42301-7821911-7",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "0c7d93f7-8fb2-473e-9f05-cd52746c7870",
@@ -483,14 +360,10 @@
       "licenseNumber": "42301-8724347-3#327",
       "cnic": "42301-8724347-3",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "dc07a6ac-958f-4e31-a4fe-a380a3764ec1",
@@ -499,14 +372,10 @@
       "licenseNumber": "41504-0575530-3#447",
       "cnic": "41504-0575530-3",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "8cb05863-31bc-42d4-a2d2-da661a515396",
@@ -515,14 +384,10 @@
       "licenseNumber": "13202-8800580-5#810",
       "cnic": "13202-8800580-5",
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "dff86c21-55d9-4b72-a848-4a6d499fc2f7",
@@ -531,14 +396,10 @@
       "licenseNumber": "42101-9948394-1#348",
       "cnic": "42101-9948394-1",
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     },
     {
       "id": "543df390-5a45-4457-a992-1580a486618a",
@@ -547,14 +408,10 @@
       "licenseNumber": "32402-9396951-3#455",
       "cnic": "32402-9396951-3",
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "shiftType": "FIXED_SHIFT",
       "shiftLabel": "Fixed Shift",
-      "status": "AVAILABLE",
-      "notes": null,
-      "maxDailyHours": null,
-      "maxWeeklyHours": null,
-      "userId": null
+      "status": "AVAILABLE"
     }
   ],
   "vehicles": [
@@ -567,10 +424,9 @@
       "year": "2025",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "dc6cc8d6-0a89-4571-8b11-9bf2adce9b93"
     },
@@ -583,10 +439,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "9b37df6c-2826-4d9b-be28-2517b6a55ad9"
     },
@@ -599,10 +454,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "0de3e6c5-ea2f-4d0a-a3df-571e7dd4de6a"
     },
@@ -615,10 +469,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "bedd2471-ecde-449f-875c-1696933b1e42"
     },
@@ -631,10 +484,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "6af31473-edcd-49e6-9eb5-e77c381c655d"
     },
@@ -647,10 +499,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "443768e9-6b6f-4611-9c69-3113b67bbef7"
     },
@@ -663,10 +514,9 @@
       "year": "2016",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "c7fac8c9-cb8f-48bf-aa9a-5dce00cdacb3"
     },
@@ -679,10 +529,9 @@
       "year": "2023",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "c068fbc7-5d23-48f9-a96c-e55444ec8ba3"
     },
@@ -695,10 +544,9 @@
       "year": "2021",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "b5939df3-24df-4ce1-a152-db9bc8fb2907"
     },
@@ -711,10 +559,9 @@
       "year": "2005",
       "capacity": 12,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "1a89b8ba-d89d-4f4f-a668-f9143e9343de"
     },
@@ -727,10 +574,9 @@
       "year": "2017",
       "capacity": 6,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "f9b4b98e-da6b-449b-89c1-2430f15a1435"
     },
@@ -743,10 +589,9 @@
       "year": "2021",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "7e9e2b7f-3486-4135-8c7a-54545bcaeba1"
     },
@@ -759,10 +604,9 @@
       "year": "2023",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "9d7b57b4-0cc0-42cb-b2f0-d8cfe8815fda"
     },
@@ -775,10 +619,9 @@
       "year": "2020",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "55ec0924-432d-4dde-85c8-0f7f4e0684cb"
     },
@@ -791,10 +634,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "5f49952e-548d-4bea-8b5c-6b9c68fffa6f"
     },
@@ -807,10 +649,9 @@
       "year": "2020",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "4fff16b6-229e-40d1-a651-7be6d652c0a3"
     },
@@ -823,10 +664,9 @@
       "year": "2021",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "75deeced-0eda-4c70-805f-3a283b37e1a3"
     },
@@ -839,10 +679,9 @@
       "year": "2022",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "e5d07baa-178b-46f7-885d-a7450a1dee97"
     },
@@ -855,10 +694,9 @@
       "year": "2023",
       "capacity": 6,
       "vendorId": "f9c6241c-4215-4e50-912f-9cea38209f37",
-      "vendorName": "UET",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "1665caed-4f53-495b-b537-db7ef9f9eacf"
     },
@@ -871,10 +709,9 @@
       "year": "2025",
       "capacity": 6,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "fea7e63a-1c84-4b51-b7b1-843e923ea34f"
     },
@@ -887,10 +724,9 @@
       "year": "2024",
       "capacity": 6,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "2315fa75-6532-4b72-95a7-2c094e86139a"
     },
@@ -903,10 +739,9 @@
       "year": "2021",
       "capacity": 6,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "d56dbb86-b1c6-49b2-aa04-f6180ada5e0e"
     },
@@ -919,10 +754,9 @@
       "year": "2007",
       "capacity": 6,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "6f1da5c9-e2ed-4ce7-a8a6-03298f311b27"
     },
@@ -935,10 +769,9 @@
       "year": "2002",
       "capacity": 12,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "d1c10c3a-b39c-4d89-b3dc-430fb99ec19c"
     },
@@ -951,10 +784,9 @@
       "year": "2005",
       "capacity": 12,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "bbe4e471-4685-40fd-a35f-ed4d1ec5149b"
     },
@@ -967,10 +799,9 @@
       "year": "2021",
       "capacity": 12,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "e48d1494-02d9-4340-b2bf-f019efef6514"
     },
@@ -983,10 +814,9 @@
       "year": "2018",
       "capacity": 6,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "daa8f53c-8f11-441c-bc09-0a927919d5bc"
     },
@@ -999,10 +829,9 @@
       "year": "2019",
       "capacity": 6,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "40d9430f-8a3a-4ba9-807e-6f436c71e6dd",
+
       "entityName": "IBEX",
       "driverId": "8a11a0a8-d5e9-4e31-9f1d-23bff6488b64"
     },
@@ -1015,10 +844,9 @@
       "year": "2020",
       "capacity": 6,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
+
       "entityName": "VW",
       "driverId": "0c7d93f7-8fb2-473e-9f05-cd52746c7870"
     },
@@ -1031,10 +859,9 @@
       "year": "2019",
       "capacity": 6,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
+
       "entityName": "VW",
       "driverId": "dc07a6ac-958f-4e31-a4fe-a380a3764ec1"
     },
@@ -1047,10 +874,9 @@
       "year": "2017",
       "capacity": 6,
       "vendorId": "72a3d247-f22b-4771-b2f2-bba6a386751f",
-      "vendorName": "CTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
+
       "entityName": "VW",
       "driverId": "8cb05863-31bc-42d4-a2d2-da661a515396"
     },
@@ -1063,10 +889,9 @@
       "year": "2001",
       "capacity": 12,
       "vendorId": "8925223d-8bab-4727-b411-7d878b04d2c0",
-      "vendorName": "UTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
+
       "entityName": "VW",
       "driverId": "dff86c21-55d9-4b72-a848-4a6d499fc2f7"
     },
@@ -1079,10 +904,9 @@
       "year": "2023",
       "capacity": 12,
       "vendorId": "47927811-f34a-40f0-99b1-cae9683960ad",
-      "vendorName": "MTS",
+
       "status": "ACTIVE",
-      "notes": null,
-      "entityId": "a3cfb930-cb6c-45fe-9d7f-7dcfed581f43",
+
       "entityName": "VW",
       "driverId": "543df390-5a45-4457-a992-1580a486618a"
     }

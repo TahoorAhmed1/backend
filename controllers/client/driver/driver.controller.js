@@ -74,7 +74,7 @@ const getAllDrivers = async (req, res, next) => {
       include: {
         vendor: { select: { id: true, name: true } },
         vehicle: { select: { id: true, vehicleNumber: true } },
-        routes: true,
+        
       },
       orderBy: { createdAt: "desc" },
     };

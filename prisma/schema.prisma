@@ -213,7 +213,7 @@ model Vehicle {
   vendorId      String?
   status        VehicleStatus @default(ACTIVE)
   notes         String?
-  vehicleEntity        Entity?
+  vehicleEntity Entity?
 
   // one vehicle ↔ one driver
   driverId String? @unique
@@ -230,34 +230,30 @@ model Vehicle {
 }
 
 model Driver {
-  id             String          @id @default(uuid())
-  name           String
-  phone          String?
-  licenseNumber  String?
-  cnic           String?         @unique
-  vendorId       String?
-  shiftType      DriverShiftType @default(TWELVE_HOUR)
-  shiftLabel     String?
-  status         DriverStatus    @default(AVAILABLE)
-  notes          String?
-  maxDailyHours  Int?
-  maxWeeklyHours Int?
+  id            String  @id @default(uuid())
+  name          String
+  phone         String?
+  licenseNumber String? @unique
+  cnic          String? @unique
+  vendorId      String?
+  userId        String? @unique
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  userId String? @unique
-
+  shiftType       DriverShiftType  @default(TWELVE_HOUR)
+  shiftLabel      String?
+  status          DriverStatus     @default(AVAILABLE)
+  notes           String?
   vendor          Vendor?          @relation(fields: [vendorId], references: [id])
   user            User?            @relation("DriverUser", fields: [userId], references: [id], onDelete: SetNull)
   vehicle         Vehicle?
   rides           Ride[]
-  routes          Route[]
   trips           Trip[]
   complaints      Complaint[]
   weeklySchedules WeeklySchedule[]
 
-  @@index([name])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ cnic, licenseNumber, userId])
 }
 
 model Route {
@@ -269,21 +265,19 @@ model Route {
   officeLocation OfficeLocation?
   serviceType    ServiceType     @default(PICK_AND_DROP)
 
-  maxCapacity    Int?
+  status RouteStatus @default(ACTIVE)
 
-  driverId       String?
-  status         RouteStatus     @default(ACTIVE)
+  shiftTiming String?
 
-  shiftTiming     String?
-  pickupStartTime DateTime?
-  dropTime        DateTime?
+  pickupStartTime   DateTime?
+  officeArrivalTime DateTime?
+  dropTime          DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   area            Area?            @relation(fields: [areaId], references: [id])
   subArea         SubArea?         @relation(fields: [subAreaId], references: [id])
-  driver          Driver?          @relation(fields: [driverId], references: [id])
   weeklySchedules WeeklySchedule[]
   rides           Ride[]
   trips           Trip[]
@@ -292,20 +286,13 @@ model Route {
   @@index([subAreaId])
 }
 
-// A single vehicle/driver run on a Route. A Route is the named corridor
-// (e.g. "Gulshan-e-Iqbal - Evening Shift"); a Trip is one vehicle
-// actually driving it. Most routes have exactly one Trip. When an
-// area/shift is overflowing, a second (third, ...) Trip is opened on the
-// SAME Route with its own driver, vehicle, and capacity, instead of
-// spinning up a lookalike Route row — this is what lets the weekly
-// schedule show "Route X — Trip 2" under one route name.
 model Trip {
   id          String      @id @default(uuid())
   routeId     String
   tripNumber  Int         @default(1)
-  driverId    String?
+  driverId    String
   vehicleId   String?
-  shiftTiming String? // overrides Route.shiftTiming for this trip if set
+  shiftTiming String?
   status      RouteStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
@@ -360,35 +347,25 @@ model Employee {
 
 model WeeklySchedule {
   id        String   @id @default(uuid())
-  weekStart DateTime // always a Monday — identifies the week
+  weekStart DateTime
 
   employeeId String
 
   routeId String?
 
-  // Which specific Trip (vehicle run) on the route this employee rides.
-  // Optional for back-compat with rows created before Trips existed —
-  // those keep working off routeId/driverId/vehicleId directly. New
-  // assignments should always set tripId so per-trip capacity/remaining
-  // seats can be computed precisely instead of only per-route.
   tripId String?
 
   serviceType ServiceType @default(PICK_AND_DROP)
 
-  // driverId/vehicleId are denormalized copies of the trip's own
-  // driver/vehicle, kept in sync by the route/trip controller whenever
-  // the trip's assignment changes. They stay here (rather than being
-  // dropped in favor of always joining through trip) because most of
-  // the existing schedule queries filter/display directly off them.
   driverId      String?
   vehicleId     String?
   vendorId      String?
   vehicleEntity String?
 
+  shiftTiming       String?
   pickupTime        String?
-  shiftTiming       String? // e.g. "6:00 PM - 3:00 AM"
-  officeArrivalTime String? // e.g. "5:00 PM"
-  dropTime          String? // e.g. "3:30 AM"
+  officeArrivalTime String?
+  dropTime          String?
 
   offDay String?
 
@@ -417,9 +394,6 @@ model WeeklySchedule {
   @@index([weekStart])
   @@index([employeeId])
   @@index([tripId])
-  // Matches the exact filter shape syncPendingRidesForWeek uses
-  // (weekStart range + status + routeId not null) — without this, that
-  // query falls back to scanning every schedule row for the week.
   @@index([weekStart, status, routeId])
 }
 
@@ -433,11 +407,12 @@ model Ride {
   tripId    String?
   trip      Trip?    @relation(fields: [tripId], references: [id])
 
-  areaId     String?
-  subAreaId  String?
-  pickupTime String?
-  dropTime   String?
-  status     RideStatus @default(PENDING)
+  areaId            String?
+  subAreaId         String?
+  pickupTime        String?
+  officeArrivalTime String?
+  dropTime          String?
+  status            RideStatus @default(PENDING)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -468,26 +443,12 @@ model RidePassenger {
   rideId     String
   employeeId String
 
-  // Snapshot of employee-facing details as of the moment this row was
-  // (re)written by syncPendingRidesForWeek. Deliberately denormalized:
-  // Employee.name/address/area/subArea can change after the ride is
-  // created (employee moves, gets renamed, changes area), but a Ride is a
-  // historical record of what dispatch actually knew and acted on that
-  // day — it shouldn't silently rewrite itself when Employee changes
-  // later. Rewritten in full every sync while the ride is still PENDING;
-  // frozen once the ride moves past PENDING, same as the rest of the ride.
   employeeName String?
   address      String?
   contact      String?
   area         String?
   subArea      String?
 
-  // Was previously ONLY logged to AuditLog (RIDE_PICKUP_CONFIRMATION) —
-  // nothing on this row or the Ride ever reflected it, so an employee
-  // tapping "Confirm" had no observable effect anywhere the app could
-  // read back. This is the actual, queryable state the confirm/decline
-  // buttons drive; AuditLog stays as the append-only history of who did
-  // what and when, this is "what's true right now".
   confirmationStatus RideConfirmationStatus @default(PENDING)
   confirmedAt        DateTime?
 
