@@ -11,6 +11,63 @@ const {
   okResponse,
 } = require("../../../constants/responses");
 
+// ============================================================
+// TIME FORMATTING HELPERS
+// ============================================================
+
+function formatTimeForResponse(value) {
+  if (!value) return null;
+  
+  // If it's already a clean time string like "6:00 PM"
+  if (typeof value === 'string' && !value.includes('T') && !value.includes('-')) {
+    return value;
+  }
+  
+  // If it's a Date object or ISO string
+  try {
+    const date = new Date(value);
+    if (!isNaN(date.getTime())) {
+      // Check if it's the dummy 1970-01-01 date
+      if (date.getFullYear() === 1970 && date.getMonth() === 0 && date.getDate() === 1) {
+        return date.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+          timeZone: 'Asia/Karachi'
+        });
+      }
+      return date.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZone: 'Asia/Karachi'
+      });
+    }
+  } catch (e) {
+    // ignore
+  }
+  
+  return String(value);
+}
+
+// Format date for display
+function formatDateForResponse(value) {
+  if (!value) return null;
+  try {
+    const date = new Date(value);
+    if (!isNaN(date.getTime())) {
+      return date.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric'
+      });
+    }
+  } catch (e) {
+    // ignore
+  }
+  return String(value);
+}
+
 const createRide = async (req, res, next) => {
   try {
     const {
@@ -21,6 +78,7 @@ const createRide = async (req, res, next) => {
       vendorId,
       areaId,
       pickupTime,
+      officeArrivalTime,
       dropTime,
       employeeId,
       status,
@@ -40,6 +98,7 @@ const createRide = async (req, res, next) => {
       vendorId,
       areaId,
       pickupTime,
+      officeArrivalTime,
       dropTime,
       employeeId,
       status: status || "PENDING",
@@ -113,6 +172,17 @@ const getAllRides = async (req, res, next) => {
 
     const response = await getRecords(prisma.ride, options);
 
+    // ✅ Format times and dates in the response
+    if (response.data && Array.isArray(response.data)) {
+      response.data = response.data.map((ride) => ({
+        ...ride,
+        rideDate: formatDateForResponse(ride.rideDate),
+        pickupTime: formatTimeForResponse(ride.pickupTime),
+        officeArrivalTime: formatTimeForResponse(ride.officeArrivalTime),
+        dropTime: formatTimeForResponse(ride.dropTime),
+      }));
+    }
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -143,6 +213,14 @@ const getRideById = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    // ✅ Format times in the response
+    if (response.data) {
+      response.data.rideDate = formatDateForResponse(response.data.rideDate);
+      response.data.pickupTime = formatTimeForResponse(response.data.pickupTime);
+      response.data.officeArrivalTime = formatTimeForResponse(response.data.officeArrivalTime);
+      response.data.dropTime = formatTimeForResponse(response.data.dropTime);
+    }
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -165,6 +243,14 @@ const updateRide = async (req, res, next) => {
       driver: true,
       vehicle: true,
     });
+
+    // ✅ Format times in the response
+    if (response.data) {
+      response.data.rideDate = formatDateForResponse(response.data.rideDate);
+      response.data.pickupTime = formatTimeForResponse(response.data.pickupTime);
+      response.data.officeArrivalTime = formatTimeForResponse(response.data.officeArrivalTime);
+      response.data.dropTime = formatTimeForResponse(response.data.dropTime);
+    }
 
     return res.status(response.status.code).json(response);
   } catch (error) {

@@ -133,6 +133,11 @@ enum NotificationStatus {
   READ
 }
 
+enum DevicePlatform {
+  IOS
+  ANDROID
+}
+
 model Area {
   id        String   @id @default(uuid())
   name      String   @unique
@@ -253,7 +258,7 @@ model Driver {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([ cnic, licenseNumber, userId])
+  @@index([cnic, licenseNumber, userId])
 }
 
 model Route {
@@ -288,9 +293,8 @@ model Route {
 
 model Trip {
   id          String      @id @default(uuid())
-  routeId     String
   tripNumber  Int         @default(1)
-  driverId    String
+  driverId    String?
   vehicleId   String?
   shiftTiming String?
   status      RouteStatus @default(ACTIVE)
@@ -298,6 +302,7 @@ model Trip {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  routeId     String
   route           Route            @relation(fields: [routeId], references: [id], onDelete: Cascade)
   driver          Driver?          @relation(fields: [driverId], references: [id])
   vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id])
@@ -360,12 +365,21 @@ model WeeklySchedule {
   driverId      String?
   vehicleId     String?
   vendorId      String?
-  vehicleEntity String?
+  // Was `String?` — aligned with Vehicle.vehicleEntity / Employee.entity so
+  // "IBEX"/"VW" can't drift into free text and can be cross-checked.
+  vehicleEntity Entity?
 
   shiftTiming       String?
-  pickupTime        String?
-  officeArrivalTime String?
-  dropTime          String?
+  // Were `String?` — sheet cells like "8:00PM" / "5::00 PM" / Excel serial
+  // fractions can't be sorted, compared, or used in the pickup=arrival-2h
+  // calculation as plain strings. Migrated to real DateTime (see
+  // weeklySchedule_controller.js parseSheetTimeToDate/computePickupTime).
+  // NOTE: run a backfill (re-parse existing string values with the same
+  // parser) before/while applying this migration — see
+  // CHANGES_AND_FOLLOWUPS.md.
+  pickupTime        DateTime?
+  officeArrivalTime DateTime?
+  dropTime          DateTime?
 
   offDay String?
 
@@ -409,9 +423,13 @@ model Ride {
 
   areaId            String?
   subAreaId         String?
-  pickupTime        String?
-  officeArrivalTime String?
-  dropTime          String?
+  // Were `String?` — migrated to DateTime for the same reason as
+  // WeeklySchedule's equivalents. rideplaing.js (not in this repo snapshot)
+  // populates these from the WeeklySchedule template and needs updating to
+  // pass Date objects through rather than copying strings.
+  pickupTime        DateTime?
+  officeArrivalTime DateTime?
+  dropTime          DateTime?
   status            RideStatus @default(PENDING)
 
   createdAt DateTime @default(now())
@@ -513,6 +531,7 @@ model User {
   employee      Employee?      @relation("EmployeeUser")
   driver        Driver?        @relation("DriverUser")
   notifications Notification[]
+  deviceTokens  DeviceToken[]
 }
 
 model AuditLog {
@@ -547,9 +566,34 @@ model Notification {
   body      String?
   status    NotificationStatus @default(UNREAD)
   link      String?
+  // Structured payload (e.g. { rideId, type: "RIDE_ASSIGNED" }) so the
+  // mobile app can deep-link on tap without re-parsing `link`.
+  data      Json?
   createdAt DateTime           @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+// One row per device a user has logged into. A user can have several
+// (e.g. phone + tablet, or a reinstall that generated a new push
+// token) — pushes fan out to every active token and stale ones get
+// flipped to isActive=false when Expo's push API reports them dead.
+// `token` holds an Expo push token (ExponentPushToken[...]).
+model DeviceToken {
+  id         String         @id @default(uuid())
+  userId     String
+  token      String         @unique
+  platform   DevicePlatform
+  isActive   Boolean        @default(true)
+  lastSeenAt DateTime       @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, isActive])
 }

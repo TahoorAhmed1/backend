@@ -264,6 +264,9 @@ const HEADER_ALIASES = {
   "drop time": "dropTime",
   contact: "contact",
   area: "area",
+  "sub area": "subArea",
+  subarea: "subArea",
+  block: "block",
   address: "address",
 };
 
@@ -287,6 +290,96 @@ const deriveServiceType = (officeArrivalTime, dropTime) => {
   return "PICK_AND_DROP";
 };
 
+// ---------- DateTime / Time-of-day Parsing ----------
+
+const SHIFT_TIME_ANCHOR_DATE = "1970-01-01";
+const KARACHI_UTC_OFFSET_MINUTES = 5 * 60;
+
+const parseSheetTimeOfDay = (raw) => {
+  if (raw === null || raw === undefined || raw === "") return null;
+
+  if (typeof raw === "number" || /^\d+(\.\d+)?$/.test(String(raw).trim())) {
+    const num = Number(raw);
+    if (!Number.isNaN(num)) {
+      const fraction = num - Math.floor(num);
+      const totalMinutes = Math.round(fraction * 24 * 60);
+      return {
+        hours: Math.floor(totalMinutes / 60) % 24,
+        minutes: totalMinutes % 60,
+      };
+    }
+  }
+
+  const str = String(raw).trim();
+  if (!str) return null;
+  if (/pick\s*only|drop\s*only/i.test(str)) return null;
+
+  let cleaned = str
+    .replace(/\s*:\s*:?\s*/g, ":")
+    .replace(/:\s*(AM|PM)/i, " $1")
+    .replace(/:(\d{2}):(\d{2})\s*(AM|PM)/i, (match, h, m, meridiem) => {
+      return `${parseInt(h)}:${m} ${meridiem}`;
+    })
+    .replace(/\s*:\s*:\s*/g, ":")
+    .replace(/\s*(AM|PM)\s*/i, " $1")
+    .trim();
+
+  const match = cleaned.match(/^(\d{1,2}):?(\d{2})?\s*(AM|PM)?$/i);
+  if (!match) return null;
+
+  let hours = parseInt(match[1], 10);
+  const minutes = match[2] ? parseInt(match[2], 10) : 0;
+  const meridiem = match[3] ? match[3].toUpperCase() : null;
+
+  if (Number.isNaN(hours) || hours > 23 || minutes > 59) return null;
+  if (meridiem === "PM" && hours < 12) hours += 12;
+  if (meridiem === "AM" && hours === 12) hours = 0;
+
+  return { hours, minutes };
+};
+
+const timeOfDayToUtcDate = ({ hours, minutes }) => {
+  const rawUtcMinutes = hours * 60 + minutes - KARACHI_UTC_OFFSET_MINUTES;
+  const wrapped = ((rawUtcMinutes % 1440) + 1440) % 1440;
+  const dayOffset = Math.floor(rawUtcMinutes / 1440);
+  const anchor = new Date(`${SHIFT_TIME_ANCHOR_DATE}T00:00:00.000Z`);
+  anchor.setUTCDate(anchor.getUTCDate() + dayOffset);
+  anchor.setUTCHours(Math.floor(wrapped / 60), wrapped % 60, 0, 0);
+  return anchor;
+};
+
+const parseSheetTimeToDate = (raw) => {
+  const tod = parseSheetTimeOfDay(raw);
+  return tod ? timeOfDayToUtcDate(tod) : null;
+};
+
+const toShiftTimeDate = (value) => {
+  if (value instanceof Date)
+    return Number.isNaN(value.getTime()) ? null : value;
+  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value.trim())) {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return parseSheetTimeToDate(value);
+};
+
+const toIsoOrNull = (value) => {
+  const d = toShiftTimeDate(value);
+  return d ? d.toISOString() : null;
+};
+
+const PICKUP_LEAD_MINUTES = 2 * 60;
+const computePickupTime = (officeArrivalDate) => {
+  if (
+    !(officeArrivalDate instanceof Date) ||
+    Number.isNaN(officeArrivalDate.getTime())
+  )
+    return null;
+  return new Date(
+    officeArrivalDate.getTime() - PICKUP_LEAD_MINUTES * 60 * 1000,
+  );
+};
+
 const normalizeShiftForCompare = (raw) =>
   String(raw || "")
     .replace(/\s+/g, "")
@@ -295,16 +388,6 @@ const normalizeShiftForCompare = (raw) =>
 const parseDriverEntries = (raw) => {
   if (!raw) return [];
   const str = String(raw);
-  // Phone numbers in these sheets aren't always one clean digit run — cells
-  // like "Adil 0311-2876546" or "Zahid Shah 03179-4679932" have a dash (or
-  // occasionally a space) INSIDE the number, not just as a name/phone
-  // separator. The phone alternative below allows exactly one such
-  // separator, but requires 3-5 digits before it and 6-8 after — that
-  // shape (area code/prefix + subscriber number) is what real numbers look
-  // like, and it's tight enough to NOT swallow a stray single-digit
-  // driver-order marker some cells have (e.g. "Shoaib 1 03330258881", where
-  // "1" numbers this as the first of several drivers listed for the row —
-  // a looser pattern would merge that "1" straight into the phone digits).
   const re =
     /([A-Za-z][A-Za-z .]*?)\s*[-:]?\s*(?:\d\s+)?(\d{3,5}[\s-]\d{6,8}|\d{10,13})/g;
   const out = [];
@@ -312,8 +395,6 @@ const parseDriverEntries = (raw) => {
   while ((match = re.exec(str)) !== null) {
     const name = match[1].trim();
     const phone = match[2].replace(/[\s-]/g, "");
-    // Same length bounds as before (10-13 digits) — just applied after
-    // normalizing away the separators rather than as part of the pattern.
     if (name && phone.length >= 10 && phone.length <= 13) {
       out.push({ name, phone });
     }
@@ -331,7 +412,54 @@ const normalizeMatch = (str) => {
 };
 
 // ============================================================
-// AREA ALIASES - DHA and Clifton are the same for routing
+// VEHICLE TYPE NORMALIZATION
+// ============================================================
+
+const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
+
+const VEHICLE_TYPE_ALIASES = {
+  KARVAN: "KARVAN",
+  KARVEN: "KARVAN",
+  KARVAN: "KARVAN",
+  CAR: "CAR",
+  VAN: "VAN",
+  HIJET: "HIJET",
+  "HI-JET": "HIJET",
+  HIJET: "HIJET",
+  BUS: "BUS",
+};
+
+const normalizeVehicleType = (raw) => {
+  if (!raw) return "";
+  const str = String(raw).toUpperCase().trim();
+
+  if (VEHICLE_TYPE_ALIASES[str]) {
+    return VEHICLE_TYPE_ALIASES[str];
+  }
+
+  const parts = str.split(/[\s\/\-_,]+/);
+  for (const part of parts) {
+    const normalized = VEHICLE_TYPE_ALIASES[part];
+    if (normalized && VEHICLE_TYPES.has(normalized)) {
+      return normalized;
+    }
+    if (VEHICLE_TYPES.has(part)) {
+      return part;
+    }
+  }
+
+  if (str.includes("KARVAN") || str.includes("KARVEN")) {
+    return "KARVAN";
+  }
+  if (str.includes("HIJET") || str.includes("HI-JET")) {
+    return "HIJET";
+  }
+
+  return parts[0] || "";
+};
+
+// ============================================================
+// AREA ALIASES
 // ============================================================
 
 const AREA_ALIASES = {
@@ -477,16 +605,10 @@ const normalizeAreaName = (areaName) => {
 
   const lower = trimmed.toLowerCase();
 
-  // Check exact alias match
   if (AREA_ALIASES[lower]) {
     return AREA_ALIASES[lower];
   }
 
-  // Check if any alias appears as a substring. Sort longest-first so a
-  // specific alias (e.g. "malir cantt") is matched before a shorter, more
-  // generic one that happens to also be a substring (e.g. "malir") —
-  // otherwise object insertion order decided the winner and could silently
-  // misroute employees to the wrong area/route.
   const sortedAliases = Object.entries(AREA_ALIASES).sort(
     (a, b) => b[0].length - a[0].length,
   );
@@ -496,12 +618,11 @@ const normalizeAreaName = (areaName) => {
     }
   }
 
-  // Default: capitalize properly
   return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
 };
 
 // ============================================================
-// AREA HELPERS - Get main area for route grouping
+// AREA HELPERS
 // ============================================================
 
 const findOrCreateNormalizedArea = async (areaName, caches) => {
@@ -513,7 +634,6 @@ const findOrCreateNormalizedArea = async (areaName, caches) => {
     return caches.areaCache.get(cacheKey);
   }
 
-  // Try to find existing area
   let area = await prisma.area.findFirst({
     where: {
       name: {
@@ -523,7 +643,6 @@ const findOrCreateNormalizedArea = async (areaName, caches) => {
     },
   });
 
-  // Create if not found
   if (!area) {
     area = await prisma.area.create({
       data: {
@@ -540,12 +659,6 @@ const findOrCreateNormalizedArea = async (areaName, caches) => {
   return area;
 };
 
-// ============================================================
-// getMainArea - Gets the top-level/main area for route grouping
-// If employee has subArea with parent (like DHA → Clifton),
-// returns the parent/main area.
-// ============================================================
-
 const getMainArea = async (employee, caches) => {
   if (!employee) return null;
 
@@ -556,10 +669,6 @@ const getMainArea = async (employee, caches) => {
 
   let rawAreaName = null;
 
-  // Area is the top-level taxonomy node in this schema (Area -> SubArea ->
-  // Block, via SubArea.areaId / Block.subAreaId). There is no
-  // Area.parent/parentId, so an employee's own `area` IS already the
-  // "main"/top-level area — nothing to resolve further up. Prefer it.
   if (employee.area?.name) {
     rawAreaName = employee.area.name;
   } else if (employee.areaId) {
@@ -579,15 +688,6 @@ const getMainArea = async (employee, caches) => {
     }
   }
 
-  // Fall back to the employee's subArea only if there's no direct area set.
-  // IMPORTANT: subAreaId is a SubArea id, not an Area id — it must be
-  // looked up via prisma.subArea (SubArea.area is the real relation back
-  // to Area). Querying prisma.area with a subAreaId, or including a
-  // non-existent Area.parent field, would never match/would throw — that
-  // was the actual bug here. We use the subArea's own parent Area name
-  // when the SubArea is linked to one (e.g. SubArea "DHA Phase 6" -> Area
-  // "DHA"); otherwise fall back to the SubArea's own name, which still
-  // gets run through the alias/normalization map below.
   if (!rawAreaName && employee.subAreaId) {
     try {
       const cacheKey = `subarea::${employee.subAreaId}`;
@@ -616,9 +716,6 @@ const getMainArea = async (employee, caches) => {
     return null;
   }
 
-  // Always run through the alias/normalization map (DHA -> Clifton, etc.)
-  // so grouping is consistent regardless of whether a parent/child area
-  // hierarchy exists in the DB.
   const mainArea = await findOrCreateNormalizedArea(rawAreaName, caches);
   console.log(
     `[weeklySchedule][getMainArea] employee ${employee.employeeCode}: "${rawAreaName}" -> "${mainArea?.name || "null"}"`,
@@ -627,13 +724,9 @@ const getMainArea = async (employee, caches) => {
 };
 
 // ============================================================
-// findDriver - Matches Name + Vendor + Vehicle Type (ALL 3)
+// findDriver
 // ============================================================
 
-// Shared candidate-picking logic: vendor is used only to disambiguate
-// between same-named drivers or to flag a mismatch for review — it never
-// excludes an otherwise-valid name match. Reused across the progressively
-// widened search stages in findDriver below.
 const pickBestDriverCandidate = (candidates, normalizedVendor) => {
   if (candidates.length === 0) return null;
 
@@ -665,10 +758,6 @@ const pickBestDriverCandidate = (candidates, normalizedVendor) => {
         driverVendor === normalizedVendor || vehicleVendor === normalizedVendor
       );
     });
-    // Vendor is a disambiguator among same-named drivers, not a hard
-    // filter: if none of the duplicates have a matching vendor on file,
-    // fall back to the full name-matched list rather than failing the
-    // match outright.
     if (vendorFiltered.length > 0) filtered = vendorFiltered;
   }
 
@@ -689,7 +778,7 @@ const pickBestDriverCandidate = (candidates, normalizedVendor) => {
 const findDriver = async (
   driverName,
   vendorNameFromSheet,
-  vehicleTypeFromSheet, // no longer used for matching — see below
+  vehicleTypeFromSheet,
   cache,
   extraCaches,
 ) => {
@@ -700,13 +789,6 @@ const findDriver = async (
   const normalizedVendor = normalizeMatch(vendorNameFromSheet);
   const firstWord = normalizedName.split(" ")[0];
 
-  // Vehicle type is intentionally NOT part of driver matching for now.
-  // A driver record's vehicle is often unassigned/incomplete at seed time,
-  // and requiring it to match the sheet's vehicle type caused valid,
-  // already-known drivers (correct name + vendor) to be rejected outright.
-  // Match on name + vendor only; vehicle assignment (including creating a
-  // placeholder vehicle from whatever sheet data is available) is handled
-  // separately and can be corrected manually later.
   const cacheKey = `${normalizedName.toLowerCase()}::${normalizedVendor}`;
   if (cache?.has(cacheKey)) return cache.get(cacheKey);
 
@@ -715,10 +797,6 @@ const findDriver = async (
     vendor: true,
   };
 
-  // Vendor clause reused by the loosened stages below so that, once we're
-  // guessing on a partial name, we ask the DB to prefer rows whose vendor
-  // (own or via vehicle) matches the sheet's vendor — instead of pulling
-  // every same-first-name driver and sorting it out afterward.
   const vendorClause = normalizedVendor
     ? {
         OR: [
@@ -736,23 +814,15 @@ const findDriver = async (
       }
     : null;
 
-  // Stage 1: exact full-name match (handles the common case).
   let candidates = await prisma.driver.findMany({
     where: { name: { equals: normalizedName, mode: "insensitive" } },
     include: driverInclude,
   });
 
-  // Stage 2: sheet cells often carry extra tokens after the real name
-  // (e.g. "Kashif SK 03151102574" where the DB driver is stored as just
-  // "Kashif"), so an exact match on the full parsed string misses drivers
-  // that genuinely exist. Fall back to the first word alone.
   let matchedLoosely = false;
   if (candidates.length === 0 && firstWord && firstWord !== normalizedName) {
     const nameClause = { name: { equals: firstWord, mode: "insensitive" } };
 
-    // 2a: same first name AND matching vendor — try this first so a known
-    // vendor narrows the guess right away rather than only disambiguating
-    // after the fact.
     if (vendorClause) {
       candidates = await prisma.driver.findMany({
         where: { AND: [nameClause, vendorClause] },
@@ -761,8 +831,6 @@ const findDriver = async (
       if (candidates.length) matchedLoosely = true;
     }
 
-    // 2b: no vendor-matching hit (or no vendor to check) — widen to any
-    // driver with that first name.
     if (candidates.length === 0) {
       candidates = await prisma.driver.findMany({
         where: nameClause,
@@ -772,9 +840,6 @@ const findDriver = async (
     }
   }
 
-  // Stage 3: still nothing — widen to a contains search on the first word,
-  // to catch cases like a stored name with a middle name/initial the sheet
-  // didn't include, or vice versa. Same vendor-first ordering as stage 2.
   if (candidates.length === 0 && firstWord) {
     const nameClause = { name: { contains: firstWord, mode: "insensitive" } };
 
@@ -816,21 +881,12 @@ const findVehicleByReg = async (vehicleReg, cache) => {
   return vehicle;
 };
 
-const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
-
-const normalizeVehicleType = (raw) => {
-  const str = String(raw || "").toUpperCase();
-  const parts = str.split(/[\/,]/).map((p) => p.replace(/\s+/g, ""));
-  return parts.find((p) => VEHICLE_TYPES.has(p)) || parts[0] || "";
-};
-
-const routeNameHasVehicleType = (routeName, vehicleTypeNorm) => {
-  if (!routeName || !vehicleTypeNorm) return false;
-  const tokens = String(routeName)
-    .toUpperCase()
-    .split(/[^A-Z0-9]+/)
-    .filter(Boolean);
-  return tokens.includes(vehicleTypeNorm);
+const ENTITY_VALUES = new Set(["IBEX", "VW"]);
+const normalizeEntity = (raw) => {
+  const key = String(raw || "")
+    .trim()
+    .toUpperCase();
+  return ENTITY_VALUES.has(key) ? key : null;
 };
 
 // ---------- Address Cross-Check ----------
@@ -904,10 +960,6 @@ const analyzeAddressMatch = (sheetAddress, employee) => {
     return { isMatch: true, score, reason: null };
   }
 
-  const masterAreaLabel =
-    [employee.area?.name, employee.subArea?.name, employee.block?.name]
-      .filter(Boolean)
-      .join(" > ") || "no area on file";
   return {
     isMatch: false,
     score,
@@ -1000,7 +1052,7 @@ const findVehicleConflict = async (
   return null;
 };
 
-// ---------- Auto-assignment (only for rows without sheet driver) ----------
+// ---------- Auto-assignment ----------
 
 const findBestAvailableDriver = async (
   weekStartDate,
@@ -1081,7 +1133,6 @@ const findBestAvailableVehicle = async (
   weekStartDate,
   candidateShiftTiming,
   targetTripId,
-  minCapacity,
   vehicleTypeHint,
   excludeEmployeeId,
   caches,
@@ -1117,13 +1168,9 @@ const findBestAvailableVehicle = async (
   const typeKey = normalizeVehicleType(vehicleTypeHint);
 
   if (caches?.activeVehicles) {
-    const candidates = caches.activeVehicles
-      .filter(
-        (v) =>
-          (!busyIds.length || !busyIds.includes(v.id)) &&
-          (!minCapacity || (v.capacity ?? 0) >= minCapacity),
-      )
-      .sort((a, b) => (a.capacity ?? 0) - (b.capacity ?? 0));
+    const candidates = caches.activeVehicles.filter(
+      (v) => !busyIds.length || !busyIds.includes(v.id),
+    );
 
     if (typeKey && VEHICLE_TYPES.has(typeKey)) {
       const typed = candidates.find((v) => v.type === typeKey);
@@ -1135,20 +1182,17 @@ const findBestAvailableVehicle = async (
   const baseWhere = {
     status: "ACTIVE",
     ...(busyIds.length ? { id: { notIn: busyIds } } : {}),
-    ...(minCapacity ? { capacity: { gte: minCapacity } } : {}),
   };
 
   if (typeKey && VEHICLE_TYPES.has(typeKey)) {
     const typed = await prisma.vehicle.findFirst({
       where: { ...baseWhere, type: typeKey },
-      orderBy: { capacity: "asc" },
     });
     if (typed) return typed;
   }
 
   return prisma.vehicle.findFirst({
     where: baseWhere,
-    orderBy: { capacity: "asc" },
   });
 };
 
@@ -1156,7 +1200,6 @@ const autoAssignDriverAndVehicle = async (
   weekStartDate,
   candidateShiftTiming,
   targetTripId,
-  minCapacity,
   vehicleTypeHint,
   excludeEmployeeId,
   caches,
@@ -1168,41 +1211,64 @@ const autoAssignDriverAndVehicle = async (
     excludeEmployeeId,
     caches,
   );
-  if (!driver) return { driverId: undefined, vehicleId: undefined };
-
-  let vehicle =
-    driver.vehicle && driver.vehicle.status === "ACTIVE"
-      ? driver.vehicle
-      : null;
-  if (vehicle) {
-    const conflict = await findVehicleConflict(
-      vehicle.id,
-      weekStartDate,
-      candidateShiftTiming,
-      targetTripId,
-      excludeEmployeeId,
-      caches,
-    );
-    if (conflict) vehicle = null;
+  if (!driver) {
+    return { driverId: null, vehicleId: null };
   }
+
+  let vehicle = driver.vehicle && driver.vehicle.status === "ACTIVE"
+    ? driver.vehicle
+    : null;
+
+  if (!vehicle) {
+    console.log(`[autoAssign] Driver ${driver.name} (${driver.id}) has no vehicle, creating placeholder...`);
+    const vendorName = driver.vendor?.name || "MTS";
+    const vehicleType = vehicleTypeHint || "CAR";
+    
+    vehicle = await findOrCreateVehicleForDriver(
+      driver.id,
+      vendorName,
+      vehicleType,
+      caches
+    );
+  }
+
   if (!vehicle) {
     vehicle = await findBestAvailableVehicle(
       weekStartDate,
       candidateShiftTiming,
       targetTripId,
-      minCapacity,
       vehicleTypeHint,
       excludeEmployeeId,
       caches,
     );
   }
 
-  return { driverId: driver.id, vehicleId: vehicle?.id };
+  if (!vehicle) {
+    const vendorName = driver.vendor?.name || "MTS";
+    const vehicleType = vehicleTypeHint || "CAR";
+    
+    vehicle = await findOrCreateVehicleForDriver(
+      driver.id,
+      vendorName,
+      vehicleType,
+      caches
+    );
+  }
+
+  if (vehicle) {
+    console.log(`[autoAssign] Driver ${driver.name} assigned to vehicle ${vehicle.vehicleNumber} (${vehicle.id})`);
+  } else {
+    console.warn(`[autoAssign] Driver ${driver.name} has NO vehicle available!`);
+  }
+
+  return { 
+    driverId: driver.id, 
+    vehicleId: vehicle?.id || null 
+  };
 };
 
 // ============================================================
-// findOrCreateVehicleForDriver - Creates placeholder vehicle
-// using sheet vendor + vehicle type + driver name
+// findOrCreateVehicleForDriver
 // ============================================================
 
 const findOrCreateVehicleForDriver = async (
@@ -1234,15 +1300,6 @@ const findOrCreateVehicleForDriver = async (
     }
   }
 
-  // Defensive re-check: vehicle.driverId is a UNIQUE constraint, so a
-  // driver can only ever have one vehicle — but the cached `driver` record
-  // above can be stale (e.g. another row for the same driver, processed
-  // earlier in this same batch, already assigned one) and the narrower
-  // vendor+type+ACTIVE lookup further below won't find a vehicle that's a
-  // different type or status (e.g. RELEASED/INACTIVE). Either way, falling
-  // through to create() in that state throws a unique constraint error
-  // instead of just reusing what the driver already has. Check broadly for
-  // ANY vehicle already on this driver before doing anything else.
   const anyExistingVehicle = await prisma.vehicle.findFirst({
     where: { driverId },
   });
@@ -1263,44 +1320,22 @@ const findOrCreateVehicleForDriver = async (
       where: {
         vendorId: vendor.id,
         type: vehicleTypeNorm,
-        OR: [{ driverId: driverId }, { driverId: null }],
+        driverId: null,
         status: "ACTIVE",
       },
-      orderBy: { driverId: { sort: "desc", nulls: "last" } },
     });
 
     if (existingVehicle) {
-      if (!existingVehicle.driverId) {
-        try {
-          await prisma.vehicle.update({
-            where: { id: existingVehicle.id },
-            data: { driverId: driverId },
-          });
-          existingVehicle.driverId = driverId;
-        } catch (updateError) {
-          // Another concurrently-processed row for this same driver won
-          // the race and already claimed a vehicle (this one or a
-          // different one) between our read above and this write. Use
-          // whatever the driver actually ended up with instead of failing
-          // the row over a timing collision.
-          if (updateError?.code === "P2002") {
-            const settled = await prisma.vehicle.findFirst({
-              where: { driverId },
-            });
-            if (settled) {
-              caches?.vehicle?.set(settled.id, settled);
-              if (driver) {
-                driver.vehicle = settled;
-                caches?.driverById?.set(driverId, driver);
-              }
-              return settled;
-            }
-          }
-          throw updateError;
-        }
+      const updated = await prisma.vehicle.update({
+        where: { id: existingVehicle.id },
+        data: { driverId: driverId },
+      });
+      caches?.vehicle?.set(updated.id, updated);
+      if (driver) {
+        driver.vehicle = updated;
+        caches?.driverById?.set(driverId, driver);
       }
-      caches?.vehicle?.set(existingVehicle.id, existingVehicle);
-      return existingVehicle;
+      return updated;
     }
   }
 
@@ -1329,13 +1364,8 @@ const findOrCreateVehicleForDriver = async (
         notes: `Placeholder vehicle created from sheet upload. Original vendor: ${vendorName || "N/A"}, Type: ${vehicleType || "N/A"}. Replace with actual vehicle when available.`,
       },
     });
+    console.log(`[findOrCreateVehicleForDriver] Created placeholder vehicle ${vehicleNumber} for driver ${driverId}`);
   } catch (createError) {
-    // vehicle.driverId is unique. If we land here with a P2002, a
-    // concurrently-processed row for the same driver created (or claimed)
-    // a vehicle between our checks above and this create — the exact
-    // failure reported in production logs. Recover by reusing whatever
-    // vehicle the driver ended up with rather than failing/skipping the
-    // row.
     if (createError?.code === "P2002") {
       const settled = await prisma.vehicle.findFirst({ where: { driverId } });
       if (settled) {
@@ -1360,7 +1390,7 @@ const findOrCreateVehicleForDriver = async (
 };
 
 // ============================================================
-// resolveConflictFreeAssignment - NEVER replaces sheet driver
+// resolveConflictFreeAssignment
 // ============================================================
 
 const resolveConflictFreeAssignment = async ({
@@ -1370,20 +1400,12 @@ const resolveConflictFreeAssignment = async ({
   proposedDriverId,
   proposedVehicleId,
   vehicleTypeHint,
-  minCapacity,
   excludeEmployeeId,
   caches,
   options,
 }) => {
   const notes = [];
 
-  // Trust THIS ROW's own resolved driver/vehicle first. Multiple employees
-  // can land on the same physical Trip record (disableMultiTrip forces
-  // everyone in an area+shift onto one trip) while genuinely having
-  // different drivers named in the sheet — falling back to trip.driverId
-  // first meant whichever employee's row happened to create/claim the
-  // trip "won", and every other employee silently got switched to that
-  // driver in the database, even though their own row named someone else.
   let driverId = proposedDriverId || trip.driverId || undefined;
   let vehicleId = proposedVehicleId || trip.vehicleId || undefined;
 
@@ -1437,13 +1459,6 @@ const resolveConflictFreeAssignment = async ({
       );
     }
   } else if (options?.skipAutoAssignDriver) {
-    // The sheet explicitly named a driver for this row, but that name
-    // couldn't be matched to a master-data record (wrong vendor, typo,
-    // unmatched name, etc). That's a data-quality problem for manual
-    // review — auto-assigning a completely different, unrelated driver
-    // here would silently put the wrong person on the route. Leave it
-    // unassigned instead, consistent with the "never auto-assign another
-    // driver" rule already applied when the initial name match failed.
     notes.push(
       "Sheet named a driver that couldn't be matched to master data — left unassigned rather than auto-assigning a different driver. Please review manually.",
     );
@@ -1452,7 +1467,6 @@ const resolveConflictFreeAssignment = async ({
       weekStartDate,
       shiftTiming,
       trip.id,
-      minCapacity ?? trip.vehicle?.capacity,
       vehicleTypeHint,
       excludeEmployeeId,
       caches,
@@ -1505,15 +1519,6 @@ const resolveConflictFreeAssignment = async ({
     }
   }
 
-  // Only WRITE the resolved driver/vehicle back onto the shared Trip
-  // record when the trip doesn't already have one — same "fill empty only,
-  // never overwrite" rule already used in findOrCreateTripOnRoute. Without
-  // this guard, every employee sharing a trip (disableMultiTrip puts many
-  // different real drivers on one trip) but naming a different driver in
-  // their own sheet row would silently overwrite the trip's driverId to
-  // whichever row processed last — corrupting the one physical Trip record
-  // that other screens (route/trip lists) read `driver` from, even though
-  // each employee's own WeeklySchedule.driverId is correctly resolved.
   const tripDriverNeedsUpdate = !trip.driverId && driverId;
   const tripVehicleNeedsUpdate = !trip.vehicleId && vehicleId;
 
@@ -1526,7 +1531,6 @@ const resolveConflictFreeAssignment = async ({
       },
       include: { vehicle: true, route: true },
     });
-    await syncRouteFromTrips(trip.routeId, caches);
     caches?.tripsByRoute?.delete(trip.routeId);
 
     if (driverId) caches?.tripIdByDriver?.set(driverId, trip.id);
@@ -1623,37 +1627,23 @@ const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
       include: { vehicle: true },
       orderBy: { tripNumber: "asc" },
     }));
-  const totalCapacity = trips.reduce(
-    (sum, t) => sum + (t.vehicle?.capacity ?? FALLBACK_ROUTE_CAPACITY),
-    0,
-  );
-  const newMaxCapacity = totalCapacity || FALLBACK_ROUTE_CAPACITY;
-  const newDriverId = trips[0]?.driverId || null;
 
   const cachedRoute = caches?.routeById?.get(routeId);
-  if (
-    cachedRoute &&
-    cachedRoute.maxCapacity === newMaxCapacity &&
-    cachedRoute.driverId === newDriverId
-  ) {
+  if (cachedRoute) {
     return cachedRoute;
   }
 
   const updated = await prisma.route.update({
     where: { id: routeId },
-    data: {
-      maxCapacity: newMaxCapacity,
-      driverId: newDriverId,
-    },
-    include: { area: true, driver: true },
+    data: {},
+    include: { area: true },
   });
   caches?.routeById?.set(routeId, updated);
   return updated;
 };
 
 // ============================================================
-// SIMPLIFIED: findExistingTripForDriverThisWeek
-// ONLY checks: driver + shift + area (NO vehicle type/vendor)
+// findExistingTripForDriverThisWeek
 // ============================================================
 
 const findExistingTripForDriverThisWeek = async (
@@ -1685,12 +1675,10 @@ const findExistingTripForDriverThisWeek = async (
     return null;
   }
 
-  // ✅ ONLY CHECK: Area matches
   if (areaRecord && trip.route?.areaId && trip.route.areaId !== areaRecord.id) {
     return null;
   }
 
-  // ✅ ONLY CHECK: Shift matches (vehicle type / vendor intentionally NOT checked)
   const tripShiftTiming = trip.shiftTiming || trip.route?.shiftTiming;
   const candidateRange = parseShiftRange(shiftTiming);
   const tripRange = parseShiftRange(tripShiftTiming);
@@ -1701,9 +1689,6 @@ const findExistingTripForDriverThisWeek = async (
       : normalizeShift(shiftTiming) === normalizeShift(tripShiftTiming);
   if (!sameShift) return null;
 
-  // RESTORED: capacity check (was dropped in the simplification — without this,
-  // a driver's existing trip absorbs unlimited passengers with no over-capacity
-  // flag and without honoring disableMultiTrip at all).
   const capacity = trip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
   const occupancy = caches?.weekRoster
     ? caches.weekRoster.filter(
@@ -1720,8 +1705,7 @@ const findExistingTripForDriverThisWeek = async (
 };
 
 // ============================================================
-// SIMPLIFIED: findOrCreateRouteAndTrip
-// ONLY checks: area + shift + driver (NO vehicle type/vendor)
+// findOrCreateRouteAndTrip
 // ============================================================
 
 const findOrCreateRouteAndTrip = async (
@@ -1737,8 +1721,6 @@ const findOrCreateRouteAndTrip = async (
   options = {},
   vendorName,
 ) => {
-  // Step 0: driver-first reuse (checks driver + shift + area; vehicle
-  // type/vendor intentionally ignored; capacity still enforced)
   if (driverId) {
     const existingTrip = await findExistingTripForDriverThisWeek(
       driverId,
@@ -1769,7 +1751,6 @@ const findOrCreateRouteAndTrip = async (
   let route = null;
   let routeCreated = false;
 
-  // Step 1: Find existing route by AREA + SHIFT only (IGNORE vehicle type)
   if (areaRecord) {
     let candidates = caches?.routesByArea?.get(areaRecord.id);
     if (!candidates) {
@@ -1783,7 +1764,6 @@ const findOrCreateRouteAndTrip = async (
 
     if (shiftTiming) {
       const shiftNorm = normalizeShift(shiftTiming);
-      // ✅ ONLY check shift - NO vehicle type check
       route = candidates.find((r) => {
         const rShiftNorm = normalizeShift(r.shiftTiming);
         return rShiftNorm === shiftNorm;
@@ -1793,7 +1773,6 @@ const findOrCreateRouteAndTrip = async (
     }
   }
 
-  // Step 2: Create new route if none found
   if (!route) {
     const baseName =
       [areaRecord?.name, shiftTiming].filter(Boolean).join(" - ") ||
@@ -1801,14 +1780,6 @@ const findOrCreateRouteAndTrip = async (
       "General Route";
     const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
 
-    // generateUniqueRouteCode only checks-then-returns a code; it doesn't
-    // reserve it. If another concurrent job/request creates a route with
-    // the same code between our check and our create() below, the create
-    // throws a P2002 unique constraint error. Route's only user-supplied
-    // unique column is routeCode, so any P2002 here is that collision -
-    // Prisma's error shape for it varies (meta.target can be a field-name
-    // array OR the DB constraint name string), so we don't pattern-match
-    // that shape; we just retry with a freshly generated code.
     const MAX_ROUTE_CODE_ATTEMPTS = 5;
     let lastRouteCreateError;
     for (let attempt = 1; attempt <= MAX_ROUTE_CODE_ATTEMPTS; attempt += 1) {
@@ -1819,7 +1790,6 @@ const findOrCreateRouteAndTrip = async (
             routeName: baseName,
             routeCode,
             shiftTiming: shiftTiming || undefined,
-            maxCapacity: guessMaxCapacity(vehicleType),
             areaId: areaRecord?.id,
           },
           include: { area: true },
@@ -1829,14 +1799,9 @@ const findOrCreateRouteAndTrip = async (
       } catch (createErr) {
         if (createErr?.code !== "P2002") throw createErr;
         lastRouteCreateError = createErr;
-        // Loop again: generateUniqueRouteCode will now see the just-created
-        // row and pick the next suffix.
       }
     }
 
-    // Belt-and-suspenders: if every generated suffix still collided (e.g.
-    // a burst of concurrent jobs all racing the same base code), fall back
-    // to a suffix that's guaranteed unique instead of failing the row.
     if (lastRouteCreateError) {
       const guaranteedCode = `${baseCode}-${Date.now()}-${Math.random()
         .toString(36)
@@ -1846,7 +1811,6 @@ const findOrCreateRouteAndTrip = async (
           routeName: baseName,
           routeCode: guaranteedCode,
           shiftTiming: shiftTiming || undefined,
-          maxCapacity: guessMaxCapacity(vehicleType),
           areaId: areaRecord?.id,
         },
         include: { area: true },
@@ -1860,7 +1824,6 @@ const findOrCreateRouteAndTrip = async (
     );
   }
 
-  // Step 3: Find or create trip on the route (multi-trip logic stays)
   const {
     trip,
     newTrip,
@@ -1892,8 +1855,7 @@ const findOrCreateRouteAndTrip = async (
 };
 
 // ============================================================
-// SIMPLIFIED: findOrCreateTripOnRoute
-// Keeps multi-trip but REMOVES vehicle type/vendor checks for matching
+// findOrCreateTripOnRoute - FIXED
 // ============================================================
 
 const findOrCreateTripOnRoute = async (
@@ -1908,6 +1870,11 @@ const findOrCreateTripOnRoute = async (
   options = {},
   vendorName,
 ) => {
+  if (!route || !route.id) {
+    console.error('[Trip create] Invalid route:', route);
+    throw new Error(`Route object is missing or has no id: ${JSON.stringify(route)}`);
+  }
+
   let trips = caches?.tripsByRoute?.get(route.id);
   if (!trips) {
     trips = await prisma.trip.findMany({
@@ -1923,11 +1890,7 @@ const findOrCreateTripOnRoute = async (
   let overCapacity = false;
   const notes = [];
 
-  // ✅ REMOVED: vehicle type and vendor checks in trip matching
-  // ✅ KEPT: capacity check (multi-trip logic)
-
   if (options.disableMultiTrip) {
-    // Force everyone onto ONE trip
     trip = trips[0] || null;
     if (trip) {
       const capacity = trip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
@@ -1946,15 +1909,6 @@ const findOrCreateTripOnRoute = async (
       }
     }
   } else {
-    // Multi-trip: an area+shift route can legitimately contain employees
-    // from different vendors/drivers (area aliasing merges e.g. "DHA" and
-    // "Defence View" into one route). Picking literally the first trip with
-    // room ignored that, so an employee whose sheet row named a different
-    // driver could land on someone else's trip — and the "keep sheet
-    // driver" patch below would then silently overwrite that trip's driver
-    // to whoever was processed last. Bias trip selection toward staying
-    // within the same driver first, so distinct vendor/driver groups on a
-    // shared route stay on separate trips instead of colliding.
     const hasRoomFor = async (candidate) => {
       const capacity =
         candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
@@ -1973,14 +1927,12 @@ const findOrCreateTripOnRoute = async (
     };
 
     if (driverId) {
-      // Pass 1: an existing trip already driven by this same driver.
       for (const candidate of trips) {
         if (candidate.driverId === driverId && (await hasRoomFor(candidate))) {
           trip = candidate;
           break;
         }
       }
-      // Pass 2: an existing trip with no driver assigned yet (safe to claim).
       if (!trip) {
         for (const candidate of trips) {
           if (!candidate.driverId && (await hasRoomFor(candidate))) {
@@ -1991,8 +1943,6 @@ const findOrCreateTripOnRoute = async (
       }
     }
 
-    // Pass 3: sheet gave no driver, or no driver-safe trip had room —
-    // fall back to the original "first trip with room" behavior.
     if (!trip) {
       for (const candidate of trips) {
         const conflictingDriver =
@@ -2005,8 +1955,47 @@ const findOrCreateTripOnRoute = async (
     }
   }
 
-  // ✅ Keep sheet driver (never replace)
-  let safeDriverId = driverId || undefined;
+  let safeDriverId = driverId || null;
+  let safeVehicleId = vehicleIdHint || null;
+
+  if (!safeDriverId) {
+    const best = await autoAssignDriverAndVehicle(
+      weekStartDate,
+      shiftTiming,
+      null,
+      vehicleType,
+      excludeEmployeeId,
+      caches,
+    );
+    if (best.driverId) {
+      safeDriverId = best.driverId;
+      safeVehicleId = best.vehicleId;
+      notes.push(`Driver auto-assigned: ${safeDriverId}`);
+    } else {
+      throw new Error('Cannot create trip: No driver available for this trip');
+    }
+  }
+
+  if (safeDriverId && !safeVehicleId) {
+    console.log(`[Trip create] Driver ${safeDriverId} has no vehicle, creating placeholder...`);
+    const vehicle = await findOrCreateVehicleForDriver(
+      safeDriverId,
+      vendorName || "MTS",
+      vehicleType || "CAR",
+      caches,
+    );
+    if (vehicle) {
+      safeVehicleId = vehicle.id;
+      if (vehicle.notes?.includes("Placeholder")) {
+        notes.push(
+          `Created placeholder vehicle "${vehicle.vehicleNumber}" for driver "${safeDriverId}". Replace with actual vehicle when available.`,
+        );
+      }
+    } else {
+      throw new Error(`Driver ${safeDriverId} has no vehicle and couldn't create one`);
+    }
+  }
+
   if (safeDriverId) {
     const driverConflict = await findDriverConflict(
       safeDriverId,
@@ -2023,7 +2012,6 @@ const findOrCreateTripOnRoute = async (
     }
   }
 
-  let safeVehicleId = vehicleIdHint || undefined;
   if (safeVehicleId) {
     const vehicleConflict = await findVehicleConflict(
       safeVehicleId,
@@ -2042,39 +2030,48 @@ const findOrCreateTripOnRoute = async (
 
   let tripCreated = false;
   let tripChanged = false;
+  
   if (!trip) {
-    // trips.length/trips.map here can be stale relative to the DB: another
-    // caller (e.g. optimizeWeekAssignments' own findOrCreateTripOnRoute
-    // call, which doesn't share this `caches` object) can create a trip on
-    // this same route between our read and our create() below, so two
-    // calls can compute the same nextTripNumber and collide on the
-    // (routeId, tripNumber) unique constraint. Retry with a freshly
-    // re-queried count instead of failing the row.
     const MAX_TRIP_NUMBER_ATTEMPTS = 5;
     let lastTripCreateError;
     let currentTrips = trips;
+    
     for (let attempt = 1; attempt <= MAX_TRIP_NUMBER_ATTEMPTS; attempt += 1) {
       const nextTripNumber = currentTrips.length
         ? Math.max(...currentTrips.map((t) => t.tripNumber)) + 1
         : 1;
+      
       try {
+        const createData = {
+          routeId: route.id,
+          tripNumber: nextTripNumber,
+          driverId: safeDriverId,
+          vehicleId: safeVehicleId || null,
+          shiftTiming: shiftTiming || null,
+        };
+        
+        console.log(`[Trip create] Attempt ${attempt} with data:`, JSON.stringify(createData, null, 2));
+        
         trip = await prisma.trip.create({
-          data: {
-            routeId: route.id,
-            tripNumber: nextTripNumber,
-            driverId: safeDriverId,
-            vehicleId: safeVehicleId,
-            shiftTiming: shiftTiming || undefined,
-          },
+          data: createData,
           include: { vehicle: true },
         });
+        
         lastTripCreateError = undefined;
         break;
+        
       } catch (createErr) {
-        if (createErr?.code !== "P2002") throw createErr;
+        console.error(`[Trip create] Error on attempt ${attempt}:`, {
+          code: createErr?.code,
+          message: createErr?.message,
+          meta: createErr?.meta,
+        });
+        
+        if (createErr?.code !== "P2002") {
+          throw createErr;
+        }
+        
         lastTripCreateError = createErr;
-        // Re-query from the DB (not the stale cache) so the next attempt
-        // sees whatever the other caller just committed.
         currentTrips = await prisma.trip.findMany({
           where: { routeId: route.id, status: "ACTIVE" },
           include: { vehicle: { include: { vendor: true } } },
@@ -2083,8 +2080,6 @@ const findOrCreateTripOnRoute = async (
       }
     }
 
-    // Belt-and-suspenders: if every re-queried attempt still collided,
-    // fall back to a tripNumber that can't clash instead of failing the row.
     if (lastTripCreateError) {
       const guaranteedTripNumber =
         (currentTrips.length
@@ -2092,13 +2087,16 @@ const findOrCreateTripOnRoute = async (
           : 0) +
         1000 +
         Math.floor(Math.random() * 1000);
+      
+      console.log(`[Trip create] Using guaranteed trip number: ${guaranteedTripNumber}`);
+      
       trip = await prisma.trip.create({
         data: {
           routeId: route.id,
           tripNumber: guaranteedTripNumber,
           driverId: safeDriverId,
-          vehicleId: safeVehicleId,
-          shiftTiming: shiftTiming || undefined,
+          vehicleId: safeVehicleId || null,
+          shiftTiming: shiftTiming || null,
         },
         include: { vehicle: true },
       });
@@ -2109,20 +2107,10 @@ const findOrCreateTripOnRoute = async (
     tripCreated = true;
     tripChanged = true;
     trips.push(trip);
+    
   } else {
     const patch = {};
-    // Trip selection above already avoids landing on a trip with a
-    // conflicting driver, so this branch should only ever fire for a trip
-    // with no driver on file yet. If it does fire with a real mismatch,
-    // that's a genuine anomaly (e.g. a manually edited trip) — flag it
-    // rather than silently overwriting.
-    // Once a trip has a driver assigned, later rows on the same trip
-    // (e.g. other employees sharing this route+shift under
-    // disableMultiTrip) must never silently overwrite it — otherwise
-    // whichever row happens to process last "wins" and replaces an
-    // earlier, correct driver with its own. Only fill the driver in when
-    // the trip doesn't have one yet; a genuine mismatch is surfaced as a
-    // note for manual review, not auto-applied.
+    
     if (safeDriverId && !trip.driverId) {
       patch.driverId = safeDriverId;
     } else if (
@@ -2134,9 +2122,11 @@ const findOrCreateTripOnRoute = async (
         `Trip #${trip.tripNumber} on route "${route.routeCode}" is already assigned to a different driver — this row's sheet driver was NOT applied; please verify manually.`,
       );
     }
-    if (safeVehicleId && !trip.vehicleId) patch.vehicleId = safeVehicleId;
+    
+    if (safeVehicleId && !trip.vehicleId) {
+      patch.vehicleId = safeVehicleId;
+    }
 
-    // ✅ If driver has no vehicle, create placeholder
     if (safeDriverId && !trip.vehicleId && !safeVehicleId) {
       const vehicle = await findOrCreateVehicleForDriver(
         safeDriverId,
@@ -2156,12 +2146,15 @@ const findOrCreateTripOnRoute = async (
     }
 
     if (Object.keys(patch).length) {
+      console.log(`[Trip update] Updating trip ${trip.id} with:`, patch);
+      
       trip = await prisma.trip.update({
         where: { id: trip.id },
         data: patch,
         include: { vehicle: true },
       });
       tripChanged = true;
+      
       const idx = trips.findIndex((t) => t.id === trip.id);
       if (idx !== -1) trips[idx] = trip;
     }
@@ -2170,13 +2163,10 @@ const findOrCreateTripOnRoute = async (
   if (tripChanged) {
     await syncRouteFromTrips(route.id, caches, trips);
   }
+  
   if (trip.driverId) {
     caches?.tripIdByDriver?.set(trip.driverId, trip.id);
   }
-  // ✅ FIX: trip.create()/trip.update() above only `include: { vehicle: true }`,
-  // so `trip.route` is missing on this object. Attach it before caching —
-  // otherwise a later cache hit in findExistingTripForDriverThisWeek() returns
-  // `route: trip.route` as undefined, which crashes downstream on `route.routeCode`.
   trip.route = route;
   caches?.tripById?.set(trip.id, trip);
 
@@ -2309,7 +2299,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 };
 
 // ============================================================
-// resolvePendingVehicleAssignments - Links vehicles to DRAFT rows
+// resolvePendingVehicleAssignments
 // ============================================================
 
 const resolvePendingVehicleAssignments = async (req, res, next) => {
@@ -2521,7 +2511,7 @@ const optimizeWeekAssignments = async (weekStartDate) => {
         entry.vehicleId || undefined,
         weekStartDate,
         entry.employeeId,
-        undefined, // caches — this loop has no shared cache object
+        undefined,
         {
           trustProposedDriver: true,
           disableMultiTrip: false,
@@ -2539,7 +2529,6 @@ const optimizeWeekAssignments = async (weekStartDate) => {
     let vehicleId = entry.vehicleId || undefined;
     const shiftTiming = entry.shiftTiming || entry.route.shiftTiming;
 
-    // ✅ NEVER replace a driver that came from the sheet
     if (driverId) {
       const conflict = await findDriverConflict(
         driverId,
@@ -2560,8 +2549,8 @@ const optimizeWeekAssignments = async (weekStartDate) => {
         shiftTiming,
         trip.id,
         undefined,
-        undefined,
         entry.employeeId,
+        caches,
       );
       if (best.driverId) {
         driverId = best.driverId;
@@ -2680,6 +2669,7 @@ const createWeeklySchedule = async (req, res, next) => {
       tripId,
       driverId,
       vehicleId,
+      vehicleEntity,
       serviceType,
       monday,
       tuesday,
@@ -2701,6 +2691,35 @@ const createWeeklySchedule = async (req, res, next) => {
       );
       return res.status(response.status.code).json(response);
     }
+
+    let normalizedVehicleEntity = null;
+    if (vehicleEntity) {
+      normalizedVehicleEntity = normalizeEntity(vehicleEntity);
+      if (!normalizedVehicleEntity) {
+        const response = badRequestResponse(
+          "Invalid vehicleEntity — expected IBEX or VW.",
+        );
+        return res.status(response.status.code).json(response);
+      }
+    }
+
+    const officeArrivalDate = officeArrivalTime
+      ? toShiftTimeDate(officeArrivalTime)
+      : null;
+    if (officeArrivalTime && !officeArrivalDate) {
+      const response = badRequestResponse(
+        "Invalid officeArrivalTime — expected an ISO 8601 datetime.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+    const dropDate = dropTime ? toShiftTimeDate(dropTime) : null;
+    if (dropTime && !dropDate) {
+      const response = badRequestResponse(
+        "Invalid dropTime — expected an ISO 8601 datetime.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+    const pickupDate = computePickupTime(officeArrivalDate);
 
     const existingSchedule = await prisma.weeklySchedule.findUnique({
       where: {
@@ -2725,6 +2744,7 @@ const createWeeklySchedule = async (req, res, next) => {
       tripId,
       driverId,
       vehicleId,
+      vehicleEntity: normalizedVehicleEntity,
       serviceType: serviceType || "PICK_AND_DROP",
       monday: monday || "BOTH",
       tuesday: tuesday || "BOTH",
@@ -2733,10 +2753,10 @@ const createWeeklySchedule = async (req, res, next) => {
       friday: friday || "BOTH",
       saturday: saturday || "OFF",
       sunday: sunday || "OFF",
-      pickupTime,
+      pickupTime: pickupDate,
       shiftTiming,
-      officeArrivalTime,
-      dropTime,
+      officeArrivalTime: officeArrivalDate,
+      dropTime: dropDate,
       status: status || "ACTIVE",
     });
 
@@ -2886,6 +2906,48 @@ const updateWeeklySchedule = async (req, res, next) => {
       updateData.weekStart = toDateOnly(updateData.weekStart);
     }
 
+    delete updateData.pickupTime;
+
+    if ("officeArrivalTime" in updateData) {
+      const parsed = updateData.officeArrivalTime
+        ? toShiftTimeDate(updateData.officeArrivalTime)
+        : null;
+      if (updateData.officeArrivalTime && !parsed) {
+        const errorResponse = badRequestResponse(
+          "Invalid officeArrivalTime — expected an ISO 8601 datetime.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+      updateData.officeArrivalTime = parsed;
+      updateData.pickupTime = computePickupTime(parsed);
+    }
+
+    if ("dropTime" in updateData) {
+      const parsed = updateData.dropTime
+        ? toShiftTimeDate(updateData.dropTime)
+        : null;
+      if (updateData.dropTime && !parsed) {
+        const errorResponse = badRequestResponse(
+          "Invalid dropTime — expected an ISO 8601 datetime.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+      updateData.dropTime = parsed;
+    }
+
+    if ("vehicleEntity" in updateData) {
+      const normalized = updateData.vehicleEntity
+        ? normalizeEntity(updateData.vehicleEntity)
+        : null;
+      if (updateData.vehicleEntity && !normalized) {
+        const errorResponse = badRequestResponse(
+          "Invalid vehicleEntity — expected IBEX or VW.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+      updateData.vehicleEntity = normalized;
+    }
+
     const schedule = await prisma.weeklySchedule.findUnique({ where: { id } });
     if (!schedule) {
       const errorResponse = badRequestResponse("Weekly schedule not found.");
@@ -2927,13 +2989,7 @@ const updateWeeklySchedule = async (req, res, next) => {
 };
 
 // ---------- Trip Driver Update ----------
-// Driver assignment is a Trip-level concept, not a per-employee one — every
-// WeeklySchedule row that rides a given Trip shares its driver. The
-// `driverId` on WeeklySchedule is only a denormalized cache of the trip's
-// driver (see the bulk-upload/reassign flows, which set
-// `driverId: routeResult.trip.driverId || entry.driverId`), so the real
-// edit has to happen here, on the Trip, and then fan out to every row
-// riding it — not on an individual schedule row.
+
 const updateTripDriver = async (req, res, next) => {
   try {
     const { tripId } = req.params;
@@ -2947,19 +3003,12 @@ const updateTripDriver = async (req, res, next) => {
 
     const safeDriverId = driverId || null;
 
-    // NOTE: Trips are NOT week-scoped — one Trip (a driver+vehicle run on a
-    // route) is reused by every WeeklySchedule row that points at it,
-    // across every week. Changing the driver here changes it for every
-    // week that uses this trip, not just the week currently on screen.
     const [updatedTrip] = await prisma.$transaction([
       prisma.trip.update({
         where: { id: tripId },
         data: { driverId: safeDriverId },
         include: { vehicle: true, driver: true, route: true },
       }),
-      // Keep every WeeklySchedule row's cached driverId in sync with the
-      // trip it actually rides on, mirroring the same denormalization the
-      // bulk-upload/optimize flows already rely on.
       prisma.weeklySchedule.updateMany({
         where: { tripId, status: { not: "CANCELLED" } },
         data: { driverId: safeDriverId },
@@ -3116,14 +3165,13 @@ const getGroupedSchedules = async (req, res, next) => {
             routeCode: true,
             area: true,
             shiftTiming: true,
-            maxCapacity: true,
-            driver: { select: { id: true, name: true } },
           },
         },
         trip: {
           select: {
             id: true,
             tripNumber: true,
+            driver: true,
             vehicle: {
               select: { id: true, vehicleNumber: true, capacity: true },
             },
@@ -3146,9 +3194,8 @@ const getGroupedSchedules = async (req, res, next) => {
           area: s.route?.area ?? "",
           shift: s.route?.shiftTiming ?? s.shiftTiming ?? "",
           service: s.serviceType,
-          driverBadge: s.route?.driver?.name ?? s.driver?.name ?? "—",
+          driverBadge: s.driver?.name ?? "—",
           vehicleBadge: s.vehicle?.vehicleNumber ?? "—",
-          capacity: s.route?.maxCapacity ?? null,
           tripMap: new Map(),
           empIds: new Set(),
           weekMap: new Map(),
@@ -3176,9 +3223,9 @@ const getGroupedSchedules = async (req, res, next) => {
         area: s.route?.area ?? "",
         shift: s.shiftTiming ?? "",
         service: s.serviceType,
-        pick: s.pickupTime ?? "-",
-        arrival: s.officeArrivalTime ?? "-",
-        drop: s.dropTime ?? "-",
+        pick: toIsoOrNull(s.pickupTime) ?? "-",
+        arrival: toIsoOrNull(s.officeArrivalTime) ?? "-",
+        drop: toIsoOrNull(s.dropTime) ?? "-",
         driver: s.driver?.name ?? "-",
         vehicle: s.vehicle?.vehicleNumber ?? "-",
         tripNumber: s.trip?.tripNumber ?? null,
@@ -3252,9 +3299,6 @@ const getGroupedSchedules = async (req, res, next) => {
             ? r.vehicleBadge
             : (firstTrip?.vehicleNumber ?? "—"),
         empCount: r.empIds.size,
-        capacity: r.capacity,
-        remainingSeats:
-          r.capacity != null ? Math.max(r.capacity - r.empIds.size, 0) : null,
         multiTrip: trips.length > 1,
         trips,
         weeks: Array.from(r.weekMap.values()).sort((a, b) =>
@@ -3390,16 +3434,6 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
     for (const emp of employees) {
       const schedule = emp.weeklySchedules[0] || null;
 
-      // Group by the employee's own driver+vehicle+shift, NOT by tripId or
-      // routeId. Even though bulk upload now creates a correct, distinct
-      // Trip per (area, shift, driver) — see the disableMultiTrip fix in
-      // the upload path — this grouping stays driver-first rather than
-      // trip-first, since it's cheaper to reason about here and still
-      // correctly separates two different drivers even for any legacy/
-      // pre-fix rows that predate that change and still share a tripId.
-      // If there's no driver at all on the row, each employee gets its
-      // own group (schedule.id) instead of being lumped in under someone
-      // else's.
       const groupKey = schedule
         ? schedule.driverId
           ? `driver:${schedule.driverId}:${schedule.vehicleId ?? "novehicle"}:${schedule.shiftTiming ?? ""}`
@@ -3456,8 +3490,8 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
         scheduleStatus: schedule?.status ?? null,
         service: schedule?.serviceType ?? emp.serviceType,
         shift: schedule?.shiftTiming ?? null,
-        pickupTime: schedule?.pickupTime ?? null,
-        dropTime: schedule?.dropTime ?? null,
+        pickupTime: toIsoOrNull(schedule?.pickupTime),
+        dropTime: toIsoOrNull(schedule?.dropTime),
         offDay: schedule?.offDay ?? null,
         route: schedule?.route
           ? {
@@ -3589,7 +3623,7 @@ const getBulkUploadStatus = async (req, res, next) => {
 };
 
 // ============================================================
-// processBulkUploadJob - MAIN BULK UPLOAD LOGIC (FIXED)
+// processBulkUploadJob - MAIN BULK UPLOAD LOGIC
 // ============================================================
 
 const processBulkUploadJob = async (
@@ -3611,6 +3645,7 @@ const processBulkUploadJob = async (
     vehicleTypeMismatch: 0,
     addressMismatch: 0,
     driversPhoneBackfilled: 0,
+    driverPhoneMismatch: 0,
     vendorsNotFound: 0,
     routesCreated: 0,
     routeLegsOpenedForOverflow: 0,
@@ -3667,13 +3702,6 @@ const processBulkUploadJob = async (
     }
   };
 
-  // Best-effort advisory lock for this week. tryAcquireWeekAreaLock uses a
-  // generous 10s timeout/maxWait and warns-then-continues on failure,
-  // instead of a raw prisma.$transaction() call with Prisma's default
-  // 2000ms maxWait — this job's own connection-pool pressure (24-way row
-  // concurrency + periodic flush transactions) could blow through 2s
-  // before a single row was even processed, aborting the entire job with
-  // "Unable to start a transaction in the given time."
   await tryAcquireWeekAreaLock(weekStartDate);
 
   const [existingWeekRoster, availableDriversList, activeVehiclesList] =
@@ -3790,22 +3818,11 @@ const processBulkUploadJob = async (
   const pendingWrites = [];
   const pendingByEmployeeId = new Map();
 
-  // ---------- Per-employee mutex ----------
-  // Row groups run with concurrency (ROW_GROUP_CONCURRENCY below), so two
-  // rows for the SAME employeeId can, in different area groups, both reach
-  // the "does this employee already have a schedule?" check before either
-  // has finished queueing/writing. Both would then independently decide
-  // "create", and the second create hits the DB's
-  // (employeeId, weekStart) unique constraint. Serializing the
-  // read-decide-queue section per employeeId closes that window; different
-  // employees are unaffected and still process fully in parallel.
   const employeeWriteLocks = new Map();
   const runExclusiveForEmployee = (employeeId, task) => {
     const prevTail = employeeWriteLocks.get(employeeId) || Promise.resolve();
     const runTask = () => task();
     const result = prevTail.then(runTask, runTask);
-    // Keep the chain alive for the next caller regardless of outcome, but
-    // don't let a rejection here propagate into unrelated future calls.
     employeeWriteLocks.set(
       employeeId,
       result.then(
@@ -3833,11 +3850,6 @@ const processBulkUploadJob = async (
     });
   };
 
-  // Batch transaction timeout: 25 sequential upserts can legitimately take
-  // longer than Prisma's 5000ms default under load, which was causing
-  // "rollback cannot be executed on an expired transaction" errors and
-  // forcing every batch into the slower row-by-row fallback. Give it real
-  // headroom instead.
   const BATCH_TX_TIMEOUT_MS = 20000;
   const BATCH_TX_MAX_WAIT_MS = 10000;
 
@@ -3846,20 +3858,6 @@ const processBulkUploadJob = async (
     const batch = pendingWrites.splice(0, pendingWrites.length);
     pendingByEmployeeId.clear();
     try {
-      // IMPORTANT: only treat an item as an update when it carries a real,
-      // persisted DB id. `item.existing` can be a cache-only placeholder for
-      // a row that's queued but not yet written (see processRow), and that
-      // placeholder object is truthy even though it has no id — checking
-      // `item.existing` alone previously caused
-      // `update({ where: { id: undefined } })` crashes whenever a duplicate
-      // employee code hit the cache before its first write had landed.
-      // Use upsert keyed on the actual DB unique constraint instead of
-      // branching on the in-memory `existing` cache. The cache can be stale
-      // (e.g. two rows for the same employee land in the same flush, or two
-      // flushes race each other), which is exactly what was producing
-      // "create vs create" P2002 collisions on (employeeId, weekStart).
-      // Upsert makes that race impossible: Postgres resolves it atomically
-      // against the real constraint no matter what the cache believed.
       const saved = await prisma.$transaction(
         batch.map((item) =>
           prisma.weeklySchedule.upsert({
@@ -3894,11 +3892,6 @@ const processBulkUploadJob = async (
         } = item;
         const hasRealId = Boolean(existing?.id);
         try {
-          // Upsert on the real DB unique key rather than branching on
-          // `hasRealId`/the cache. This is what actually resolves a
-          // (employeeId, weekStart) collision: whichever row already
-          // exists in Postgres gets updated, regardless of what our local
-          // cache believed going in.
           const savedSchedule = await prisma.weeklySchedule.upsert({
             where: {
               employeeId_weekStart: {
@@ -3922,15 +3915,7 @@ const processBulkUploadJob = async (
     }
   };
 
-  // Row grouping — this MUST use the exact same area resolution as
-  // processRow (sheet's Area column first, employee master area as
-  // fallback), or two rows destined for the very same route/shift can end
-  // up in different concurrency groups and run in PARALLEL instead of
-  // serialized. That's a real race: both rows can miss finding an existing
-  // route before either creates one, so both create a route — silently
-  // splitting one route+shift into two, which is exactly the kind of
-  // "same area, employees split across different drivers/groups" bug this
-  // was meant to prevent.
+  // Row grouping
   const rowGroups = new Map();
   for (const {
     sheetName,
@@ -3946,10 +3931,6 @@ const processBulkUploadJob = async (
         empCodeCol !== undefined ? String(raw[empCodeCol] ?? "").trim() : "";
       if (!employeeCode || !/^\d+$/.test(employeeCode)) continue;
 
-      // NOTE: do NOT skip when the employee isn't in the cache — that would
-      // silently drop the row with no exception logged. Let it fall through
-      // to processRow, which does its own lookup and reports a proper
-      // "employee not found" exception for unmatched codes.
       const employee = caches.employee.get(employeeCode);
 
       const sheetAreaRaw =
@@ -3974,10 +3955,6 @@ const processBulkUploadJob = async (
 
   const ROW_GROUP_CONCURRENCY = 24;
   const limit = pLimit(ROW_GROUP_CONCURRENCY);
-
-  // ============================================================
-  // processRow - UPDATED: Uses simplified route creation with main area
-  // ============================================================
 
   const processRow = async (sheetName, raw, rowNum, colIndex) => {
     const get = (key) =>
@@ -4011,6 +3988,7 @@ const processBulkUploadJob = async (
       let driverSheetPhone = null;
       let vehicleId = null;
       let resolvedVehicleType = null;
+      let resolvedVehicleEntity = null;
 
       for (let d = 0; d < driverEntries.length; d++) {
         const driver = await findDriver(
@@ -4037,6 +4015,40 @@ const processBulkUploadJob = async (
           if (driver.vehicle) {
             vehicleId = driver.vehicle.id;
             resolvedVehicleType = driver.vehicle.type;
+            resolvedVehicleEntity = driver.vehicle.vehicleEntity ?? null;
+            console.log(`[processRow] Driver ${driver.name} has vehicle: ${driver.vehicle.vehicleNumber}`);
+          } else {
+            console.log(`[processRow] Driver ${driver.name} has NO vehicle, creating placeholder...`);
+            const vendorNameForVehicle = vendorName || driver.vendor?.name || "MTS";
+            const vehicleTypeForVehicle = vehicleType || "CAR";
+            
+            const newVehicle = await findOrCreateVehicleForDriver(
+              driverId,
+              vendorNameForVehicle,
+              vehicleTypeForVehicle,
+              caches
+            );
+            
+            if (newVehicle) {
+              vehicleId = newVehicle.id;
+              resolvedVehicleType = newVehicle.type;
+              resolvedVehicleEntity = newVehicle.vehicleEntity ?? null;
+              
+              results.vehiclesCreated = (results.vehiclesCreated || 0) + 1;
+              results.notes.push({
+                row: rowNum,
+                employeeCode,
+                note: `Created placeholder vehicle "${newVehicle.vehicleNumber}" for driver "${driver.name}". Replace with actual vehicle when available.`,
+              });
+              console.log(`[processRow] Created placeholder vehicle ${newVehicle.vehicleNumber} for driver ${driver.name}`);
+            } else {
+              results.notes.push({
+                row: rowNum,
+                employeeCode,
+                note: `Failed to create vehicle for driver "${driver.name}". Row will be DRAFT.`,
+              });
+              console.error(`[processRow] Failed to create vehicle for driver ${driver.name}`);
+            }
           }
 
           break;
@@ -4078,12 +4090,6 @@ const processBulkUploadJob = async (
         }
       }
 
-      // ✅ No match → leave driverId NULL and keep the "No Driver" warning.
-      // Never auto-assign another available driver (could produce a wrong
-      // schedule) and never auto-create a driver here (could pollute master
-      // data with duplicates). The weekly schedule row itself is still
-      // created exactly as the sheet says — only the driver link is left
-      // blank for manual review.
       const driverNamedButUnmatched = !driverId && driverEntries.length > 0;
       if (driverNamedButUnmatched) {
         results.notes.push({
@@ -4108,22 +4114,6 @@ const processBulkUploadJob = async (
         }
       }
 
-      // ============================================================
-      // Route grouping must use THIS WEEK'S sheet Area, not whatever
-      // area happened to be on the employee's master record. The sheet
-      // is uploaded per week specifically because pickup area/driver can
-      // change week to week; falling back to stale master data here was
-      // why employees with a current, correct driver in the sheet (e.g.
-      // area "JOHAR" / "Mehmoodabad" / "Tariq road") were getting merged
-      // onto an unrelated "Defence (DHA)" route/driver left over from an
-      // old master-data area. Sheet area wins when present.
-      //
-      // NOTE: when the sheet provides an area, we deliberately do NOT
-      // write it back to employee.areaId. Master data is left untouched
-      // for now — this row's area is used for this week's routing only.
-      // We only backfill employee.areaId when the employee had no area
-      // on file at all and we resolved one from the sheet.
-      // ============================================================
       let areaRecord = null;
       const sheetAreaName = get("area");
       if (sheetAreaName) {
@@ -4144,9 +4134,21 @@ const processBulkUploadJob = async (
         caches.employee.set(employee.employeeCode, employee);
       }
 
-      const sheetAddress = get("address");
-      if (sheetAddress) {
-        const addressCheck = analyzeAddressMatch(sheetAddress, employee);
+      const sheetSubArea = get("subArea");
+      const sheetBlock = get("block");
+      const sheetLocationCombined = [
+        sheetAreaName,
+        sheetSubArea,
+        sheetBlock,
+        get("address"),
+      ]
+        .filter(Boolean)
+        .join(" ");
+      if (sheetLocationCombined) {
+        const addressCheck = analyzeAddressMatch(
+          sheetLocationCombined,
+          employee,
+        );
         if (!addressCheck.isMatch) {
           results.addressMismatch++;
           results.notes.push({
@@ -4163,6 +4165,7 @@ const processBulkUploadJob = async (
         if (vehicle) {
           vehicleId = vehicle.id;
           resolvedVehicleType = vehicle.type;
+          resolvedVehicleEntity = vehicle.vehicleEntity ?? null;
         } else {
           results.notes.push({
             row: rowNum,
@@ -4172,7 +4175,6 @@ const processBulkUploadJob = async (
         }
       }
 
-      // Create placeholder vehicle if needed
       if (driverId && !vehicleId) {
         const vehicle = await findOrCreateVehicleForDriver(
           driverId,
@@ -4183,6 +4185,7 @@ const processBulkUploadJob = async (
         if (vehicle) {
           vehicleId = vehicle.id;
           resolvedVehicleType = vehicle.type;
+          resolvedVehicleEntity = vehicle.vehicleEntity ?? null;
           if (vehicle.notes?.includes("Placeholder")) {
             results.vehiclesCreated = (results.vehiclesCreated || 0) + 1;
             results.notes.push({
@@ -4235,13 +4238,82 @@ const processBulkUploadJob = async (
         }
       }
 
+      if (driverId && driverSheetPhone && driverRecord.phone) {
+        const sheetDigits = String(driverSheetPhone)
+          .replace(/\D/g, "")
+          .slice(-10);
+        const onFileDigits = String(driverRecord.phone)
+          .replace(/\D/g, "")
+          .slice(-10);
+        if (sheetDigits && onFileDigits && sheetDigits !== onFileDigits) {
+          results.driverPhoneMismatch = (results.driverPhoneMismatch || 0) + 1;
+          results.notes.push({
+            row: rowNum,
+            employeeCode,
+            note: `Driver "${driverRecord.name}" phone on the sheet ("${driverSheetPhone}") doesn't match the phone on file ("${driverRecord.phone}") — please verify.`,
+          });
+        }
+      }
+
+      const vehicleEntityRaw = get("vehicleEntityName");
+      const vehicleEntity = normalizeEntity(vehicleEntityRaw);
+      if (vehicleEntityRaw && !vehicleEntity) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Vehicle Entity "${vehicleEntityRaw}" is not a recognized entity (expected IBEX or VW).`,
+        });
+      } else if (!vehicleEntityRaw) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Vehicle Entity is missing for this row.`,
+        });
+      } else if (
+        vehicleEntity &&
+        resolvedVehicleEntity &&
+        vehicleEntity !== resolvedVehicleEntity
+      ) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Sheet Vehicle Entity ("${vehicleEntity}") doesn't match the assigned vehicle's entity on file (${resolvedVehicleEntity}).`,
+        });
+      }
+
+      const employeeEntityRaw = get("entity");
+      const employeeEntity = normalizeEntity(employeeEntityRaw);
+      if (employeeEntityRaw && !employeeEntity) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Entity "${employeeEntityRaw}" is not a recognized entity (expected IBEX or VW).`,
+        });
+      } else if (employeeEntity && !employee.entity) {
+        await prisma.employee.update({
+          where: { id: employee.id },
+          data: { entity: employeeEntity },
+        });
+        employee.entity = employeeEntity;
+        caches.employee.set(employee.employeeCode, employee);
+      } else if (
+        employeeEntity &&
+        employee.entity &&
+        employeeEntity !== employee.entity
+      ) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Sheet Entity ("${employeeEntity}") doesn't match this employee's entity on file (${employee.entity}).`,
+        });
+      }
+
       const campaign = get("campaign") || get("batch");
 
       let route;
       let trip;
       let routeCreated = false;
       try {
-        // ✅ UPDATED: Uses simplified findOrCreateRouteAndTrip with main area
         const routeResult = await findOrCreateRouteAndTrip(
           areaRecord,
           vehicleType,
@@ -4253,30 +4325,6 @@ const processBulkUploadJob = async (
           employee.id,
           caches,
           {
-            // ✅ UPDATED: was `disableMultiTrip: true` ("workaround for
-            // rideplaing.js"), which forced every employee in an area+shift
-            // onto ONE shared Trip record even when the sheet named
-            // different drivers — e.g. every Johar-area row collapsed onto
-            // whichever driver's row was processed first, silently losing
-            // the other real drivers. findOrCreateTripOnRoute's multi-trip
-            // path already implements the intended rule (confirmed): same
-            // driver + same area + same shift -> same trip; driver changes
-            // -> a new trip, never merged into another driver's trip. This
-            // also makes the driverId-based grouping workaround in the
-            // roster read path (search "Bulk upload deliberately puts every
-            // employee ... onto one shared Trip record") unnecessary going
-            // forward, since tripId now reliably differs per driver again —
-            // that grouping code is left in place since it still works
-            // correctly either way.
-            //
-            // VERIFIED against rideplaing.js and schema.prisma: rideplaing.js
-            // already groups/identifies Rides by (driverId, tripId, rideDate)
-            // — see its own "multi-trip-per-driver-per-day" bug-fix comments
-            // — and Ride has a real DB constraint
-            // ride_driver_trip_date_unique on exactly those three columns.
-            // So it already expects (and requires) a distinct tripId per
-            // driver, same as this change now produces. No changes needed
-            // there.
             disableMultiTrip: false,
             trustProposedDriver: true,
           },
@@ -4294,9 +4342,6 @@ const processBulkUploadJob = async (
           results.notes.push({
             row: rowNum,
             employeeCode,
-            // ✅ FIX: defensive fallback — never let a missing `route` object
-            // (e.g. a future cache gap) throw and cause the whole row to be
-            // skipped just to report a capacity note.
             note: `Trip #${trip?.tripNumber ?? "?"} on route "${route?.routeCode ?? route?.id ?? "unknown"}" is at/over capacity.`,
           });
         }
@@ -4334,7 +4379,6 @@ const processBulkUploadJob = async (
         proposedDriverId: driverId,
         proposedVehicleId: vehicleId,
         vehicleTypeHint: vehicleType,
-        minCapacity: undefined,
         excludeEmployeeId: employee.id,
         caches,
         options: {
@@ -4360,8 +4404,32 @@ const processBulkUploadJob = async (
         dayFields[day] = offDaySet.has(day) ? "OFF" : "BOTH";
       });
 
-      const officeArrivalTime = get("officeArrivalTime");
-      const dropTime = get("dropTime");
+      const officeArrivalTimeRaw = get("officeArrivalTime");
+      const dropTimeRaw = get("dropTime");
+      const serviceType = deriveServiceType(officeArrivalTimeRaw, dropTimeRaw);
+
+      const officeArrivalDate = parseSheetTimeToDate(officeArrivalTimeRaw);
+      const dropDate = parseSheetTimeToDate(dropTimeRaw);
+      const pickupDate = computePickupTime(officeArrivalDate);
+
+      if (
+        officeArrivalTimeRaw &&
+        !officeArrivalDate &&
+        serviceType !== "DROP_ONLY"
+      ) {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Office Arrival Time "${officeArrivalTimeRaw}" could not be parsed into a valid time — pickup time could not be derived.`,
+        });
+      }
+      if (dropTimeRaw && !dropDate && serviceType !== "PICK_ONLY") {
+        results.notes.push({
+          row: rowNum,
+          employeeCode,
+          note: `Drop Time "${dropTimeRaw}" could not be parsed into a valid time.`,
+        });
+      }
 
       const missingDriver = !driverId;
       const missingVehicle = !vehicleId;
@@ -4377,22 +4445,17 @@ const processBulkUploadJob = async (
         driverId,
         vendorId,
         vehicleId,
-        serviceType: deriveServiceType(officeArrivalTime, dropTime),
+        vehicleEntity: vehicleEntity || undefined,
+        serviceType,
         shiftTiming: shiftTiming || undefined,
-        pickupTime: officeArrivalTime || undefined,
-        officeArrivalTime: officeArrivalTime || undefined,
-        dropTime: dropTime || undefined,
+        pickupTime: pickupDate || undefined,
+        officeArrivalTime: officeArrivalDate || undefined,
+        dropTime: dropDate || undefined,
         offDay: get("offDay") || undefined,
         ...dayFields,
         status: missingDriver || missingVehicle ? "DRAFT" : "ACTIVE",
       };
 
-      // The whole "does this employee already have a schedule?" decision
-      // through queueing/caching runs inside a per-employee lock: row
-      // groups process concurrently, and without this, two rows for the
-      // same employeeId can both read "no existing schedule" before either
-      // has queued a write, both decide "create", and the second create
-      // trips the (employeeId, weekStart) unique constraint.
       const shouldSkipRow = await runExclusiveForEmployee(
         employee.id,
         async () => {
@@ -4459,9 +4522,6 @@ const processBulkUploadJob = async (
                       data: tripPatch,
                       include: { vehicle: true },
                     });
-                    // ✅ FIX: same gap as findOrCreateTripOnRoute — this update only
-                    // includes `vehicle`, so attach `route` before caching or a later
-                    // cache hit will return a trip with no `.route`.
                     mergedTrip.route = route;
                     caches?.tripById?.set(mergedTrip.id, mergedTrip);
                     if (mergedTrip.driverId) {
@@ -4524,10 +4584,6 @@ const processBulkUploadJob = async (
               );
               return true;
             }
-            // Only a genuinely persisted record (real DB id) counts as an
-            // update; a cache-only placeholder from an earlier not-yet-flushed
-            // row must never be handed to Prisma as `existing`, or it produces
-            // update({ where: { id: undefined } }).
             const existingHasId = Boolean(existing?.id);
             if (existingHasId) results.updated++;
             else results.created++;
@@ -4546,9 +4602,6 @@ const processBulkUploadJob = async (
             });
           }
 
-          // Cache the merged view for later rows/lookups this run, but never
-          // fabricate an `id` — leave it unset until the write is actually
-          // confirmed (applyCacheEffects fills in the real id post-save).
           caches.scheduleByEmployeeId.set(employee.id, {
             ...(existing || {}),
             ...scheduleData,
@@ -4621,7 +4674,6 @@ const processBulkUploadJob = async (
   await flushPendingWrites();
   console.log(`[weeklySchedule][job ${jobId}] final flush complete.`);
 
-  // Phone backfill flush
   if (caches.driverPhoneBackfills.size) {
     const backfillEntries = Array.from(caches.driverPhoneBackfills.entries());
     try {
@@ -4677,19 +4729,14 @@ const processBulkUploadJob = async (
   return results;
 };
 
-// ---------- Driver Options (lightweight list for the schedule edit UI) ----------
-// Deliberately separate from the heavy driver-matching helpers above
-// (findOrCreateVehicleForDriver, checkDriverWorkingHours, etc.) — this is
-// just "give me id+name+status for a dropdown", nothing else.
+// ---------- Driver Options ----------
 
 const getDriverOptions = async (req, res, next) => {
   try {
     const drivers = await prisma.driver.findMany({
       where: {
         vehicle: {
-          id: {
-            not: null,
-          },
+          isNot: null,
         },
       },
       select: {
@@ -4915,6 +4962,12 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
 
 module.exports = {
   analyzeAddressMatch,
+  normalizeEntity,
+  parseSheetTimeOfDay,
+  parseSheetTimeToDate,
+  toShiftTimeDate,
+  toIsoOrNull,
+  computePickupTime,
   getDriverOptions,
   updateTripDriver,
   createWeeklySchedule,
