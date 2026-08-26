@@ -248,7 +248,7 @@ const HEADER_ALIASES = {
   d: "vehicleType",
   vehicle: "vehicleType",
   vendor: "vendor",
-  "vehicle entity": "vehicleEntityName",
+  "vehicle entity": "vehicleEntity",
   "vehicle reg": "vehicleReg",
   "vehicle registration": "vehicleReg",
   drivers: "drivers",
@@ -268,6 +268,7 @@ const HEADER_ALIASES = {
   subarea: "subArea",
   block: "block",
   address: "address",
+  location: "location",
 };
 
 const parseOffDays = (offDayRaw) => {
@@ -2060,11 +2061,11 @@ const findOrCreateRouteAndTrip = async (
   caches,
   options = {},
   vendorName,
+  location, // <-- ADD THIS
+  vehicleEntity, // <-- ADD THIS
 ) => {
-  // If driverId is specified, we should ONLY look for/create trips with this driver
   const requestedDriverId = driverId;
 
-  // First check if driver already has a trip this week with same shift
   if (requestedDriverId) {
     const existingTrip = await findExistingTripForDriverThisWeek(
       requestedDriverId,
@@ -2095,7 +2096,6 @@ const findOrCreateRouteAndTrip = async (
   let route = null;
   let routeCreated = false;
 
-  // Find or create route for this area/shift
   if (areaRecord) {
     let candidates = caches?.routesByArea?.get(areaRecord.id);
     if (!candidates) {
@@ -2118,12 +2118,17 @@ const findOrCreateRouteAndTrip = async (
     }
   }
 
-  // Create route if needed
   if (!route) {
-    const baseName =
-      [areaRecord?.name, shiftTiming].filter(Boolean).join(" - ") ||
-      campaign ||
-      "General Route";
+    // ========== FIX: Add location and vehicleEntity to route name ==========
+    const nameParts = [
+      areaRecord?.name,
+      location, // <-- ADD Location
+      shiftTiming,
+    ].filter(Boolean);
+
+    const baseName = nameParts.join(" - ") || campaign || "General Route";
+    // ========== END FIX ==========
+
     const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
 
     const MAX_ROUTE_CODE_ATTEMPTS = 5;
@@ -2166,11 +2171,11 @@ const findOrCreateRouteAndTrip = async (
     if (areaRecord) caches?.routesByArea?.delete(areaRecord.id);
     console.log(
       `[weeklySchedule] Created new route: "${route.routeCode}" ` +
-        `for area "${areaRecord?.name || "unknown"}" shift "${shiftTiming}"`,
+        `for area "${areaRecord?.name || "unknown"}" shift "${shiftTiming}"` +
+        ` location "${location}" vehicleEntity "${vehicleEntity}"`,
     );
   }
 
-  // Now find or create trip on this route with capacity awareness
   const {
     trip,
     newTrip,
@@ -4071,7 +4076,7 @@ const processBulkUploadJob = async (
         dayFields[day] = offDaySet.has(day) ? "OFF" : "BOTH";
       });
 
-      const vehicleEntity = normalizeEntity(get("vehicleEntityName"));
+      const vehicleEntity = normalizeEntity(get("vehicleEntity"));
       const campaign = get("campaign") || get("batch");
 
       const employeeData = {
@@ -4096,6 +4101,8 @@ const processBulkUploadJob = async (
         raw,
         driverEntries,
         driverNamedButUnmatched,
+        location: get("location"), // <-- ADD THIS
+        vehicleEntity: get("vehicleEntity"),
         assigned: false,
         assignedTrip: null,
         assignedRoute: null,
@@ -4381,6 +4388,8 @@ const processBulkUploadJob = async (
           allowCreate: true,
         },
         firstEmp.vendorName,
+        firstEmp.location, // <-- ADD THIS
+        firstEmp.vehicleEntity, // <-- ADD THIS
       );
 
       const trip = routeResult.trip;
