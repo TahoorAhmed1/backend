@@ -21,6 +21,8 @@ const {
   resyncPendingRides,
   updateTripDriver,
   getDriverOptions,
+  updateSingleEmployeeSchedule,
+  deleteSingleEmployeeSchedule,
 } = require("../../../controllers/client/schedule/weeklySchedule.controller");
 const upload = require("../../../middlewares/upload.middleware");
 
@@ -45,6 +47,11 @@ router.get("/driver-options", getDriverOptions);
 router.get("/:id", getWeeklyScheduleById);
 router.patch("/:id", updateWeeklySchedule);
 router.patch("/trip/:tripId/driver", updateTripDriver);
+
+router.patch("/:id/single", updateSingleEmployeeSchedule);
+router.delete("/:id/single", deleteSingleEmployeeSchedule);
+
+
 router.delete("/:id", deleteWeeklySchedule);
 router.post(
   "/weekly-schedule/validate-upload",

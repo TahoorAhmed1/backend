@@ -128,8 +128,8 @@ const getAllRides = async (req, res, next) => {
 
     const options = {
       where,
-      skip: Math.max(0, parseInt(skip, 10) || 0),
-      take: Math.max(1, parseInt(take, 10) || 10),
+      // skip: Math.max(0, parseInt(skip, 10) || 0),
+      // take: Math.max(1, parseInt(take, 10) || 10),
 
       include: {
         route: {
