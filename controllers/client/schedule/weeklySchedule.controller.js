@@ -1,5 +1,4 @@
 const XLSX = require("xlsx");
-const pLimit = require("p-limit");
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
@@ -12,2199 +11,52 @@ const {
   badRequestResponse,
   okResponse,
 } = require("../../../constants/responses");
-const {
-  normalizeShift,
-  parseShiftRange,
-  shiftTimesOverlap,
-} = require("../../../utils/shiftTime");
+const { normalizeShift } = require("../../../utils/shiftTime");
 const {
   syncPendingRidesForWeek,
   syncPendingRidesForWeekBestEffort,
 } = require("../../../lib/rideplaing");
 
-const DAY_KEYS = [
-  "monday",
-  "tuesday",
-  "wednesday",
-  "thursday",
-  "friday",
-  "saturday",
-  "sunday",
-];
-
-// ---------- helpers ----------
-
-const toDateOnly = (d) => {
-  const date = new Date(d);
-  return new Date(
-    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-  );
-};
-
-const formatDateOnly = (d) => new Date(d).toISOString().slice(0, 10);
-
-const mondayOfCurrentWeek = () => {
-  const now = new Date();
-  const utcToday = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-  );
-  const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
-  return new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
-};
-
-const DAY_FIELD_KEYS = [
-  "monday",
-  "tuesday",
-  "wednesday",
-  "thursday",
-  "friday",
-  "saturday",
-  "sunday",
-];
-
-// ---------- Driver Rest Time / Working Hours ----------
-
-const MIN_REST_MINUTES = 8 * 60;
-const DEFAULT_MAX_DAILY_HOURS = 12;
-const DEFAULT_MAX_WEEKLY_HOURS = 60;
-
-const hasMinimumRest = (a, b) => {
-  if (!a || !b) return true;
-  const aEnd = a.start + a.durationMinutes;
-  const bEnd = b.start + b.durationMinutes;
-  const gapAToB = (((b.start - aEnd) % 1440) + 1440) % 1440;
-  const gapBToA = (((a.start - bEnd) % 1440) + 1440) % 1440;
-  return Math.max(gapAToB, gapBToA) >= MIN_REST_MINUTES;
-};
-
-const countWorkingDays = (entry) =>
-  DAY_KEYS.filter((day) => entry[day] && entry[day] !== "OFF").length;
-
-// ---------- In-memory "week roster" cache ----------
-
-const filterRoster = (
-  roster,
-  { driverId, vehicleId, excludeTripId, excludeEmployeeId } = {},
-) =>
-  roster.filter((r) => {
-    if (driverId && r.driverId !== driverId) return false;
-    if (vehicleId && r.vehicleId !== vehicleId) return false;
-    if (excludeTripId && r.tripId === excludeTripId) return false;
-    if (excludeEmployeeId && r.employeeId === excludeEmployeeId) return false;
-    return true;
-  });
-
-const upsertRosterEntry = (caches, entry) => {
-  if (!caches?.weekRoster) return;
-  const idx = caches.weekRoster.findIndex(
-    (r) => r.employeeId === entry.employeeId,
-  );
-  if (idx === -1) caches.weekRoster.push(entry);
-  else caches.weekRoster[idx] = { ...caches.weekRoster[idx], ...entry };
-};
-
-const checkDriverWorkingHours = async (
-  client,
-  driverId,
-  weekStartDate,
-  candidateShiftTiming,
-  candidateWorkingDays,
-  excludeEmployeeId,
-  caches,
-) => {
-  let driver = caches?.driverById?.get(driverId);
-  if (!driver) {
-    driver = await client.driver.findUnique({ where: { id: driverId } });
-    if (driver) caches?.driverById?.set(driverId, driver);
-  }
-  if (!driver) return { ok: true };
-
-  const maxDaily = driver.maxDailyHours || DEFAULT_MAX_DAILY_HOURS;
-  const maxWeekly = driver.maxWeeklyHours || DEFAULT_MAX_WEEKLY_HOURS;
-
-  const range = parseShiftRange(candidateShiftTiming);
-  if (!range) return { ok: true };
-
-  const dailyHours = range.durationMinutes / 60;
-  if (dailyHours > maxDaily) {
-    return {
-      ok: false,
-      reason: `Shift is ${dailyHours.toFixed(1)}h, which exceeds this driver's ${maxDaily}h daily limit.`,
-    };
-  }
-
-  const others = caches?.weekRoster
-    ? filterRoster(caches.weekRoster, { driverId, excludeEmployeeId })
-    : await client.weeklySchedule.findMany({
-        where: {
-          driverId,
-          weekStart: weekStartDate,
-          status: { not: "CANCELLED" },
-          ...(excludeEmployeeId
-            ? { employeeId: { not: excludeEmployeeId } }
-            : {}),
-        },
-      });
-
-  let weeklyMinutes = range.durationMinutes * (candidateWorkingDays || 5);
-  for (const other of others) {
-    const otherRange = parseShiftRange(other.shiftTiming);
-    if (otherRange)
-      weeklyMinutes += otherRange.durationMinutes * countWorkingDays(other);
-  }
-
-  const weeklyHours = weeklyMinutes / 60;
-  if (weeklyHours > maxWeekly) {
-    return {
-      ok: false,
-      reason: `Assigning this driver would total ${weeklyHours.toFixed(1)}h this week, exceeding their ${maxWeekly}h weekly limit.`,
-    };
-  }
-
-  return { ok: true };
-};
-
-// ---------- Historical Assignment Tracking ----------
-
-const recordAssignmentHistory = async (
-  client,
-  action,
-  weeklyScheduleId,
-  before,
-  after,
-  changedBy,
-) => {
-  try {
-    await client.auditLog.create({
-      data: {
-        action,
-        model: "WeeklySchedule",
-        recordId: weeklyScheduleId,
-        before: before ? JSON.parse(JSON.stringify(before)) : undefined,
-        after: after ? JSON.parse(JSON.stringify(after)) : undefined,
-        userId: changedBy || undefined,
-      },
-    });
-  } catch (historyError) {
-    // Never let audit logging break the actual assignment operation.
-  }
-};
-
-// ---------- Exception Queue ----------
-
-const logScheduleException = async (
-  client,
-  { weekStart, employeeCode, rowNumber, reason, rawData },
-) => {
-  try {
-    await client.scheduleException.create({
-      data: {
-        weekStart,
-        employeeCode: employeeCode || undefined,
-        rowNumber: rowNumber ?? undefined,
-        reason,
-        rawData: rawData ? JSON.parse(JSON.stringify(rawData)) : undefined,
-      },
-    });
-  } catch (exceptionLogError) {
-    // Never let exception logging break the actual upload/reassign.
-  }
-};
-
-// ---------- Concurrency Protection ----------
-
-const acquireWeekAreaLock = async (client, weekStartDate, areaKey) => {
-  const lockKey = `weekly-schedule::${weekStartDate.toISOString()}::${areaKey || "no-area"}`;
-  await client.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-};
-
-const tryAcquireWeekAreaLock = async (weekStartDate, areaKey) => {
-  try {
-    await prisma.$transaction(
-      (tx) => acquireWeekAreaLock(tx, weekStartDate, areaKey),
-      { maxWait: 10000, timeout: 10000 },
-    );
-  } catch (lockError) {
-    console.warn(
-      `[weeklySchedule] Skipping week/area lock (continuing without it): ${lockError.message}`,
-    );
-  }
-};
-
-// ---------- Bulk upload (XLSX) helpers ----------
-
-const DAY_ABBR_MAP = {
-  SUN: "sunday",
-  MON: "monday",
-  TUE: "tuesday",
-  WED: "wednesday",
-  THU: "thursday",
-  FRI: "friday",
-  SAT: "saturday",
-};
-
-const HEADER_ALIASES = {
-  "vehicle type": "vehicleType",
-  d: "vehicleType",
-  vehicle: "vehicleType",
-  vendor: "vendor",
-  "vehicle entity": "vehicleEntity",
-  "vehicle reg": "vehicleReg",
-  "vehicle registration": "vehicleReg",
-  drivers: "drivers",
-  "employee id": "employeeCode",
-  "user name": "name",
-  "off day": "offDay",
-  campaign: "campaign",
-  batch: "batch",
-  entity: "entity",
-  "shift timings": "shiftTiming",
-  "office arival time": "officeArrivalTime",
-  "office arrival time": "officeArrivalTime",
-  "drop time": "dropTime",
-  contact: "contact",
-  area: "area",
-  "sub area": "subArea",
-  subarea: "subArea",
-  block: "block",
-  address: "address",
-  location: "location",
-};
-
-const parseOffDays = (offDayRaw) => {
-  const tokens =
-    String(offDayRaw || "")
-      .toUpperCase()
-      .match(/SUN|MON|TUE|WED|THU|FRI|SAT/g) || [];
-  return new Set(tokens.map((t) => DAY_ABBR_MAP[t]));
-};
-
-const deriveServiceType = (officeArrivalTime, dropTime) => {
-  const arrival = String(officeArrivalTime || "")
-    .trim()
-    .toLowerCase();
-  const drop = String(dropTime || "")
-    .trim()
-    .toLowerCase();
-  if (arrival.includes("drop")) return "DROP_ONLY";
-  if (drop.includes("pick")) return "PICK_ONLY";
-  return "PICK_AND_DROP";
-};
-
-// ---------- DateTime / Time-of-day Parsing ----------
-
-const SHIFT_TIME_ANCHOR_DATE = "1970-01-01";
-const KARACHI_UTC_OFFSET_MINUTES = 5 * 60;
-
-const parseSheetTimeOfDay = (raw) => {
-  if (raw === null || raw === undefined || raw === "") return null;
-
-  if (typeof raw === "number" || /^\d+(\.\d+)?$/.test(String(raw).trim())) {
-    const num = Number(raw);
-    if (!Number.isNaN(num)) {
-      const fraction = num - Math.floor(num);
-      const totalMinutes = Math.round(fraction * 24 * 60);
-      return {
-        hours: Math.floor(totalMinutes / 60) % 24,
-        minutes: totalMinutes % 60,
-      };
-    }
-  }
-
-  const str = String(raw).trim();
-  if (!str) return null;
-  if (/pick\s*only|drop\s*only/i.test(str)) return null;
-
-  let cleaned = str
-    .replace(/\s*:\s*:?\s*/g, ":")
-    .replace(/:\s*(AM|PM)/i, " $1")
-    .replace(/:(\d{2}):(\d{2})\s*(AM|PM)/i, (match, h, m, meridiem) => {
-      return `${parseInt(h)}:${m} ${meridiem}`;
-    })
-    .replace(/\s*:\s*:\s*/g, ":")
-    .replace(/\s*(AM|PM)\s*/i, " $1")
-    .trim();
-
-  const match = cleaned.match(/^(\d{1,2}):?(\d{2})?\s*(AM|PM)?$/i);
-  if (!match) return null;
-
-  let hours = parseInt(match[1], 10);
-  const minutes = match[2] ? parseInt(match[2], 10) : 0;
-  const meridiem = match[3] ? match[3].toUpperCase() : null;
-
-  if (Number.isNaN(hours) || hours > 23 || minutes > 59) return null;
-  if (meridiem === "PM" && hours < 12) hours += 12;
-  if (meridiem === "AM" && hours === 12) hours = 0;
-
-  return { hours, minutes };
-};
-
-const timeOfDayToUtcDate = ({ hours, minutes }) => {
-  const rawUtcMinutes = hours * 60 + minutes - KARACHI_UTC_OFFSET_MINUTES;
-  const wrapped = ((rawUtcMinutes % 1440) + 1440) % 1440;
-  const dayOffset = Math.floor(rawUtcMinutes / 1440);
-  const anchor = new Date(`${SHIFT_TIME_ANCHOR_DATE}T00:00:00.000Z`);
-  anchor.setUTCDate(anchor.getUTCDate() + dayOffset);
-  anchor.setUTCHours(Math.floor(wrapped / 60), wrapped % 60, 0, 0);
-  return anchor;
-};
-
-const parseSheetTimeToDate = (raw) => {
-  const tod = parseSheetTimeOfDay(raw);
-  return tod ? timeOfDayToUtcDate(tod) : null;
-};
-
-const toShiftTimeDate = (value) => {
-  if (value instanceof Date)
-    return Number.isNaN(value.getTime()) ? null : value;
-  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value.trim())) {
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-  return parseSheetTimeToDate(value);
-};
-
-const toIsoOrNull = (value) => {
-  const d = toShiftTimeDate(value);
-  return d ? d.toISOString() : null;
-};
-
-const PICKUP_LEAD_MINUTES = 2 * 60;
-const computePickupTime = (officeArrivalDate) => {
-  if (
-    !(officeArrivalDate instanceof Date) ||
-    Number.isNaN(officeArrivalDate.getTime())
-  )
-    return null;
-  return new Date(
-    officeArrivalDate.getTime() - PICKUP_LEAD_MINUTES * 60 * 1000,
-  );
-};
-
-const normalizeShiftForCompare = (raw) =>
-  String(raw || "")
-    .replace(/\s+/g, "")
-    .toUpperCase();
-
-const parseDriverEntries = (raw) => {
-  if (!raw) return [];
-  const str = String(raw);
-  const re =
-    /([A-Za-z][A-Za-z .]*?)\s*[-:]?\s*(?:\d\s+)?(\d{3,5}[\s-]\d{6,8}|\d{10,13})/g;
-  const out = [];
-  let match;
-  while ((match = re.exec(str)) !== null) {
-    const name = match[1].trim();
-    const phone = match[2].replace(/[\s-]/g, "");
-    if (name && phone.length >= 10 && phone.length <= 13) {
-      out.push({ name, phone });
-    }
-  }
-  return out;
-};
-
-const parseDriverEntry = (raw) => parseDriverEntries(raw)[0] || null;
-
-const normalizeMatch = (str) => {
-  return String(str || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-};
-
-// ============================================================
-// VEHICLE TYPE NORMALIZATION
-// ============================================================
-
-const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
-
-const VEHICLE_TYPE_ALIASES = {
-  KARVAN: "KARVAN",
-  KARVEN: "KARVAN",
-  KARVAN: "KARVAN",
-  CAR: "CAR",
-  VAN: "VAN",
-  HIJET: "HIJET",
-  "HI-JET": "HIJET",
-  HIJET: "HIJET",
-  BUS: "BUS",
-};
-
-const normalizeVehicleType = (raw) => {
-  if (!raw) return "";
-  const str = String(raw).toUpperCase().trim();
-
-  if (VEHICLE_TYPE_ALIASES[str]) {
-    return VEHICLE_TYPE_ALIASES[str];
-  }
-
-  const parts = str.split(/[\s\/\-_,]+/);
-  for (const part of parts) {
-    const normalized = VEHICLE_TYPE_ALIASES[part];
-    if (normalized && VEHICLE_TYPES.has(normalized)) {
-      return normalized;
-    }
-    if (VEHICLE_TYPES.has(part)) {
-      return part;
-    }
-  }
-
-  if (str.includes("KARVAN") || str.includes("KARVEN")) {
-    return "KARVAN";
-  }
-  if (str.includes("HIJET") || str.includes("HI-JET")) {
-    return "HIJET";
-  }
-
-  return parts[0] || "";
-};
-
-// ============================================================
-// AREA ALIASES
-// ============================================================
-
-const AREA_ALIASES = {
-  pechs: "P.E.C.H.S",
-  "pechs,": "P.E.C.H.S",
-  "6 pechs": "P.E.C.H.S",
-  garden: "Garden East",
-  "garden headquarters": "Garden East",
-  "garden east": "Garden East",
-  "garden east.": "Garden East",
-  "garden east k": "Garden East",
-  "garden west": "Garden West",
-  "garden west,": "Garden West",
-  nazimabad: "Nazimabad",
-  "nazimabad karachi": "Nazimabad",
-  naizamabad: "Nazimabad",
-  naizmabad: "Nazimabad",
-  nazimbad: "Nazimabad",
-  nazaimabad: "Nazimabad",
-  "nazaimabad no 4": "Nazimabad",
-  "north nazimabad": "North Nazimabad",
-  "n nazimabad": "North Nazimabad",
-  "north nazimbad": "North Nazimabad",
-  "north naizamabad": "North Nazimabad",
-  "north naizamabad.": "North Nazimabad",
-  "north naizmabad": "North Nazimabad",
-  "north nazimbad": "North Nazimabad",
-  bufferzone: "Buffer Zone",
-  "bufferzone,": "Buffer Zone",
-  "buffer zone": "Buffer Zone",
-  "buffer zone.": "Buffer Zone",
-  "2 minutes chowrangi": "2 Min Chowrangi",
-  "2 minute chowrangi": "2 Min Chowrangi",
-  "north karachi": "North Karachi",
-  "north karach": "North Karachi",
-  "north karachi.": "North Karachi",
-  "noth karachi": "North Karachi",
-  "fb area": "F.B Area",
-  "f.b area": "F.B Area",
-  "fb area.": "F.B Area",
-  "federal b area": "F.B Area",
-  liaqatabad: "Liaquatabad",
-  "teen hatthi": "Teen Hatti",
-  teenhati: "Teen Hatti",
-  teenhatti: "Teen Hatti",
-  "gulistan e johar": "Gulistan-e-Jauhar",
-  "gulistan-e-johar": "Gulistan-e-Jauhar",
-  johar: "Gulistan-e-Jauhar",
-  jauhar: "Gulistan-e-Jauhar",
-  "jauhar chowrangi": "Gulistan-e-Jauhar",
-  "gulshan -e-iqbal": "Gulshan-e-Iqbal",
-  "gulshan e iqbal": "Gulshan-e-Iqbal",
-  gulshan: "Gulshan-e-Iqbal",
-  "shah faisal": "Shah Faisal Colony",
-  "shah faisal colony": "Shah Faisal Colony",
-  "shah faisa": "Shah Faisal Colony",
-  shahfaisal: "Shah Faisal Colony",
-  mlir: "Shah Faisal Colony",
-  malir: "Malir City",
-  "malir cantt": "Malir Cantt",
-  "malir cantt.": "Malir Cantt",
-  "malir cant": "Malir Cantt",
-  "malir count": "Malir Cantt",
-  "malir cattle": "Malir Cantt",
-  saudabad: "Saudabad",
-  mehoodabad: "Mehmoodabad",
-  mehmoodabad: "Mehmoodabad",
-  mehmmodabad: "Mehmoodabad",
-  mehmodabad: "Mehmoodabad",
-  "mehmoodabad,": "Mehmoodabad",
-  mehmdabad: "Mehmoodabad",
-  mehmoodbad: "Mehmoodabad",
-  "gulzar e hijr": "Gulzar-e-Hijri",
-  "gulzar e hijri": "Gulzar-e-Hijri",
-  "gulazar-e-hijri": "Gulzar-e-Hijri",
-  "gulzar-e-hijr": "Gulzar-e-Hijri",
-  "gulzar hijri": "Gulzar-e-Hijri",
-  "gulzar e hijri,": "Gulzar-e-Hijri",
-  "madrass chowrangi": "Gulzar-e-Hijri",
-  "gulazar-e-hijri": "Gulzar-e-Hijri",
-  dha: "Defence (DHA)",
-  "dha phase 8": "Defence (DHA)",
-  "dha phase 2": "Defence (DHA)",
-  "defense view": "Defence (DHA)",
-  "defence view": "Defence (DHA)",
-  defense: "Defence (DHA)",
-  defence: "Defence (DHA)",
-  "phase 2": "Defence (DHA)",
-  "phase 2 ext": "Defence (DHA)",
-  "defence view.": "Defence (DHA)",
-  clifton: "Clifton",
-  "clifton,": "Clifton",
-  "korangi crossing": "Korangi",
-  crossing: "Korangi",
-  "khalid bin waleed road": "Old City Area",
-  saddar: "Old City Area",
-  "saddar,": "Old City Area",
-  "tibet center": "Old City Area",
-  "m a jinnah road": "Old City Area",
-  "ma jinnah road": "Old City Area",
-  "m.a.jinnah road": "Old City Area",
-  "scheme 33": "Scheme 33",
-  "kaneez fatima": "Kaneez Fatima",
-  maymaar: "Gulshan-e-Maymar",
-  cantt: "Cantt",
-  "cant station": "Cantt",
-  "pib colony": "PIB Colony",
-  pib: "PIB Colony",
-  "jamshed road": "Jamshed Road",
-  "jhamshed road": "Jamshed Road",
-  "jamshad road": "Jamshed Road",
-  "jamshad rd": "Jamshed Road",
-  "jail road": "Jail Road",
-  numaish: "Numaish",
-  numish: "Numaish",
-  nomaish: "Numaish",
-  "soldier bazar": "Soldier Bazar",
-  "soldier bazar no 2": "Soldier Bazar",
-  "soldier bazar #1": "Soldier Bazar",
-  "soldeir bazar # 1": "Soldier Bazar",
-  "akhtar colony": "Akhtar Colony",
-  "aktar clony": "Akhtar Colony",
-  qayyumabad: "Qayyumabad",
-  qayummabad: "Qayyumabad",
-  qaiyumabad: "Qayyumabad",
-  qyummabad: "Qayyumabad",
-  bahadurabad: "Bahadurabad",
-  bahadarabad: "Bahadurabad",
-  bahadrubad: "Bahadurabad",
-  bahardurabad: "Bahadurabad",
-  "azam town": "Azam Town",
-  "azam basti": "Azam Town",
-  "azam basti,": "Azam Town",
-  dalmia: "Dalmia",
-  airport: "Airport",
-  "khi airport": "Airport",
-};
-
-const normalizeAreaName = (areaName) => {
-  if (!areaName) return null;
-  const trimmed = String(areaName).trim();
-  if (!trimmed) return null;
-
-  const lower = trimmed.toLowerCase();
-
-  if (AREA_ALIASES[lower]) {
-    return AREA_ALIASES[lower];
-  }
-
-  const sortedAliases = Object.entries(AREA_ALIASES).sort(
-    (a, b) => b[0].length - a[0].length,
-  );
-  for (const [alias, canonical] of sortedAliases) {
-    if (lower.includes(alias)) {
-      return canonical;
-    }
-  }
-
-  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
-};
-
-// ============================================================
-// AREA HELPERS
-// ============================================================
-
-const findOrCreateNormalizedArea = async (areaName, caches) => {
-  const normalizedName = normalizeAreaName(areaName);
-  if (!normalizedName) return null;
-
-  const cacheKey = `area::${normalizedName.toLowerCase()}`;
-  if (caches?.areaCache?.has(cacheKey)) {
-    return caches.areaCache.get(cacheKey);
-  }
-
-  let area = await prisma.area.findFirst({
-    where: {
-      name: {
-        equals: normalizedName,
-        mode: "insensitive",
-      },
-    },
-  });
-
-  if (!area) {
-    area = await prisma.area.create({
-      data: {
-        name: normalizedName,
-        city: "Karachi",
-      },
-    });
-    console.log(
-      `[area] Created new area: "${normalizedName}" from "${areaName}"`,
-    );
-  }
-
-  caches?.areaCache?.set(cacheKey, area);
-  return area;
-};
-
-const getMainArea = async (employee, caches) => {
-  if (!employee) return null;
-
-  if (!caches) caches = {};
-  if (!caches.areaCache) {
-    caches.areaCache = new Map();
-  }
-
-  let rawAreaName = null;
-
-  if (employee.area?.name) {
-    rawAreaName = employee.area.name;
-  } else if (employee.areaId) {
-    try {
-      const cacheKey = `area::${employee.areaId}`;
-      let area = caches.areaCache.get(cacheKey);
-      if (area === undefined) {
-        area = await prisma.area.findUnique({ where: { id: employee.areaId } });
-        caches.areaCache.set(cacheKey, area || null);
-      }
-      rawAreaName = area?.name || null;
-    } catch (areaError) {
-      console.error(
-        `[weeklySchedule][getMainArea] area lookup failed for employee ${employee.employeeCode} ` +
-          `(areaId=${employee.areaId}): ${areaError.message}`,
-      );
-    }
-  }
-
-  if (!rawAreaName && employee.subAreaId) {
-    try {
-      const cacheKey = `subarea::${employee.subAreaId}`;
-      let subArea = caches.areaCache.get(cacheKey);
-      if (subArea === undefined) {
-        subArea = await prisma.subArea.findUnique({
-          where: { id: employee.subAreaId },
-          include: { area: true },
-        });
-        caches.areaCache.set(cacheKey, subArea || null);
-      }
-      rawAreaName = subArea?.area?.name || subArea?.name || null;
-    } catch (subAreaError) {
-      console.error(
-        `[weeklySchedule][getMainArea] subArea lookup failed for employee ${employee.employeeCode} ` +
-          `(subAreaId=${employee.subAreaId}): ${subAreaError.message}.`,
-      );
-    }
-  }
-
-  if (!rawAreaName) {
-    console.log(
-      `[weeklySchedule][getMainArea] employee ${employee.employeeCode} has no resolvable area ` +
-        `(areaId=${employee.areaId || "none"}, subAreaId=${employee.subAreaId || "none"}).`,
-    );
-    return null;
-  }
-
-  const mainArea = await findOrCreateNormalizedArea(rawAreaName, caches);
-  console.log(
-    `[weeklySchedule][getMainArea] employee ${employee.employeeCode}: "${rawAreaName}" -> "${mainArea?.name || "null"}"`,
-  );
-  return mainArea;
-};
-
-// ============================================================
-// findDriver
-// ============================================================
-
-const pickBestDriverCandidate = (candidates, normalizedVendor) => {
-  if (candidates.length === 0) return null;
-
-  if (candidates.length === 1) {
-    const driver = candidates[0];
-    const driverVendor = normalizeMatch(driver.vendor?.name);
-    const vehicleVendor = normalizeMatch(driver.vehicle?.vendor?.name);
-
-    let result = driver;
-    if (normalizedVendor) {
-      const vendorUnverifiable = !driverVendor && !vehicleVendor;
-      const vendorMismatch =
-        !vendorUnverifiable &&
-        driverVendor !== normalizedVendor &&
-        vehicleVendor !== normalizedVendor;
-      if (vendorUnverifiable || vendorMismatch) {
-        result.__matchWarning = true;
-      }
-    }
-    return result;
-  }
-
-  let filtered = candidates;
-  if (normalizedVendor) {
-    const vendorFiltered = filtered.filter((d) => {
-      const driverVendor = normalizeMatch(d.vendor?.name);
-      const vehicleVendor = normalizeMatch(d.vehicle?.vendor?.name);
-      return (
-        driverVendor === normalizedVendor || vehicleVendor === normalizedVendor
-      );
-    });
-    if (vendorFiltered.length > 0) filtered = vendorFiltered;
-  }
-
-  if (filtered.length === 1) {
-    const result = filtered[0];
-    if (normalizedVendor && filtered === candidates && candidates.length > 1) {
-      result.__matchWarning = true;
-    }
-    return result;
-  } else if (filtered.length > 1) {
-    const result = filtered[0];
-    result.__matchWarning = true;
-    return result;
-  }
-  return null;
-};
-
-const findDriver = async (
-  driverName,
-  vendorNameFromSheet,
-  vehicleTypeFromSheet,
-  cache,
-  extraCaches,
-) => {
-  const trimmedName = String(driverName || "").trim();
-  if (!trimmedName) return null;
-
-  const normalizedName = trimmedName.replace(/\s+/g, " ");
-  const normalizedVendor = normalizeMatch(vendorNameFromSheet);
-  const firstWord = normalizedName.split(" ")[0];
-
-  const cacheKey = `${normalizedName.toLowerCase()}::${normalizedVendor}`;
-  if (cache?.has(cacheKey)) return cache.get(cacheKey);
-
-  const driverInclude = {
-    vehicle: { include: { vendor: true } },
-    vendor: true,
-  };
-
-  const vendorClause = normalizedVendor
-    ? {
-        OR: [
-          {
-            vendor: { name: { equals: normalizedVendor, mode: "insensitive" } },
-          },
-          {
-            vehicle: {
-              vendor: {
-                name: { equals: normalizedVendor, mode: "insensitive" },
-              },
-            },
-          },
-        ],
-      }
-    : null;
-
-  let candidates = await prisma.driver.findMany({
-    where: { name: { equals: normalizedName, mode: "insensitive" } },
-    include: driverInclude,
-  });
-
-  let matchedLoosely = false;
-  if (candidates.length === 0 && firstWord && firstWord !== normalizedName) {
-    const nameClause = { name: { equals: firstWord, mode: "insensitive" } };
-
-    if (vendorClause) {
-      candidates = await prisma.driver.findMany({
-        where: { AND: [nameClause, vendorClause] },
-        include: driverInclude,
-      });
-      if (candidates.length) matchedLoosely = true;
-    }
-
-    if (candidates.length === 0) {
-      candidates = await prisma.driver.findMany({
-        where: nameClause,
-        include: driverInclude,
-      });
-      if (candidates.length) matchedLoosely = true;
-    }
-  }
-
-  if (candidates.length === 0 && firstWord) {
-    const nameClause = { name: { contains: firstWord, mode: "insensitive" } };
-
-    if (vendorClause) {
-      candidates = await prisma.driver.findMany({
-        where: { AND: [nameClause, vendorClause] },
-        include: driverInclude,
-      });
-      if (candidates.length) matchedLoosely = true;
-    }
-
-    if (candidates.length === 0) {
-      candidates = await prisma.driver.findMany({
-        where: nameClause,
-        include: driverInclude,
-      });
-      if (candidates.length) matchedLoosely = true;
-    }
-  }
-
-  const result = pickBestDriverCandidate(candidates, normalizedVendor);
-  if (result && matchedLoosely) result.__looseNameMatch = true;
-
-  cache?.set(cacheKey, result);
-  if (result) extraCaches?.driverById?.set(result.id, result);
-  return result;
-};
-
-const findVehicleByReg = async (vehicleReg, cache) => {
-  const trimmed = String(vehicleReg || "").trim();
-  if (!trimmed) return null;
-  const key = trimmed.toUpperCase();
-  if (cache?.has(key)) return cache.get(key);
-
-  const vehicle = await prisma.vehicle.findFirst({
-    where: { vehicleNumber: { equals: trimmed, mode: "insensitive" } },
-  });
-  cache?.set(key, vehicle || null);
-  return vehicle;
-};
-
-const ENTITY_VALUES = new Set(["IBEX", "VW"]);
-const normalizeEntity = (raw) => {
-  const key = String(raw || "")
-    .trim()
-    .toUpperCase();
-  return ENTITY_VALUES.has(key) ? key : null;
-};
-
-// ---------- Address Cross-Check ----------
-
-const ADDRESS_STOPWORDS = new Set([
-  "flat",
-  "floor",
-  "house",
-  "street",
-  "st",
-  "no",
-  "number",
-  "near",
-  "phase",
-  "block",
-  "society",
-  "road",
-  "karachi",
-  "apartment",
-  "apartments",
-  "building",
-  "plot",
-  "the",
-  "of",
-  "and",
-  "view",
-  "town",
-  "city",
-  "sector",
-  "area",
-  "opposite",
-  "behind",
-  "infront",
-  "front",
-  "gali",
-  "commercial",
-]);
-
-const normalizeAddressTokens = (raw) =>
-  new Set(
-    String(raw || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter((t) => t.length > 1 && !ADDRESS_STOPWORDS.has(t)),
-  );
-
-const ADDRESS_MATCH_THRESHOLD = 0.15;
-
-const analyzeAddressMatch = (sheetAddress, employee) => {
-  const sheetTokens = normalizeAddressTokens(sheetAddress);
-  if (sheetTokens.size === 0) {
-    return { isMatch: true, score: null, reason: null };
-  }
-
-  const taxonomyTokens = normalizeAddressTokens(
-    [employee.area?.name, employee.subArea?.name, employee.block?.name]
-      .filter(Boolean)
-      .join(" "),
-  );
-  const masterTokens = normalizeAddressTokens(employee.address);
-  const compareTokens = new Set([...masterTokens, ...taxonomyTokens]);
-  if (compareTokens.size === 0) {
-    return { isMatch: true, score: null, reason: null };
-  }
-
-  const intersection = [...sheetTokens].filter((t) => compareTokens.has(t));
-  const union = new Set([...sheetTokens, ...compareTokens]);
-  const score = intersection.length / union.size;
-  if (score >= ADDRESS_MATCH_THRESHOLD) {
-    return { isMatch: true, score, reason: null };
-  }
-
-  return {
-    isMatch: false,
-    score,
-    reason: `Sheet address ("${sheetAddress}") shares almost nothing with this employee's master-data address/area`,
-  };
-};
-
-// ---------- Conflict detection ----------
-
-const findDriverConflict = async (
-  driverId,
-  weekStartDate,
-  candidateShiftTiming,
-  targetTripId,
-  excludeEmployeeId,
-  caches,
-) => {
-  if (!driverId) return null;
-  const others = caches?.weekRoster
-    ? filterRoster(caches.weekRoster, {
-        driverId,
-        excludeTripId: targetTripId,
-        excludeEmployeeId,
-      })
-    : await prisma.weeklySchedule.findMany({
-        where: {
-          driverId,
-          weekStart: weekStartDate,
-          status: { not: "CANCELLED" },
-          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-          ...(excludeEmployeeId
-            ? { employeeId: { not: excludeEmployeeId } }
-            : {}),
-        },
-        include: { route: true },
-      });
-
-  const candidateRange = candidateShiftTiming
-    ? parseShiftRange(candidateShiftTiming)
-    : null;
-
-  for (const other of others) {
-    if (!candidateShiftTiming || !other.shiftTiming) return other;
-    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming))
-      return other;
-    const otherRange = parseShiftRange(other.shiftTiming);
-    if (
-      candidateRange &&
-      otherRange &&
-      !hasMinimumRest(candidateRange, otherRange)
-    )
-      return other;
-  }
-  return null;
-};
-
-const findVehicleConflict = async (
-  vehicleId,
-  weekStartDate,
-  candidateShiftTiming,
-  targetTripId,
-  excludeEmployeeId,
-  caches,
-) => {
-  if (!vehicleId) return null;
-  const others = caches?.weekRoster
-    ? filterRoster(caches.weekRoster, {
-        vehicleId,
-        excludeTripId: targetTripId,
-        excludeEmployeeId,
-      })
-    : await prisma.weeklySchedule.findMany({
-        where: {
-          vehicleId,
-          weekStart: weekStartDate,
-          status: { not: "CANCELLED" },
-          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-          ...(excludeEmployeeId
-            ? { employeeId: { not: excludeEmployeeId } }
-            : {}),
-        },
-        include: { route: true },
-      });
-
-  for (const other of others) {
-    if (!candidateShiftTiming || !other.shiftTiming) return other;
-    if (shiftTimesOverlap(candidateShiftTiming, other.shiftTiming))
-      return other;
-  }
-  return null;
-};
-
-// ---------- Auto-assignment ----------
-
-const findBestAvailableDriver = async (
-  weekStartDate,
-  candidateShiftTiming,
-  targetTripId,
-  excludeEmployeeId,
-  caches,
-) => {
-  const others = caches?.weekRoster
-    ? filterRoster(caches.weekRoster, {
-        excludeTripId: targetTripId,
-        excludeEmployeeId,
-      }).filter((r) => r.driverId)
-    : await prisma.weeklySchedule.findMany({
-        where: {
-          weekStart: weekStartDate,
-          status: { not: "CANCELLED" },
-          driverId: { not: null },
-          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-          ...(excludeEmployeeId
-            ? { employeeId: { not: excludeEmployeeId } }
-            : {}),
-        },
-        select: { driverId: true, shiftTiming: true },
-      });
-
-  const candidateRange = candidateShiftTiming
-    ? parseShiftRange(candidateShiftTiming)
-    : null;
-  const busyIds = new Set();
-  const loadMap = new Map();
-  for (const row of others) {
-    loadMap.set(row.driverId, (loadMap.get(row.driverId) || 0) + 1);
-    if (!candidateShiftTiming || !row.shiftTiming) {
-      busyIds.add(row.driverId);
-      continue;
-    }
-    if (shiftTimesOverlap(candidateShiftTiming, row.shiftTiming)) {
-      busyIds.add(row.driverId);
-      continue;
-    }
-    const otherRange = parseShiftRange(row.shiftTiming);
-    if (
-      candidateRange &&
-      otherRange &&
-      !hasMinimumRest(candidateRange, otherRange)
-    ) {
-      busyIds.add(row.driverId);
-    }
-  }
-
-  const eligible = caches?.availableDrivers
-    ? caches.availableDrivers.filter((d) => !busyIds.size || !busyIds.has(d.id))
-    : await prisma.driver.findMany({
-        where: {
-          status: "AVAILABLE",
-          ...(busyIds.size ? { id: { notIn: Array.from(busyIds) } } : {}),
-        },
-        include: { vehicle: true },
-        orderBy: { createdAt: "asc" },
-      });
-  if (!eligible.length) return null;
-  if (eligible.length === 1) return eligible[0];
-
-  let best = eligible[0];
-  let bestLoad = loadMap.get(best.id) || 0;
-  for (const driver of eligible.slice(1)) {
-    const load = loadMap.get(driver.id) || 0;
-    if (load < bestLoad) {
-      best = driver;
-      bestLoad = load;
-    }
-  }
-  return best;
-};
-
-const findBestAvailableVehicle = async (
-  weekStartDate,
-  candidateShiftTiming,
-  targetTripId,
-  vehicleTypeHint,
-  excludeEmployeeId,
-  caches,
-) => {
-  const others = caches?.weekRoster
-    ? filterRoster(caches.weekRoster, {
-        excludeTripId: targetTripId,
-        excludeEmployeeId,
-      }).filter((r) => r.vehicleId)
-    : await prisma.weeklySchedule.findMany({
-        where: {
-          weekStart: weekStartDate,
-          status: { not: "CANCELLED" },
-          vehicleId: { not: null },
-          ...(targetTripId ? { tripId: { not: targetTripId } } : {}),
-          ...(excludeEmployeeId
-            ? { employeeId: { not: excludeEmployeeId } }
-            : {}),
-        },
-        select: { vehicleId: true, shiftTiming: true },
-      });
-  const busyIds = [];
-  for (const row of others) {
-    if (
-      !candidateShiftTiming ||
-      !row.shiftTiming ||
-      shiftTimesOverlap(candidateShiftTiming, row.shiftTiming)
-    ) {
-      busyIds.push(row.vehicleId);
-    }
-  }
-
-  const typeKey = normalizeVehicleType(vehicleTypeHint);
-
-  if (caches?.activeVehicles) {
-    const candidates = caches.activeVehicles.filter(
-      (v) => !busyIds.length || !busyIds.includes(v.id),
-    );
-
-    if (typeKey && VEHICLE_TYPES.has(typeKey)) {
-      const typed = candidates.find((v) => v.type === typeKey);
-      if (typed) return typed;
-    }
-    return candidates[0] || null;
-  }
-
-  const baseWhere = {
-    status: "ACTIVE",
-    ...(busyIds.length ? { id: { notIn: busyIds } } : {}),
-  };
-
-  if (typeKey && VEHICLE_TYPES.has(typeKey)) {
-    const typed = await prisma.vehicle.findFirst({
-      where: { ...baseWhere, type: typeKey },
-    });
-    if (typed) return typed;
-  }
-
-  return prisma.vehicle.findFirst({
-    where: baseWhere,
-  });
-};
-
-const autoAssignDriverAndVehicle = async (
-  weekStartDate,
-  candidateShiftTiming,
-  targetTripId,
-  vehicleTypeHint,
-  excludeEmployeeId,
-  caches,
-) => {
-  const driver = await findBestAvailableDriver(
-    weekStartDate,
-    candidateShiftTiming,
-    targetTripId,
-    excludeEmployeeId,
-    caches,
-  );
-  if (!driver) {
-    return { driverId: null, vehicleId: null };
-  }
-
-  let vehicle =
-    driver.vehicle && driver.vehicle.status === "ACTIVE"
-      ? driver.vehicle
-      : null;
-
-  if (!vehicle) {
-    console.log(
-      `[autoAssign] Driver ${driver.name} (${driver.id}) has no vehicle, creating placeholder...`,
-    );
-    const vendorName = driver.vendor?.name || "MTS";
-    const vehicleType = vehicleTypeHint || "CAR";
-
-    vehicle = await findOrCreateVehicleForDriver(
-      driver.id,
-      vendorName,
-      vehicleType,
-      caches,
-    );
-  }
-
-  if (!vehicle) {
-    vehicle = await findBestAvailableVehicle(
-      weekStartDate,
-      candidateShiftTiming,
-      targetTripId,
-      vehicleTypeHint,
-      excludeEmployeeId,
-      caches,
-    );
-  }
-
-  if (!vehicle) {
-    const vendorName = driver.vendor?.name || "MTS";
-    const vehicleType = vehicleTypeHint || "CAR";
-
-    vehicle = await findOrCreateVehicleForDriver(
-      driver.id,
-      vendorName,
-      vehicleType,
-      caches,
-    );
-  }
-
-  if (vehicle) {
-    console.log(
-      `[autoAssign] Driver ${driver.name} assigned to vehicle ${vehicle.vehicleNumber} (${vehicle.id})`,
-    );
-  } else {
-    console.warn(
-      `[autoAssign] Driver ${driver.name} has NO vehicle available!`,
-    );
-  }
-
-  return {
-    driverId: driver.id,
-    vehicleId: vehicle?.id || null,
-  };
-};
-
-// ============================================================
-// findOrCreateVehicleForDriver
-// ============================================================
-
-const findOrCreateVehicleForDriver = async (
-  driverId,
-  vendorName,
-  vehicleType,
-  caches,
-) => {
-  if (!driverId) return null;
-
-  let driver = caches?.driverById?.get(driverId);
-  if (!driver) {
-    driver = await prisma.driver.findUnique({
-      where: { id: driverId },
-      include: { vehicle: true },
-    });
-    if (driver) caches?.driverById?.set(driverId, driver);
-  }
-
-  if (driver?.vehicle?.id) {
-    const cached = caches?.vehicle?.get(driver.vehicle.id);
-    if (cached) return cached;
-    const existingVehicle = await prisma.vehicle.findUnique({
-      where: { id: driver.vehicle.id },
-    });
-    if (existingVehicle) {
-      caches?.vehicle?.set(existingVehicle.id, existingVehicle);
-      return existingVehicle;
-    }
-  }
-
-  const anyExistingVehicle = await prisma.vehicle.findFirst({
-    where: { driverId },
-  });
-  if (anyExistingVehicle) {
-    caches?.vehicle?.set(anyExistingVehicle.id, anyExistingVehicle);
-    if (driver) {
-      driver.vehicle = anyExistingVehicle;
-      caches?.driverById?.set(driverId, driver);
-    }
-    return anyExistingVehicle;
-  }
-
-  const vendor = await findVendor(vendorName, caches?.vendor);
-  const vehicleTypeNorm = normalizeVehicleType(vehicleType);
-
-  if (vendor && vehicleTypeNorm && VEHICLE_TYPES.has(vehicleTypeNorm)) {
-    const existingVehicle = await prisma.vehicle.findFirst({
-      where: {
-        vendorId: vendor.id,
-        type: vehicleTypeNorm,
-        driverId: null,
-        status: "ACTIVE",
-      },
-    });
-
-    if (existingVehicle) {
-      const updated = await prisma.vehicle.update({
-        where: { id: existingVehicle.id },
-        data: { driverId: driverId },
-      });
-      caches?.vehicle?.set(updated.id, updated);
-      if (driver) {
-        driver.vehicle = updated;
-        caches?.driverById?.set(driverId, driver);
-      }
-      return updated;
-    }
-  }
-
-  const driverName = driver?.name || "UNKNOWN";
-  const timestamp = Date.now().toString().slice(-6);
-  const vehicleNumber = `TEMP-${driverName.toUpperCase().replace(/\s+/g, "-")}-${timestamp}`;
-
-  const DEFAULT_CAPACITY = {
-    CAR: 4,
-    VAN: 12,
-    HIJET: 10,
-    KARVAN: 15,
-    BUS: 40,
-  };
-
-  let newVehicle;
-  try {
-    newVehicle = await prisma.vehicle.create({
-      data: {
-        vehicleNumber: vehicleNumber,
-        type: vehicleTypeNorm || "CAR",
-        capacity: DEFAULT_CAPACITY[vehicleTypeNorm] || 4,
-        status: "ACTIVE",
-        vendorId: vendor?.id || null,
-        driverId: driverId,
-        notes: `Placeholder vehicle created from sheet upload. Original vendor: ${vendorName || "N/A"}, Type: ${vehicleType || "N/A"}. Replace with actual vehicle when available.`,
-      },
-    });
-    console.log(
-      `[findOrCreateVehicleForDriver] Created placeholder vehicle ${vehicleNumber} for driver ${driverId}`,
-    );
-  } catch (createError) {
-    if (createError?.code === "P2002") {
-      const settled = await prisma.vehicle.findFirst({ where: { driverId } });
-      if (settled) {
-        caches?.vehicle?.set(settled.id, settled);
-        if (driver) {
-          driver.vehicle = settled;
-          caches?.driverById?.set(driverId, driver);
-        }
-        return settled;
-      }
-    }
-    throw createError;
-  }
-
-  caches?.vehicle?.set(newVehicle.id, newVehicle);
-  if (driver) {
-    driver.vehicle = newVehicle;
-    caches?.driverById?.set(driverId, driver);
-  }
-
-  return newVehicle;
-};
-
-// ============================================================
-// resolveConflictFreeAssignment
-// ============================================================
-
-const resolveConflictFreeAssignment = async ({
-  trip,
-  weekStartDate,
-  candidateShiftTiming,
-  proposedDriverId,
-  proposedVehicleId,
-  vehicleTypeHint,
-  excludeEmployeeId,
-  caches,
-  options,
-}) => {
-  const notes = [];
-  let driverId = proposedDriverId || trip.driverId || undefined;
-  let vehicleId = proposedVehicleId || trip.vehicleId || undefined;
-
-  const sheetSpecifiedDriver = proposedDriverId;
-  const sheetSpecifiedVehicle = proposedVehicleId;
-
-  if (sheetSpecifiedDriver) {
-    if (trip.driverId && trip.driverId !== sheetSpecifiedDriver) {
-      const updatedTrip = await prisma.trip.update({
-        where: { id: trip.id },
-        data: { driverId: sheetSpecifiedDriver },
-        include: { vehicle: true, route: true },
-      });
-
-      if (caches) {
-        caches.tripById?.set(trip.id, updatedTrip);
-        caches.tripIdByDriver?.set(sheetSpecifiedDriver, trip.id);
-        caches.tripDriverMap?.set(trip.id, sheetSpecifiedDriver);
-
-        if (trip.driverId) {
-          const oldTripId = caches.tripIdByDriver?.get(trip.driverId);
-          if (oldTripId === trip.id) {
-            caches.tripIdByDriver?.delete(trip.driverId);
-          }
-        }
-      }
-
-      trip.driverId = sheetSpecifiedDriver;
-      trip.driver = updatedTrip.driver;
-      notes.push(`Force-updated trip to use sheet-specified driver`);
-    }
-
-    driverId = sheetSpecifiedDriver;
-
-    if (sheetSpecifiedVehicle) {
-      if (trip.vehicleId && trip.vehicleId !== sheetSpecifiedVehicle) {
-        await prisma.trip.update({
-          where: { id: trip.id },
-          data: { vehicleId: sheetSpecifiedVehicle },
-        });
-        trip.vehicleId = sheetSpecifiedVehicle;
-        notes.push(`Force-updated trip to use sheet-specified vehicle`);
-      }
-      vehicleId = sheetSpecifiedVehicle;
-    }
-  }
-
-  if (driverId && trip.driverId && driverId !== trip.driverId) {
-    notes.push(
-      `This row's named driver differs from another employee's driver sharing Trip #${trip.tripNumber ?? ""} on this route — kept THIS row's own driver as named in the sheet.`,
-    );
-
-    await prisma.trip.update({
-      where: { id: trip.id },
-      data: { driverId: driverId },
-    });
-    trip.driverId = driverId;
-
-    if (caches) {
-      caches.tripIdByDriver?.set(driverId, trip.id);
-      caches.tripDriverMap?.set(trip.id, driverId);
-    }
-  }
-
-  if (vehicleId && trip.vehicleId && vehicleId !== trip.vehicleId) {
-    notes.push(
-      `This row's named vehicle differs from another employee's vehicle sharing Trip #${trip.tripNumber ?? ""} on this route — kept THIS row's own vehicle as named in the sheet.`,
-    );
-
-    await prisma.trip.update({
-      where: { id: trip.id },
-      data: { vehicleId: vehicleId },
-    });
-    trip.vehicleId = vehicleId;
-  }
-
-  let autoAssignedDriver = false;
-  let autoAssignedVehicle = false;
-  const shiftTiming =
-    candidateShiftTiming || trip.shiftTiming || trip.route?.shiftTiming;
-
-  if (driverId) {
-    const conflict = await findDriverConflict(
-      driverId,
-      weekStartDate,
-      shiftTiming,
-      trip.id,
-      excludeEmployeeId,
-      caches,
-    );
-    if (conflict) {
-      notes.push(
-        `Driver's shift may overlap route "${conflict.route?.routeCode ?? conflict.routeId}" this week — kept as assigned in the sheet; please double-check manually.`,
-      );
-    }
-
-    const hoursCheck = await checkDriverWorkingHours(
-      prisma,
-      driverId,
-      weekStartDate,
-      shiftTiming,
-      undefined,
-      excludeEmployeeId,
-      caches,
-    );
-    if (!hoursCheck.ok) {
-      notes.push(
-        `Driver may exceed working-hours limits this week — ${hoursCheck.reason} Kept as assigned in the sheet; please double-check manually.`,
-      );
-    }
-  } else if (options?.skipAutoAssignDriver) {
-    notes.push(
-      "Sheet named a driver that couldn't be matched to master data — left unassigned rather than auto-assigning a different driver. Please review manually.",
-    );
-  } else {
-    const best = await autoAssignDriverAndVehicle(
-      weekStartDate,
-      shiftTiming,
-      trip.id,
-      vehicleTypeHint,
-      excludeEmployeeId,
-      caches,
-    );
-    if (best.driverId) {
-      driverId = best.driverId;
-      autoAssignedDriver = true;
-      if (!vehicleId && best.vehicleId) {
-        vehicleId = best.vehicleId;
-        autoAssignedVehicle = true;
-      }
-    } else {
-      notes.push("No available driver found for this row — left unassigned.");
-    }
-  }
-
-  if (vehicleId) {
-    const conflict = await findVehicleConflict(
-      vehicleId,
-      weekStartDate,
-      shiftTiming,
-      trip.id,
-      excludeEmployeeId,
-      caches,
-    );
-    if (conflict) {
-      notes.push(
-        `Vehicle's shift may overlap route "${conflict.route?.routeCode ?? conflict.routeId}" this week — kept as assigned in the sheet; please double-check manually.`,
-      );
-    }
-  } else if (driverId) {
-    const vehicle = await findOrCreateVehicleForDriver(
-      driverId,
-      null,
-      vehicleTypeHint,
-      caches,
-    );
-    if (vehicle) {
-      vehicleId = vehicle.id;
-      autoAssignedVehicle = true;
-      if (vehicle.notes?.includes("Placeholder")) {
-        notes.push(
-          `Created placeholder vehicle "${vehicle.vehicleNumber}" for driver. Replace with actual vehicle when available.`,
-        );
-      }
-    } else {
-      notes.push(
-        "No vehicle found for this driver and unable to create placeholder — left unassigned.",
-      );
-    }
-  }
-
-  const tripDriverNeedsUpdate = !trip.driverId && driverId;
-  const tripVehicleNeedsUpdate = !trip.vehicleId && vehicleId;
-
-  if (tripDriverNeedsUpdate || tripVehicleNeedsUpdate) {
-    const updatedTrip = await prisma.trip.update({
-      where: { id: trip.id },
-      data: {
-        ...(tripDriverNeedsUpdate ? { driverId } : {}),
-        ...(tripVehicleNeedsUpdate ? { vehicleId } : {}),
-      },
-      include: { vehicle: true, route: true },
-    });
-    caches?.tripsByRoute?.delete(trip.routeId);
-
-    if (driverId) caches?.tripIdByDriver?.set(driverId, trip.id);
-    caches?.tripById?.set(trip.id, updatedTrip);
-  } else {
-    if (driverId) caches?.tripIdByDriver?.set(driverId, trip.id);
-  }
-
-  return {
-    driverId,
-    vehicleId,
-    autoAssignedDriver,
-    autoAssignedVehicle,
-    notes,
-  };
-};
-
-const findOrCreateTripOnRouteWithCapacity = async (
-  route,
-  vehicleType,
-  shiftTiming,
-  driverId,
-  vehicleIdHint,
-  weekStartDate,
-  excludeEmployeeId,
-  caches,
-  options = {},
-  vendorName,
-) => {
-  // Force driver ID if specified in options
-  const requestedDriverId = options?.forceDriverId || driverId;
-  const requestedVehicleId = vehicleIdHint;
-
-  if (!route || !route.id) {
-    console.error("[Trip create] Invalid route:", route);
-    throw new Error(
-      `Route object is missing or has no id: ${JSON.stringify(route)}`,
-    );
-  }
-
-  let trips = caches?.tripsByRoute?.get(route.id);
-  if (!trips) {
-    trips = await prisma.trip.findMany({
-      where: { routeId: route.id, status: "ACTIVE" },
-      include: { vehicle: { include: { vendor: true } } },
-      orderBy: { tripNumber: "asc" },
-    });
-    if (caches) {
-      caches.tripsByRoute = caches.tripsByRoute || new Map();
-      caches.tripsByRoute.set(route.id, trips);
-    }
-  }
-  const hadExistingTrips = trips && trips.length > 0;
-
-  let trip = null;
-  let overCapacity = false;
-  const notes = [];
-
-  if (requestedDriverId && trips && trips.length > 0) {
-    const driverTrips = trips.filter((t) => t.driverId === requestedDriverId);
-
-    if (driverTrips.length > 0) {
-      for (const candidateTrip of driverTrips) {
-        const capacity =
-          candidateTrip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
-        const occupancy =
-          caches?.tripOccupancy?.get(candidateTrip.id) ||
-          caches?.weekRoster?.filter((r) => r.tripId === candidateTrip.id)
-            .length ||
-          0;
-
-        if (occupancy < capacity) {
-          trip = candidateTrip;
-          break;
-        }
-      }
-    }
-  }
-
-  if (!trip && !requestedDriverId && trips && trips.length > 0) {
-    const sortedTrips = [...trips].sort((a, b) => {
-      const aOcc = caches?.tripOccupancy?.get(a.id) || 0;
-      const bOcc = caches?.tripOccupancy?.get(b.id) || 0;
-      return bOcc - aOcc;
-    });
-
-    for (const candidate of sortedTrips) {
-      const capacity =
-        candidate.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
-      const occupancy = caches?.tripOccupancy?.get(candidate.id) || 0;
-
-      if (occupancy < capacity) {
-        trip = candidate;
-        break;
-      }
-    }
-  }
-
-  if (!trip) {
-    if (options && options.allowCreate === false) {
-      return {
-        trip: null,
-        newTrip: false,
-        overCapacity: false,
-        notes: [...notes, "Trip creation deferred for batch optimization."],
-        deferred: true,
-      };
-    }
-
-    let safeDriverId = requestedDriverId || null;
-    let safeVehicleId = requestedVehicleId || null;
-
-    if (!safeDriverId) {
-      const best = await autoAssignDriverAndVehicle(
-        weekStartDate,
-        shiftTiming,
-        null,
-        vehicleType,
-        excludeEmployeeId,
-        caches,
-      );
-      if (best && best.driverId) {
-        safeDriverId = best.driverId;
-        safeVehicleId = best.vehicleId || null;
-        notes.push(`Driver auto-assigned: ${safeDriverId}`);
-      } else {
-        throw new Error(
-          "Cannot create trip: No driver available for this trip",
-        );
-      }
-    }
-
-    if (safeDriverId && !safeVehicleId) {
-      const vehicle = await findOrCreateVehicleForDriver(
-        safeDriverId,
-        vendorName || "MTS",
-        vehicleType || "CAR",
-        caches,
-      );
-      if (vehicle) {
-        safeVehicleId = vehicle.id;
-        if (vehicle.notes && vehicle.notes.includes("Placeholder")) {
-          notes.push(
-            `Created placeholder vehicle "${vehicle.vehicleNumber}" for driver "${safeDriverId}". Replace with actual vehicle when available.`,
-          );
-        }
-      } else {
-        throw new Error(
-          `Driver ${safeDriverId} has no vehicle and couldn't create one`,
-        );
-      }
-    }
-
-    if (safeDriverId) {
-      const driverConflict = await findDriverConflict(
-        safeDriverId,
-        weekStartDate,
-        shiftTiming,
-        null,
-        excludeEmployeeId,
-        caches,
-      );
-      if (driverConflict) {
-        notes.push(
-          `Driver's shift may overlap route "${driverConflict.route?.routeCode || driverConflict.routeId}" this week — kept as named in the sheet; please double-check manually.`,
-        );
-      }
-    }
-
-    if (safeVehicleId) {
-      const vehicleConflict = await findVehicleConflict(
-        safeVehicleId,
-        weekStartDate,
-        shiftTiming,
-        null,
-        excludeEmployeeId,
-        caches,
-      );
-      if (vehicleConflict) {
-        notes.push(
-          `Vehicle's shift may overlap route "${vehicleConflict.route?.routeCode || vehicleConflict.routeId}" this week — kept as named in the sheet; please double-check manually.`,
-        );
-      }
-    }
-
-    const MAX_TRIP_NUMBER_ATTEMPTS = 5;
-    let lastTripCreateError;
-    let currentTrips = trips || [];
-
-    for (let attempt = 1; attempt <= MAX_TRIP_NUMBER_ATTEMPTS; attempt += 1) {
-      const nextTripNumber =
-        currentTrips.length > 0
-          ? Math.max(...currentTrips.map((t) => t.tripNumber)) + 1
-          : 1;
-
-      try {
-        const createData = {
-          routeId: route.id,
-          tripNumber: nextTripNumber,
-          driverId: safeDriverId,
-          vehicleId: safeVehicleId || null,
-          shiftTiming: shiftTiming || null,
-        };
-
-        trip = await prisma.trip.create({
-          data: createData,
-          include: { vehicle: true },
-        });
-
-        if (trip) {
-          if (!trips) trips = [];
-          trips.push(trip);
-          if (caches) {
-            caches.tripsByRoute = caches.tripsByRoute || new Map();
-            caches.tripsByRoute.set(route.id, trips);
-            caches.tripOccupancy = caches.tripOccupancy || new Map();
-            caches.tripOccupancy.set(trip.id, 1);
-            if (trip.driverId) {
-              caches.tripIdByDriver = caches.tripIdByDriver || new Map();
-              caches.tripIdByDriver.set(trip.driverId, trip.id);
-              caches.tripDriverMap = caches.tripDriverMap || new Map();
-              caches.tripDriverMap.set(trip.id, trip.driverId);
-            }
-            caches.tripById = caches.tripById || new Map();
-            trip.route = route;
-            caches.tripById.set(trip.id, trip);
-          }
-        }
-
-        lastTripCreateError = undefined;
-        break;
-      } catch (createErr) {
-        if (createErr?.code !== "P2002") {
-          throw createErr;
-        }
-        lastTripCreateError = createErr;
-        currentTrips = await prisma.trip.findMany({
-          where: { routeId: route.id, status: "ACTIVE" },
-          include: { vehicle: { include: { vendor: true } } },
-          orderBy: { tripNumber: "asc" },
-        });
-      }
-    }
-
-    if (lastTripCreateError) {
-      const guaranteedTripNumber =
-        (currentTrips.length > 0
-          ? Math.max(...currentTrips.map((t) => t.tripNumber))
-          : 0) +
-        1000 +
-        Math.floor(Math.random() * 1000);
-
-      trip = await prisma.trip.create({
-        data: {
-          routeId: route.id,
-          tripNumber: guaranteedTripNumber,
-          driverId: safeDriverId,
-          vehicleId: safeVehicleId || null,
-          shiftTiming: shiftTiming || null,
-        },
-        include: { vehicle: true },
-      });
-    }
-
-    if (trip) {
-      await syncRouteFromTrips(route.id, caches, trips);
-      return { trip, newTrip: true, overCapacity: false, notes };
-    } else {
-      throw new Error(
-        "Failed to create trip - trip is null after creation attempts",
-      );
-    }
-  }
-
-  if (trip) {
-    if (trip.driverId && caches) {
-      caches.tripIdByDriver = caches.tripIdByDriver || new Map();
-      caches.tripIdByDriver.set(trip.driverId, trip.id);
-      caches.tripDriverMap = caches.tripDriverMap || new Map();
-      caches.tripDriverMap.set(trip.id, trip.driverId);
-    }
-    trip.route = route;
-    if (caches) {
-      caches.tripById = caches.tripById || new Map();
-      caches.tripById.set(trip.id, trip);
-    }
-  }
-
-  return { trip, newTrip: false, overCapacity, notes };
-};
-
-// ---------- Lookup functions ----------
-
-const findVendor = async (name, cache) => {
-  const trimmed = String(name || "").trim();
-  if (!trimmed) return null;
-  const key = trimmed.toLowerCase();
-  if (cache?.has(key)) return cache.get(key);
-
-  const vendor = await prisma.vendor.findFirst({
-    where: { name: { equals: trimmed, mode: "insensitive" } },
-  });
-  cache?.set(key, vendor || null);
-  return vendor;
-};
-
-const findEmployee = async (employeeCode, caches) => {
-  if (caches?.employee?.has(employeeCode)) {
-    return caches.employee.get(employeeCode) || null;
-  }
-  const employee = await prisma.employee.findUnique({
-    where: { employeeCode },
-    include: { area: true, subArea: true, block: true },
-  });
-  caches?.employee?.set(employeeCode, employee || null);
-  return employee;
-};
-
-// ---------- Route / Trip creation ----------
-
-const slugify = (s) =>
-  String(s || "")
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-const DEFAULT_CAPACITY_BY_VEHICLE_TYPE = {
-  CAR: 4,
-  VAN: 12,
-  HIJET: 10,
-  KARVAN: 15,
-  BUS: 40,
-};
-const FALLBACK_ROUTE_CAPACITY = 10;
-
-const guessMaxCapacity = (vehicleTypeRaw) => {
-  const key = normalizeVehicleType(vehicleTypeRaw);
-  return DEFAULT_CAPACITY_BY_VEHICLE_TYPE[key] || FALLBACK_ROUTE_CAPACITY;
-};
-
-const countTripOccupancy = async (tripId, weekStartDate, excludeEmployeeId) => {
-  return prisma.weeklySchedule.count({
-    where: {
-      tripId,
-      weekStart: weekStartDate,
-      status: { not: "CANCELLED" },
-      ...(excludeEmployeeId ? { employeeId: { not: excludeEmployeeId } } : {}),
-    },
-  });
-};
-
-const generateUniqueRouteCode = async (baseCode) => {
-  let candidate = baseCode;
-  let n = 1;
-  while (await prisma.route.findUnique({ where: { routeCode: candidate } })) {
-    n += 1;
-    candidate = `${baseCode}-L${n}`;
-  }
-  return candidate;
-};
-
-const syncRouteFromTrips = async (routeId, caches, tripsHint) => {
-  const trips =
-    tripsHint ||
-    (await prisma.trip.findMany({
-      where: { routeId, status: "ACTIVE" },
-      include: { vehicle: true },
-      orderBy: { tripNumber: "asc" },
-    }));
-
-  const cachedRoute = caches?.routeById?.get(routeId);
-  if (cachedRoute) {
-    return cachedRoute;
-  }
-
-  const updated = await prisma.route.update({
-    where: { id: routeId },
-    data: {},
-    include: { area: true },
-  });
-  caches?.routeById?.set(routeId, updated);
-  return updated;
-};
-
-// ============================================================
-// findExistingTripForDriverThisWeek
-// ============================================================
-
-const findExistingTripForDriverThisWeek = async (
-  driverId,
-  shiftTiming,
-  vehicleType,
-  weekStartDate,
-  excludeEmployeeId,
-  caches,
-  options = {},
-  areaRecord,
-) => {
-  if (!driverId || !caches?.tripIdByDriver) return null;
-  const tripId = caches.tripIdByDriver.get(driverId);
-  if (!tripId) return null;
-
-  let trip = caches?.tripById?.get(tripId);
-  if (!trip) {
-    trip = await prisma.trip.findUnique({
-      where: { id: tripId },
-      include: {
-        vehicle: { include: { vendor: true } },
-        route: { include: { area: true } },
-      },
-    });
-    if (trip) caches?.tripById?.set(tripId, trip);
-  }
-  if (!trip || trip.status !== "ACTIVE" || trip.driverId !== driverId) {
-    return null;
-  }
-
-  if (areaRecord && trip.route?.areaId && trip.route.areaId !== areaRecord.id) {
-    return null;
-  }
-
-  const tripShiftTiming = trip.shiftTiming || trip.route?.shiftTiming;
-  const candidateRange = parseShiftRange(shiftTiming);
-  const tripRange = parseShiftRange(tripShiftTiming);
-  const sameShift =
-    candidateRange && tripRange
-      ? candidateRange.start === tripRange.start &&
-        candidateRange.durationMinutes === tripRange.durationMinutes
-      : normalizeShift(shiftTiming) === normalizeShift(tripShiftTiming);
-  if (!sameShift) return null;
-
-  const capacity = trip.vehicle?.capacity ?? guessMaxCapacity(vehicleType);
-  const occupancy = caches?.weekRoster
-    ? caches.weekRoster.filter(
-        (r) =>
-          r.tripId === trip.id &&
-          (!excludeEmployeeId || r.employeeId !== excludeEmployeeId),
-      ).length
-    : await countTripOccupancy(trip.id, weekStartDate, excludeEmployeeId);
-  const overCapacity = occupancy >= capacity;
-
-  if (overCapacity && !options.disableMultiTrip) return null;
-
-  return { trip, route: trip.route, overCapacity };
-};
-
-// ============================================================
-// findOrCreateRouteAndTrip - UPDATED WITH CAPACITY AWARENESS
-// ============================================================
-
-const findOrCreateRouteAndTrip = async (
-  areaRecord,
-  vehicleType,
-  shiftTiming,
-  campaign,
-  driverId,
-  vehicleIdHint,
-  weekStartDate,
-  excludeEmployeeId,
-  caches,
-  options = {},
-  vendorName,
-  location, // <-- ADD THIS
-  vehicleEntity, // <-- ADD THIS
-) => {
-  const requestedDriverId = driverId;
-
-  if (requestedDriverId) {
-    const existingTrip = await findExistingTripForDriverThisWeek(
-      requestedDriverId,
-      shiftTiming,
-      vehicleType,
-      weekStartDate,
-      excludeEmployeeId,
-      caches,
-      options,
-      areaRecord,
-    );
-    if (existingTrip) {
-      return {
-        route: existingTrip.route,
-        trip: existingTrip.trip,
-        created: false,
-        newTrip: false,
-        overCapacity: existingTrip.overCapacity || false,
-        notes: existingTrip.overCapacity
-          ? [
-              `Trip #${existingTrip.trip.tripNumber} (driver already on it this week/shift) is at/over its vehicle's capacity — added anyway per current settings; needs manual review.`,
-            ]
-          : [],
-      };
-    }
-  }
-
-  let route = null;
-  let routeCreated = false;
-
-  if (areaRecord) {
-    let candidates = caches?.routesByArea?.get(areaRecord.id);
-    if (!candidates) {
-      candidates = await prisma.route.findMany({
-        where: { areaId: areaRecord.id },
-        include: { area: true },
-        orderBy: { routeCode: "asc" },
-      });
-      caches?.routesByArea?.set(areaRecord.id, candidates);
-    }
-
-    if (shiftTiming) {
-      const shiftNorm = normalizeShift(shiftTiming);
-      route = candidates.find((r) => {
-        const rShiftNorm = normalizeShift(r.shiftTiming);
-        return rShiftNorm === shiftNorm;
-      });
-    } else {
-      route = candidates[0] || null;
-    }
-  }
-
-  if (!route) {
-    // ========== FIX: Add location and vehicleEntity to route name ==========
-    const nameParts = [areaRecord?.name, shiftTiming, location].filter(Boolean);
-
-    const baseName = nameParts.join(" - ") || campaign || "General Route";
-    // ========== END FIX ==========
-
-    const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
-
-    const MAX_ROUTE_CODE_ATTEMPTS = 5;
-    let lastRouteCreateError;
-    for (let attempt = 1; attempt <= MAX_ROUTE_CODE_ATTEMPTS; attempt += 1) {
-      const routeCode = await generateUniqueRouteCode(baseCode);
-      try {
-        route = await prisma.route.create({
-          data: {
-            routeName: baseName,
-            routeCode,
-            shiftTiming: shiftTiming || undefined,
-            areaId: areaRecord?.id,
-          },
-          include: { area: true },
-        });
-        lastRouteCreateError = undefined;
-        break;
-      } catch (createErr) {
-        if (createErr?.code !== "P2002") throw createErr;
-        lastRouteCreateError = createErr;
-      }
-    }
-
-    if (lastRouteCreateError) {
-      const guaranteedCode = `${baseCode}-${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 6)}`;
-      route = await prisma.route.create({
-        data: {
-          routeName: baseName,
-          routeCode: guaranteedCode,
-          shiftTiming: shiftTiming || undefined,
-          areaId: areaRecord?.id,
-        },
-        include: { area: true },
-      });
-    }
-    routeCreated = true;
-    if (areaRecord) caches?.routesByArea?.delete(areaRecord.id);
-    console.log(
-      `[weeklySchedule] Created new route: "${route.routeCode}" ` +
-        `for area "${areaRecord?.name || "unknown"}" shift "${shiftTiming}"` +
-        ` location "${location}" vehicleEntity "${vehicleEntity}"`,
-    );
-  }
-
-  const {
-    trip,
-    newTrip,
-    overCapacity,
-    notes: tripNotes,
-  } = await findOrCreateTripOnRouteWithCapacity(
-    route,
-    vehicleType,
-    shiftTiming,
-    requestedDriverId,
-    vehicleIdHint,
-    weekStartDate,
-    excludeEmployeeId,
-    caches,
-    { ...options, forceDriverId: requestedDriverId },
-    vendorName,
-  );
-
-  route = caches?.routeById?.get(route.id) || route;
-
-  return {
-    route,
-    trip,
-    created: routeCreated,
-    newTrip,
-    overCapacity,
-    notes: tripNotes || [],
-  };
-};
-
-// ============================================================
-// resolvePendingVehicleAssignments
-// ============================================================
+const {
+  toDateOnly,
+  formatDateOnly,
+  mondayOfCurrentWeek,
+  toShiftTimeDate,
+  toIsoOrNull,
+  computePickupTime,
+  DAY_KEYS,
+} = require("../../../utils/dateTimeHelpers");
+const {
+  normalizeEntity,
+  normalizeVehicleType,
+  HEADER_ALIASES,
+} = require("../../../utils/xlsxParsing");
+const { tryAcquireWeekAreaLock } = require("../../../utils/locking");
+
+const {
+  findVehicleConflict,
+} = require("../../../services/conflictDetection.service");
+const {
+  findOrCreateVehicleForDriver,
+} = require("../../../services/autoAssignment.service");
+const {
+  recordAssignmentHistory,
+} = require("../../../services/auditLog.service");
+const {
+  findOrCreateRouteAndTrip,
+} = require("../../../services/routeTrip.service");
+const {
+  optimizeWeekAssignments,
+} = require("../../../services/routeOptimization.service");
+const {
+  bulkUploadJobs,
+  createBulkUploadJob,
+  updateBulkUploadJob,
+  processBulkUploadJob,
+  MIN_BATCH_SIZE,
+  MAX_BATCH_SIZE,
+  DEFAULT_BATCH_SIZE,
+} = require("../../../services/bulkUpload.service");
 
 const resolvePendingVehicleAssignments = async (req, res, next) => {
   try {
@@ -2384,145 +236,6 @@ const resolvePendingVehicleAssignments = async (req, res, next) => {
   }
 };
 
-// ---------- Real-Time Route Optimization ----------
-
-const optimizeWeekAssignments = async (weekStartDate) => {
-  await tryAcquireWeekAreaLock(weekStartDate);
-
-  const schedules = await prisma.weeklySchedule.findMany({
-    where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
-    include: { route: true, trip: { include: { vehicle: true } } },
-  });
-
-  const summary = {
-    scanned: schedules.length,
-    driversReassigned: 0,
-    vehiclesReassigned: 0,
-    tripsBackfilled: 0,
-    details: [],
-  };
-
-  for (const entry of schedules) {
-    if (!entry.route) continue;
-
-    let trip = entry.trip;
-    if (!trip) {
-      const backfilled = await findOrCreateTripOnRouteWithCapacity(
-        entry.route,
-        undefined,
-        entry.shiftTiming || entry.route.shiftTiming,
-        entry.driverId || undefined,
-        entry.vehicleId || undefined,
-        weekStartDate,
-        entry.employeeId,
-        undefined,
-        {
-          trustProposedDriver: true,
-          disableMultiTrip: false,
-        },
-      );
-      trip = backfilled.trip;
-      await prisma.weeklySchedule.update({
-        where: { id: entry.id },
-        data: { tripId: trip.id },
-      });
-      summary.tripsBackfilled++;
-    }
-
-    let driverId = entry.driverId || undefined;
-    let vehicleId = entry.vehicleId || undefined;
-    const shiftTiming = entry.shiftTiming || entry.route.shiftTiming;
-
-    if (driverId) {
-      const conflict = await findDriverConflict(
-        driverId,
-        weekStartDate,
-        shiftTiming,
-        trip.id,
-        entry.employeeId,
-      );
-      if (conflict) {
-        summary.details.push({
-          weeklyScheduleId: entry.id,
-          note: `Driver ${driverId} has conflict but kept per sheet`,
-        });
-      }
-    } else {
-      const best = await autoAssignDriverAndVehicle(
-        weekStartDate,
-        shiftTiming,
-        trip.id,
-        undefined,
-        entry.employeeId,
-        caches,
-      );
-      if (best.driverId) {
-        driverId = best.driverId;
-        summary.driversReassigned++;
-      }
-    }
-
-    if (vehicleId) {
-      const conflict = await findVehicleConflict(
-        vehicleId,
-        weekStartDate,
-        shiftTiming,
-        trip.id,
-        entry.employeeId,
-      );
-      if (conflict) {
-        summary.details.push({
-          weeklyScheduleId: entry.id,
-          note: `Vehicle ${vehicleId} has conflict but kept per sheet`,
-        });
-      }
-    } else if (driverId) {
-      const vehicle = await findOrCreateVehicleForDriver(
-        driverId,
-        null,
-        entry.route?.routeName
-          ? normalizeVehicleType(entry.route.routeName.split("-").pop())
-          : "CAR",
-        { driverById: new Map() },
-      );
-      if (vehicle) {
-        vehicleId = vehicle.id;
-        summary.vehiclesReassigned++;
-        summary.details.push({
-          weeklyScheduleId: entry.id,
-          note: `Created placeholder vehicle "${vehicle.vehicleNumber}" for driver.`,
-        });
-      }
-    }
-
-    if (
-      driverId !== (entry.driverId || undefined) ||
-      vehicleId !== (entry.vehicleId || undefined)
-    ) {
-      await prisma.weeklySchedule.update({
-        where: { id: entry.id },
-        data: {
-          driverId: driverId || null,
-          vehicleId: vehicleId || null,
-          tripId: trip.id,
-        },
-      });
-      summary.details.push({
-        weeklyScheduleId: entry.id,
-        employeeId: entry.employeeId,
-        routeId: entry.routeId,
-        tripId: trip.id,
-        driverId,
-        vehicleId,
-      });
-    }
-  }
-
-  await syncPendingRidesForWeekBestEffort(weekStartDate);
-
-  return summary;
-};
-
 const optimizeRouteAssignments = async (req, res, next) => {
   try {
     const { weekStart } = req.body;
@@ -2561,8 +274,6 @@ const resyncPendingRides = async (req, res, next) => {
     next(error);
   }
 };
-
-// ---------- CRUD ----------
 
 const createWeeklySchedule = async (req, res, next) => {
   try {
@@ -2683,15 +394,24 @@ const createWeeklySchedule = async (req, res, next) => {
 const getAllWeeklySchedules = async (req, res, next) => {
   try {
     const {
-      skip = 0,
-      take = 10,
+      page = 1,
+      limit = 10,  
       employeeId,
       status,
       weekStart,
       routeId,
       search,
+      sortBy = "weekStart",
+      sortOrder = "desc",
     } = req.query;
 
+    // Parse pagination parameters
+    const pageNumber = Math.max(1, parseInt(page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const skip = (pageNumber - 1) * pageSize;
+    const take = pageSize;
+
+    // Build where clause
     const where = {};
     if (employeeId) where.employeeId = employeeId;
     if (routeId) where.routeId = routeId;
@@ -2718,8 +438,33 @@ const getAllWeeklySchedules = async (req, res, next) => {
       ];
     }
 
-    const options = {
+    // Build orderBy clause
+    const orderBy = [];
+    switch (sortBy) {
+      case "employeeName":
+        orderBy.push({ employee: { name: sortOrder } });
+        break;
+      case "routeCode":
+        orderBy.push({ route: { routeCode: sortOrder } });
+        break;
+      case "status":
+        orderBy.push({ status: sortOrder });
+        break;
+      case "weekStart":
+      default:
+        orderBy.push({ weekStart: sortOrder });
+        orderBy.push({ route: { routeCode: "asc" } });
+        break;
+    }
+
+    // Get total count for pagination
+    const totalCount = await prisma.weeklySchedule.count({ where });
+
+    // Get paginated records
+    const schedules = await prisma.weeklySchedule.findMany({
       where,
+      skip,
+      take,
       include: {
         employee: {
           select: {
@@ -2767,10 +512,32 @@ const getAllWeeklySchedules = async (req, res, next) => {
           select: { id: true, name: true },
         },
       },
-      orderBy: [{ weekStart: "desc" }, { route: { routeCode: "asc" } }],
-    };
+      orderBy,
+    });
 
-    const response = await getRecords(prisma.weeklySchedule, options);
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalCount / pageSize);
+    const hasNextPage = pageNumber < totalPages;
+    const hasPrevPage = pageNumber > 1;
+
+    // Build response
+    const response = okResponse(
+      {
+        data: schedules,
+        pagination: {
+          page: pageNumber,
+          limit: pageSize,
+          totalCount,
+          totalPages,
+          hasNextPage,
+          hasPrevPage,
+          nextPage: hasNextPage ? pageNumber + 1 : null,
+          prevPage: hasPrevPage ? pageNumber - 1 : null,
+        },
+      },
+      `Weekly schedules retrieved successfully. Showing page ${pageNumber} of ${totalPages || 1}.`,
+    );
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -2892,7 +659,28 @@ const updateWeeklySchedule = async (req, res, next) => {
   }
 };
 
-// ---------- Single Employee Schedule Update (No Side Effects) ----------
+const deleteWeeklySchedule = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const schedule = await prisma.weeklySchedule.findUnique({
+      where: { id },
+    });
+
+    if (!schedule) {
+      const errorResponse = badRequestResponse("Weekly schedule not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const response = await deleteRecord(prisma.weeklySchedule, id);
+
+    await syncPendingRidesForWeekBestEffort(schedule.weekStart);
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
 
 const updateSingleEmployeeSchedule = async (req, res, next) => {
   try {
@@ -2992,8 +780,6 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
   }
 };
 
-// ---------- Single Employee Schedule Delete (Only Rides & RidePassenger) ----------
-
 const deleteSingleEmployeeSchedule = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -3062,8 +848,6 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
   }
 };
 
-// ---------- Trip Driver Update ----------
-
 const updateTripDriver = async (req, res, next) => {
   try {
     const { tripId } = req.params;
@@ -3090,7 +874,7 @@ const updateTripDriver = async (req, res, next) => {
         },
       },
     });
-    
+
     if (!trip) {
       const errorResponse = badRequestResponse("Trip not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -3108,6 +892,20 @@ const updateTripDriver = async (req, res, next) => {
         where: { id: safeDriverId },
         include: {
           vehicle: true,
+          // Get all active trips for this driver to check for conflicts
+          trips: {
+            where: {
+              status: "ACTIVE",
+            },
+            include: {
+              route: true,
+              weeklySchedules: {
+                where: {
+                  status: { not: "CANCELLED" },
+                },
+              },
+            },
+          },
         },
       });
 
@@ -3121,20 +919,31 @@ const updateTripDriver = async (req, res, next) => {
       // ✅ Check if driver has a vehicle
       if (!driver.vehicle) {
         const errorResponse = badRequestResponse(
-          `Driver ${driver.name} does not have a vehicle assigned. Please assign a vehicle to this driver first.`
+          `Driver ${driver.name} does not have a vehicle assigned. Please assign a vehicle to this driver first.`,
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
 
-      // ✅ Check if driver is available
-      if (driver.status !== "AVAILABLE") {
-        const errorResponse = badRequestResponse(
-          `Driver ${driver.name} is currently ${driver.status}. Only AVAILABLE drivers can be assigned.`
-        );
-        return res.status(errorResponse.status.code).json(errorResponse);
-      }
+      // ✅ REMOVED: Driver status check - allow assigning drivers regardless of status
+      // A driver can be ON_RIDE for their current trip but still be assigned to future trips
+      console.log(
+        `[updateTripDriver] Assigning driver ${driver.name} (status: ${driver.status}) to trip. Status doesn't prevent assignment.`,
+      );
 
-      // ✅ Check if driver is already assigned to another trip at the same time
+      // ✅ Set new vehicle to driver's vehicle ID
+      newVehicleId = driver.vehicle.id;
+
+      console.log(
+        "[updateTripDriver] Driver:",
+        driver.name,
+        "Driver's Vehicle:",
+        driver.vehicle.vehicleNumber,
+        "Vehicle ID:",
+        driver.vehicle.id,
+      );
+
+      // ✅ Check for conflicting trips ONLY at the same shift timing
+      // A driver can have multiple trips for different shifts/days
       conflictingTrip = await prisma.trip.findFirst({
         where: {
           driverId: safeDriverId,
@@ -3162,10 +971,13 @@ const updateTripDriver = async (req, res, next) => {
         },
       });
 
-      // ✅ If driver has conflicting trip, MERGE employees into that trip
+      // ✅ If driver has conflicting trip at same shift, MERGE employees into that trip
       if (conflictingTrip) {
-        console.log('[updateTripDriver] Driver has conflicting trip:', conflictingTrip.id);
-        console.log('[updateTripDriver] Moving employees from current trip to driver\'s trip');
+        console.log(
+          "[updateTripDriver] Driver has conflicting trip at same shift:",
+          conflictingTrip.id,
+          "- Will merge employees",
+        );
 
         // Check if driver's trip has available seats
         const vehicleCapacity = driver.vehicle.capacity || 6;
@@ -3176,40 +988,39 @@ const updateTripDriver = async (req, res, next) => {
         if (totalEmployees > vehicleCapacity) {
           const errorResponse = badRequestResponse(
             `Cannot merge trips. Driver ${driver.name}'s trip has ${currentEmployees} employees ` +
-            `and this trip has ${employeesToMove} employees. Total (${totalEmployees}) exceeds ` +
-            `vehicle capacity (${vehicleCapacity} seats). Please reduce employees or assign a larger vehicle.`
+              `and this trip has ${employeesToMove} employees. Total (${totalEmployees}) exceeds ` +
+              `vehicle capacity (${vehicleCapacity} seats). Please reduce employees or assign a larger vehicle.`,
           );
           return res.status(errorResponse.status.code).json(errorResponse);
         }
 
-        // ✅ MOVE all employees from current trip to driver's trip
-        await prisma.weeklySchedule.updateMany({
-          where: {
-            tripId: tripId,
-            status: { not: "CANCELLED" },
-          },
-          data: {
-            tripId: conflictingTrip.id,
-            routeId: conflictingTrip.routeId,
-            driverId: safeDriverId,
-            vehicleId: driver.vehicleId,
-            shiftTiming: conflictingTrip.shiftTiming,
-          },
-        });
+        // ✅ Use a transaction for all the merge operations
+        const result = await prisma.$transaction(async (tx) => {
+          // MOVE all employees from current trip to driver's existing trip
+          await tx.weeklySchedule.updateMany({
+            where: {
+              tripId: tripId,
+              status: { not: "CANCELLED" },
+            },
+            data: {
+              tripId: conflictingTrip.id,
+              routeId: conflictingTrip.routeId,
+              driverId: safeDriverId,
+              vehicleId: driver.vehicle.id,
+              shiftTiming: conflictingTrip.shiftTiming,
+            },
+          });
 
-        // ✅ Delete the old trip (now empty)
-        await prisma.ride.deleteMany({
-          where: { tripId: tripId },
-        });
+          // Delete the old trip (now empty)
+          await tx.ride.deleteMany({
+            where: { tripId: tripId },
+          });
 
-        await prisma.trip.delete({
-          where: { id: tripId },
-        });
+          await tx.trip.delete({
+            where: { id: tripId },
+          });
 
-        // ✅ Update driver status
-        await prisma.driver.update({
-          where: { id: safeDriverId },
-          data: { status: "ON_RIDE" },
+          return { employeesMoved: employeesToMove };
         });
 
         // ✅ Sync rides
@@ -3221,16 +1032,17 @@ const updateTripDriver = async (req, res, next) => {
           {
             action: "MERGED_TRIPS",
             driver: driver.name,
+            driverStatus: driver.status,
             vehicle: driver.vehicle.vehicleNumber,
             targetTripId: conflictingTrip.id,
             deletedTripId: tripId,
-            employeesMoved: employeesToMove,
+            employeesMoved: result.employeesMoved,
             totalEmployeesInTarget: totalEmployees,
             vehicleCapacity: vehicleCapacity,
             seatsRemaining: vehicleCapacity - totalEmployees,
-            message: `Employees merged into driver ${driver.name}'s existing trip. Empty trip deleted.`
+            message: `Employees merged into driver ${driver.name}'s existing trip at same shift. Empty trip deleted.`,
           },
-          `Trip merged into existing trip. ${employeesToMove} employee(s) moved to ${driver.name}'s trip with vehicle ${driver.vehicle.vehicleNumber}.`
+          `Trip merged into existing trip. ${result.employeesMoved} employee(s) moved to ${driver.name}'s trip with vehicle ${driver.vehicle.vehicleNumber}.`,
         );
         return res.status(response.status.code).json(response);
       }
@@ -3242,7 +1054,7 @@ const updateTripDriver = async (req, res, next) => {
       if (employeeCount > vehicleCapacity) {
         const errorResponse = badRequestResponse(
           `Trip has ${employeeCount} employees but driver's vehicle (${driver.vehicle.vehicleNumber}) has only ${vehicleCapacity} seats. ` +
-          `Please assign a driver with a larger vehicle or reduce employees.`
+            `Please assign a driver with a larger vehicle or reduce employees.`,
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
@@ -3250,16 +1062,17 @@ const updateTripDriver = async (req, res, next) => {
       // ✅ Check if vehicle is available
       if (driver.vehicle.status !== "ACTIVE") {
         const errorResponse = badRequestResponse(
-          `Driver's vehicle ${driver.vehicle.vehicleNumber} is currently ${driver.vehicle.status}. Only ACTIVE vehicles can be used.`
+          `Driver's vehicle ${driver.vehicle.vehicleNumber} is currently ${driver.vehicle.status}. Only ACTIVE vehicles can be used.`,
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
 
-      // ✅ Set new vehicle to driver's vehicle
-      newVehicleId = driver.vehicleId;
-
-      console.log('[updateTripDriver] Driver:', driver.name, 'Vehicle:', driver.vehicle.vehicleNumber);
-      console.log('[updateTripDriver] Old vehicle:', trip.vehicle?.vehicleNumber, '→ New vehicle:', driver.vehicle.vehicleNumber);
+      console.log(
+        "[updateTripDriver] Old vehicle:",
+        trip.vehicle?.vehicleNumber,
+        "→ New vehicle:",
+        driver.vehicle.vehicleNumber,
+      );
     }
 
     // ✅ Step 3: If removing driver (driverId = null), validate
@@ -3267,150 +1080,101 @@ const updateTripDriver = async (req, res, next) => {
       if (trip.weeklySchedules.length > 0) {
         const errorResponse = badRequestResponse(
           `Cannot remove driver from trip with ${trip.weeklySchedules.length} employees. ` +
-          `Please reassign employees first or assign a new driver.`
+            `Please reassign employees first or assign a new driver.`,
         );
         return res.status(errorResponse.status.code).json(errorResponse);
       }
     }
 
-    // ✅ Step 4: Perform the update - BOTH driver AND vehicle
-    const [updatedTrip, updatedSchedules] = await prisma.$transaction([
-      prisma.trip.update({
-        where: { id: tripId },
-        data: {
-          driverId: safeDriverId,
-          vehicleId: newVehicleId,
-        },
-        include: {
-          vehicle: true,
-          driver: {
-            include: {
-              vehicle: true,
-            },
+    // ✅ Step 4: Perform the update using a single transaction
+    const [updatedTrip, updatedSchedules, auditLog] = await prisma.$transaction(
+      async (tx) => {
+        // Update trip
+        const tripResult = await tx.trip.update({
+          where: { id: tripId },
+          data: {
+            driverId: safeDriverId,
+            vehicleId: newVehicleId,
           },
-          route: true,
-        },
-      }),
-      prisma.weeklySchedule.updateMany({
-        where: { 
-          tripId, 
-          status: { not: "CANCELLED" } 
-        },
-        data: {
-          driverId: safeDriverId,
-          vehicleId: newVehicleId,
-        },
-      }),
-    ]);
-
-    // ✅ Step 5: Update driver status to ON_RIDE if assigned
-    if (safeDriverId) {
-      await prisma.driver.update({
-        where: { id: safeDriverId },
-        data: { status: "ON_RIDE" },
-      });
-    }
-
-    // ✅ Step 6: Free up old driver if there was one (and different)
-    if (trip.driverId && trip.driverId !== safeDriverId) {
-      const oldDriverTrips = await prisma.trip.count({
-        where: {
-          driverId: trip.driverId,
-          status: "ACTIVE",
-          id: { not: tripId },
-          weeklySchedules: {
-            some: {
-              status: { not: "CANCELLED" },
+          include: {
+            vehicle: true,
+            driver: {
+              include: {
+                vehicle: true,
+              },
             },
+            route: true,
           },
-        },
-      });
-
-      if (oldDriverTrips === 0) {
-        await prisma.driver.update({
-          where: { id: trip.driverId },
-          data: { status: "AVAILABLE" },
         });
-        console.log('[updateTripDriver] Old driver freed:', trip.driverId);
-      }
-    }
 
-    // ✅ Step 7: Free up old vehicle if it's no longer used
-    if (trip.vehicleId && trip.vehicleId !== newVehicleId) {
-      const oldVehicleTrips = await prisma.trip.count({
-        where: {
-          vehicleId: trip.vehicleId,
-          status: "ACTIVE",
-          id: { not: tripId },
-          weeklySchedules: {
-            some: {
-              status: { not: "CANCELLED" },
-            },
+        // Update all associated weekly schedules
+        const schedulesResult = await tx.weeklySchedule.updateMany({
+          where: {
+            tripId,
+            status: { not: "CANCELLED" },
           },
-        },
-      });
-
-      if (oldVehicleTrips === 0) {
-        await prisma.vehicle.update({
-          where: { id: trip.vehicleId },
-          data: { status: "ACTIVE" },
+          data: {
+            driverId: safeDriverId,
+            vehicleId: newVehicleId,
+          },
         });
-        console.log('[updateTripDriver] Old vehicle freed:', trip.vehicleId);
-      }
-    }
 
-    // ✅ Step 8: Sync rides for the week
+        // Create audit log within the same transaction
+        const auditResult = await tx.auditLog.create({
+          data: {
+            userId: req.user?.id || null,
+            action: "TRIP_DRIVER_UPDATE",
+            model: "Trip",
+            recordId: tripId,
+            before: {
+              driverId: trip.driverId,
+              driverName: trip.driver?.name || null,
+              vehicleId: trip.vehicleId,
+              vehicleNumber: trip.vehicle?.vehicleNumber || null,
+            },
+            after: {
+              driverId: safeDriverId,
+              driverName: tripResult.driver?.name || null,
+              vehicleId: newVehicleId,
+              vehicleNumber: tripResult.vehicle?.vehicleNumber || null,
+            },
+            ipAddress: req.ip || req.connection.remoteAddress || null,
+          },
+        });
+
+        return [tripResult, schedulesResult, auditResult];
+      },
+    );
+
+    // ✅ Sync rides for the week (outside transaction)
     if (weekStart) {
       await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
     }
 
-    // ✅ Step 9: Log the change
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.id || null,
-        action: "TRIP_DRIVER_UPDATE",
-        model: "Trip",
-        recordId: tripId,
-        before: {
-          driverId: trip.driverId,
-          driverName: trip.driver?.name || null,
-          vehicleId: trip.vehicleId,
-          vehicleNumber: trip.vehicle?.vehicleNumber || null,
-        },
-        after: {
-          driverId: safeDriverId,
-          driverName: updatedTrip.driver?.name || null,
-          vehicleId: newVehicleId,
-          vehicleNumber: updatedTrip.vehicle?.vehicleNumber || null,
-        },
-        ipAddress: req.ip || req.connection.remoteAddress || null,
-      },
-    });
-
-    // ✅ Step 10: Return response with details
+    // ✅ Return response with details
     const response = okResponse(
       {
         action: "UPDATED_TRIP",
         trip: updatedTrip,
         driver: updatedTrip.driver,
         vehicle: updatedTrip.vehicle,
-        previousVehicle: trip.vehicle?.vehicleNumber || 'none',
-        previousDriver: trip.driver?.name || 'none',
+        previousVehicle: trip.vehicle?.vehicleNumber || "none",
+        previousDriver: trip.driver?.name || "none",
         employeeCount: trip.weeklySchedules.length,
         vehicleCapacity: updatedTrip.vehicle?.capacity || 0,
-        seatsRemaining: updatedTrip.vehicle 
+        seatsRemaining: updatedTrip.vehicle
           ? (updatedTrip.vehicle.capacity || 0) - trip.weeklySchedules.length
           : 0,
         vehicleChanged: trip.vehicleId !== newVehicleId,
         driverChanged: trip.driverId !== safeDriverId,
         updatedSchedules: updatedSchedules.count || 0,
+        message: `Driver and vehicle updated successfully. Driver can be assigned to multiple trips.`,
       },
-      `Trip updated: Driver ${updatedTrip.driver?.name || 'none'} with vehicle ${updatedTrip.vehicle?.vehicleNumber || 'none'}.`
+      `Trip updated: Driver ${updatedTrip.driver?.name || "none"} with vehicle ${updatedTrip.vehicle?.vehicleNumber || "none"}.`,
     );
     return res.status(response.status.code).json(response);
-    
   } catch (error) {
-    console.error('[updateTripDriver] Error:', error);
+    console.error("[updateTripDriver] Error:", error);
     next(error);
   }
 };
@@ -3456,7 +1220,7 @@ const findExistingTripWithSeats = async ({
     const vehicle = trip.vehicle || trip.driver?.vehicle;
 
     if (!vehicle) {
-      console.log('[findExistingTrip] No vehicle found for trip:', trip.id);
+      console.log("[findExistingTrip] No vehicle found for trip:", trip.id);
       continue;
     }
 
@@ -3933,29 +1697,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
   }
 };
 
-const deleteWeeklySchedule = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-
-    const schedule = await prisma.weeklySchedule.findUnique({
-      where: { id },
-    });
-
-    if (!schedule) {
-      const errorResponse = badRequestResponse("Weekly schedule not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const response = await deleteRecord(prisma.weeklySchedule, id);
-
-    await syncPendingRidesForWeekBestEffort(schedule.weekStart);
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
 const getCurrentWeekSchedules = async (req, res, next) => {
   try {
     const startOfWeek = mondayOfCurrentWeek();
@@ -4026,11 +1767,23 @@ const getEmployeeScheduleRange = async (req, res, next) => {
   }
 };
 
-// ---------- Grouped view ----------
-
 const getGroupedSchedules = async (req, res, next) => {
   try {
-    const { weeks = 1, search, routeId } = req.query;
+    const { 
+      weeks = 1, 
+      search, 
+      routeId,
+      page = 1,
+      limit = 10,
+      sortBy = "routeCode",
+      sortOrder = "asc",
+    } = req.query;
+
+    // Parse pagination parameters
+    const pageNumber = Math.max(1, parseInt(page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const skip = (pageNumber - 1) * pageSize;
+    const take = pageSize;
 
     const where = {};
     if (routeId) where.routeId = routeId;
@@ -4182,7 +1935,7 @@ const getGroupedSchedules = async (req, res, next) => {
       });
     }
 
-    const routes = Array.from(routeMap.values())
+    let routes = Array.from(routeMap.values())
       .map((r) => {
         const trips = Array.from(r.tripMap.values())
           .filter((t) => t.tripNumber != null)
@@ -4232,23 +1985,65 @@ const getGroupedSchedules = async (req, res, next) => {
       .sort((a, b) => {
         if (a.code === "—") return 1;
         if (b.code === "—") return -1;
-        return a.code.localeCompare(b.code, undefined, {
-          numeric: true,
-          sensitivity: "base",
-        });
+        
+        // Dynamic sorting based on sortBy parameter
+        switch (sortBy) {
+          case "empCount":
+            return sortOrder === "asc" 
+              ? a.empCount - b.empCount 
+              : b.empCount - a.empCount;
+          case "area":
+            return sortOrder === "asc"
+              ? a.area.localeCompare(b.area)
+              : b.area.localeCompare(a.area);
+          case "shift":
+            return sortOrder === "asc"
+              ? a.shift.localeCompare(b.shift)
+              : b.shift.localeCompare(a.shift);
+          case "routeCode":
+          default:
+            return sortOrder === "asc"
+              ? a.code.localeCompare(b.code, undefined, {
+                  numeric: true,
+                  sensitivity: "base",
+                })
+              : b.code.localeCompare(a.code, undefined, {
+                  numeric: true,
+                  sensitivity: "base",
+                });
+        }
       });
 
+    // ✅ Calculate total routes before pagination
+    const totalRoutes = routes.length;
+    const totalPages = Math.ceil(totalRoutes / pageSize);
+    const hasNextPage = pageNumber < totalPages;
+    const hasPrevPage = pageNumber > 1;
+
+    // ✅ Apply pagination to routes array
+    routes = routes.slice(skip, skip + take);
+
     const response = okResponse(
-      routes,
-      "Grouped weekly schedules retrieved successfully.",
+      {
+        data: routes,
+        pagination: {
+          page: pageNumber,
+          limit: pageSize,
+          totalCount: totalRoutes,
+          totalPages,
+          hasNextPage,
+          hasPrevPage,
+          nextPage: hasNextPage ? pageNumber + 1 : null,
+          prevPage: hasPrevPage ? pageNumber - 1 : null,
+        },
+      },
+      `Grouped weekly schedules retrieved successfully. Showing page ${pageNumber} of ${totalPages || 1} (${totalRoutes} routes total).`,
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
   }
 };
-
-// ---------- Stats ----------
 
 const getScheduleStats = async (req, res, next) => {
   try {
@@ -4280,8 +2075,6 @@ const getScheduleStats = async (req, res, next) => {
     next(error);
   }
 };
-
-// ---------- Schedule Table ----------
 
 const getScheduleTableStats = async (req, res, next) => {
   try {
@@ -4468,55 +2261,34 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
   }
 };
 
-// ---------- Bulk Upload ----------
+const getDriverOptions = async (req, res, next) => {
+  try {
+    const drivers = await prisma.driver.findMany({
+      where: {
+        vehicle: {
+          isNot: null,
+        },
+      },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+      },
+      orderBy: {
+        name: "asc",
+      },
+    });
 
-const bulkUploadJobs = new Map();
-const BULK_UPLOAD_JOB_TTL_MS = 30 * 60 * 1000;
+    const response = okResponse(
+      drivers,
+      "Available driver options retrieved successfully.",
+    );
 
-const MIN_BATCH_SIZE = 10;
-const MAX_BATCH_SIZE = 1000;
-const DEFAULT_BATCH_SIZE = 100;
-
-const createBulkUploadJob = (totalRows, batchSize, weekStartDate) => {
-  const cutoff = Date.now() - BULK_UPLOAD_JOB_TTL_MS;
-  for (const [id, job] of bulkUploadJobs) {
-    if (job.status !== "processing" && job.startedAt < cutoff) {
-      bulkUploadJobs.delete(id);
-    }
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
   }
-
-  const weekKey = weekStartDate.toISOString();
-  const conflicting = Array.from(bulkUploadJobs.values()).find(
-    (job) => job.status === "processing" && job.weekKey === weekKey,
-  );
-  if (conflicting) {
-    return { conflict: true, existingJobId: conflicting.jobId };
-  }
-
-  const jobId = `bulkupload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  bulkUploadJobs.set(jobId, {
-    jobId,
-    weekKey,
-    status: "processing",
-    totalRows,
-    processedRows: 0,
-    batchSize,
-    totalBatches: totalRows ? Math.ceil(totalRows / batchSize) : 0,
-    batchesCompleted: 0,
-    startedAt: Date.now(),
-    partialResult: null,
-    result: null,
-    error: null,
-  });
-  return { conflict: false, jobId };
 };
-
-const updateBulkUploadJob = (jobId, patch) => {
-  const job = bulkUploadJobs.get(jobId);
-  if (!job) return;
-  Object.assign(job, patch);
-};
-
 const getBulkUploadStatus = async (req, res, next) => {
   try {
     const { jobId } = req.params;
@@ -4552,930 +2324,6 @@ const getBulkUploadStatus = async (req, res, next) => {
     next(error);
   }
 };
-
-const processBulkUploadJob = async (
-  jobId,
-  workbook,
-  weekStartDate,
-  batchSize = 100,
-) => {
-  console.log(
-    `[weeklySchedule][job ${jobId}] START weekStart=${weekStartDate} batchSize=${batchSize}`,
-  );
-
-  const results = {
-    created: 0,
-    updated: 0,
-    employeesNotFound: 0,
-    routesCreated: 0,
-    driversAutoAssigned: 0,
-    vehiclesAutoAssigned: 0,
-    vehiclesCreated: 0,
-    skipped: [],
-    sheetsProcessed: [],
-    sheetsSkipped: [],
-    tripsCreated: 0,
-    tripsReused: 0,
-    employeesReassigned: 0,
-    totalCapacityUsed: 0,
-    totalCapacityAvailable: 0,
-  };
-
-  const pendingWrites = [];
-  const employeeWriteLocks = new Map();
-
-  const skipRow = async (sheetName, rowNum, employeeCode, reason, rawData) => {
-    console.error(
-      `[weeklySchedule][SKIP] sheet="${sheetName}" row=${rowNum} employeeCode=${employeeCode || "?"} reason: ${reason}`,
-    );
-    results.skipped.push({
-      sheet: sheetName,
-      row: rowNum,
-      employeeCode,
-      reason,
-    });
-    try {
-      await prisma.scheduleException.create({
-        data: {
-          weekStart: weekStartDate,
-          employeeCode: employeeCode || undefined,
-          rowNumber: rowNum ?? undefined,
-          reason: `[${sheetName}] ${reason}`,
-          rawData: rawData ? JSON.parse(JSON.stringify(rawData)) : undefined,
-        },
-      });
-    } catch (exceptionLogError) {}
-  };
-
-  const applyCacheEffects = (
-    savedSchedule,
-    { employee, scheduleData, dayFields, route },
-  ) => {
-    if (!caches) return;
-    caches.scheduleByEmployeeId.set(employee.id, savedSchedule);
-    const idx = (caches.weekRoster || []).findIndex(
-      (r) => r.employeeId === employee.id,
-    );
-    const entry = {
-      employeeId: employee.id,
-      tripId: scheduleData.tripId,
-      routeId: scheduleData.routeId,
-      driverId: scheduleData.driverId || null,
-      vehicleId: scheduleData.vehicleId || null,
-      shiftTiming: scheduleData.shiftTiming,
-      route,
-      ...dayFields,
-    };
-    if (idx === -1) {
-      if (caches.weekRoster) caches.weekRoster.push(entry);
-    } else {
-      if (caches.weekRoster)
-        caches.weekRoster[idx] = { ...caches.weekRoster[idx], ...entry };
-    }
-  };
-
-  const flushPendingWrites = async () => {
-    if (!pendingWrites.length) return;
-    const batch = pendingWrites.splice(0, pendingWrites.length);
-    try {
-      const saved = await prisma.$transaction(
-        batch.map((item) =>
-          prisma.weeklySchedule.upsert({
-            where: {
-              employeeId_weekStart: {
-                employeeId: item.scheduleData.employeeId,
-                weekStart: item.scheduleData.weekStart,
-              },
-            },
-            update: item.scheduleData,
-            create: item.scheduleData,
-          }),
-        ),
-        { timeout: 20000, maxWait: 10000 },
-      );
-      saved.forEach((savedSchedule, i) =>
-        applyCacheEffects(savedSchedule, batch[i]),
-      );
-    } catch (batchError) {
-      console.error(
-        `[flushPendingWrites] BATCH TRANSACTION FAILED: ${batchError.message}`,
-      );
-      for (const item of batch) {
-        try {
-          const savedSchedule = await prisma.weeklySchedule.upsert({
-            where: {
-              employeeId_weekStart: {
-                employeeId: item.scheduleData.employeeId,
-                weekStart: item.scheduleData.weekStart,
-              },
-            },
-            update: item.scheduleData,
-            create: item.scheduleData,
-          });
-          applyCacheEffects(savedSchedule, item);
-        } catch (rowError) {
-          await skipRow(
-            item.sheetName,
-            item.rowNum,
-            item.employeeCode,
-            rowError.message,
-            item.raw,
-          );
-        }
-      }
-    }
-  };
-
-  try {
-    await prisma.$transaction(
-      async (tx) => {
-        const lockKey = `weekly-schedule::${weekStartDate.toISOString()}::no-area`;
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-      },
-      { maxWait: 10000, timeout: 10000 },
-    );
-  } catch (lockError) {
-    console.warn(
-      `[weeklySchedule] Skipping week/area lock (continuing without it): ${lockError.message}`,
-    );
-  }
-
-  const caches = {
-    employee: new Map(),
-    driver: new Map(),
-    vendor: new Map(),
-    vehicle: new Map(),
-    areaCache: new Map(),
-    routesByArea: new Map(),
-    tripsByRoute: new Map(),
-    routeById: new Map(),
-    tripIdByDriver: new Map(),
-    tripById: new Map(),
-    weekRoster: [],
-    availableDrivers: [],
-    activeVehicles: [],
-    driverById: new Map(),
-    scheduleByEmployeeId: new Map(),
-    tripOccupancy: new Map(),
-    tripCapacity: new Map(),
-    tripDriverMap: new Map(),
-    tripRouteMap: new Map(),
-  };
-
-  console.log(`[weeklySchedule][job ${jobId}] Pre-fetching existing data...`);
-
-  const [existingWeekRoster, availableDriversList, activeVehiclesList] =
-    await Promise.all([
-      prisma.weeklySchedule.findMany({
-        where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
-        include: { route: true, trip: { include: { vehicle: true } } },
-      }),
-      prisma.driver.findMany({
-        where: { status: "AVAILABLE" },
-        include: { vehicle: true },
-        orderBy: { createdAt: "asc" },
-      }),
-      prisma.vehicle.findMany({ where: { status: "ACTIVE" } }),
-    ]);
-
-  caches.weekRoster = existingWeekRoster;
-  caches.availableDrivers = availableDriversList;
-  caches.activeVehicles = activeVehiclesList;
-  for (const d of availableDriversList) {
-    caches.driverById.set(d.id, d);
-  }
-  for (const s of existingWeekRoster) {
-    caches.scheduleByEmployeeId.set(s.employeeId, s);
-    if (s.driverId && s.tripId) {
-      caches.tripIdByDriver.set(s.driverId, s.tripId);
-    }
-    if (s.tripId) {
-      caches.tripOccupancy.set(
-        s.tripId,
-        (caches.tripOccupancy.get(s.tripId) || 0) + 1,
-      );
-      if (s.driverId) {
-        caches.tripDriverMap.set(s.tripId, s.driverId);
-      }
-      if (s.routeId) {
-        caches.tripRouteMap.set(s.tripId, s.routeId);
-      }
-    }
-  }
-
-  console.log(`[weeklySchedule][job ${jobId}] Parsing sheets...`);
-
-  const allEmployeeCodes = new Set();
-  const allEmployeeData = [];
-
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, {
-      header: 1,
-      raw: false,
-      defval: "",
-    });
-    const headerRowIndex = rows.findIndex((r) =>
-      r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
-    );
-
-    if (headerRowIndex === -1) {
-      results.sheetsSkipped.push({
-        sheet: sheetName,
-        reason: "No 'Employee ID' header found.",
-      });
-      continue;
-    }
-    results.sheetsProcessed.push(sheetName);
-
-    const colIndex = {};
-    rows[headerRowIndex].forEach((cell, i) => {
-      const key = HEADER_ALIASES[String(cell).trim().toLowerCase()];
-      if (key) colIndex[key] = i;
-    });
-
-    const dataRows = rows.slice(headerRowIndex + 1);
-    const empCodeCol = colIndex.employeeCode;
-
-    for (let i = 0; i < dataRows.length; i++) {
-      const raw = dataRows[i];
-      const code =
-        empCodeCol !== undefined ? String(raw[empCodeCol] ?? "").trim() : "";
-      if (code && /^\d+$/.test(code)) {
-        allEmployeeCodes.add(code);
-        allEmployeeData.push({
-          sheetName,
-          raw,
-          rowNum: headerRowIndex + i + 2,
-          colIndex,
-          employeeCode: code,
-        });
-      }
-    }
-  }
-
-  console.log(
-    `[weeklySchedule][job ${jobId}] Loading ${allEmployeeCodes.size} employees...`,
-  );
-  if (allEmployeeCodes.size) {
-    const existingEmployees = await prisma.employee.findMany({
-      where: { employeeCode: { in: Array.from(allEmployeeCodes) } },
-      include: { area: true, subArea: true, block: true },
-    });
-    for (const emp of existingEmployees) {
-      caches.employee.set(emp.employeeCode, emp);
-    }
-  }
-
-  const areaIds = new Set();
-  for (const emp of caches.employee.values()) {
-    if (emp.areaId) areaIds.add(emp.areaId);
-  }
-
-  const tripsByAreaShift = new Map();
-  if (areaIds.size > 0) {
-    console.log(
-      `[weeklySchedule][job ${jobId}] Pre-fetching trips for ${areaIds.size} areas...`,
-    );
-    const trips = await prisma.trip.findMany({
-      where: {
-        route: { areaId: { in: Array.from(areaIds) } },
-        status: "ACTIVE",
-      },
-      include: { route: { include: { area: true } }, vehicle: true },
-    });
-
-    for (const trip of trips) {
-      const key = `${trip.route.areaId}::${normalizeShift(trip.shiftTiming)}`;
-      if (!tripsByAreaShift.has(key)) tripsByAreaShift.set(key, []);
-      tripsByAreaShift.get(key).push(trip);
-
-      if (!caches.tripOccupancy.has(trip.id)) {
-        caches.tripOccupancy.set(trip.id, 0);
-      }
-      caches.tripCapacity.set(trip.id, trip.vehicle?.capacity || 10);
-      if (trip.driverId) {
-        caches.tripDriverMap.set(trip.id, trip.driverId);
-      }
-      if (trip.routeId) {
-        caches.tripRouteMap.set(trip.id, trip.routeId);
-      }
-    }
-  }
-
-  console.log(
-    `[weeklySchedule][job ${jobId}] Processing ${allEmployeeData.length} employees...`,
-  );
-
-  const processedEmployees = [];
-
-  for (const {
-    sheetName,
-    raw,
-    rowNum,
-    colIndex,
-    employeeCode,
-  } of allEmployeeData) {
-    const get = (key) =>
-      colIndex[key] !== undefined
-        ? String(raw[colIndex[key]] ?? "").trim()
-        : "";
-
-    try {
-      const employee = await findEmployee(employeeCode, caches);
-      if (!employee) {
-        results.employeesNotFound++;
-        await skipRow(
-          sheetName,
-          rowNum,
-          employeeCode,
-          `Employee code ${employeeCode} not found.`,
-          raw,
-        );
-        continue;
-      }
-
-      const vendorName = get("vendor");
-      const vehicleType = get("vehicleType");
-      const shiftTiming = get("shiftTiming");
-      const driverEntries = parseDriverEntries(get("drivers"));
-
-      let driverId = null;
-      let driverRecord = null;
-      let vehicleId = null;
-
-      for (let d = 0; d < driverEntries.length; d++) {
-        const driver = await findDriver(
-          driverEntries[d].name,
-          vendorName,
-          vehicleType,
-          caches.driver,
-          caches,
-        );
-        if (driver) {
-          driverId = driver.id;
-          driverRecord = driver;
-          if (driver.vehicle) {
-            vehicleId = driver.vehicle.id;
-          } else {
-            const newVehicle = await findOrCreateVehicleForDriver(
-              driverId,
-              vendorName || driver.vendor?.name || "MTS",
-              vehicleType || "CAR",
-              caches,
-            );
-            if (newVehicle) {
-              vehicleId = newVehicle.id;
-              results.vehiclesCreated = (results.vehiclesCreated || 0) + 1;
-            }
-          }
-          break;
-        }
-      }
-
-      const driverNamedButUnmatched = !driverId && driverEntries.length > 0;
-
-      // ---------- AREA FIX: Use ONLY sheet area; no fallback to employee's master area ----------
-      let areaRecord = null;
-      const sheetAreaName = get("area");
-      if (sheetAreaName) {
-        areaRecord = await findOrCreateNormalizedArea(
-          normalizeAreaName(sheetAreaName),
-          caches,
-        );
-      }
-      if (!areaRecord) {
-        await skipRow(
-          sheetName,
-          rowNum,
-          employeeCode,
-          `Area "${sheetAreaName || "empty"}" not found or invalid in sheet`,
-          raw,
-        );
-        continue;
-      }
-      // ---------- END AREA FIX ----------
-
-      if (driverId && !vehicleId) {
-        const vehicle = await findOrCreateVehicleForDriver(
-          driverId,
-          vendorName,
-          vehicleType,
-          caches,
-        );
-        if (vehicle) {
-          vehicleId = vehicle.id;
-        }
-      }
-
-      const officeArrivalTimeRaw = get("officeArrivalTime");
-      const dropTimeRaw = get("dropTime");
-      const serviceType = deriveServiceType(officeArrivalTimeRaw, dropTimeRaw);
-      const officeArrivalDate = parseSheetTimeToDate(officeArrivalTimeRaw);
-      const dropDate = parseSheetTimeToDate(dropTimeRaw);
-      const pickupDate = computePickupTime(officeArrivalDate);
-
-      const offDaySet = parseOffDays(get("offDay"));
-      const dayFields = {};
-      DAY_KEYS.forEach((day) => {
-        dayFields[day] = offDaySet.has(day) ? "OFF" : "BOTH";
-      });
-
-      const vehicleEntity = normalizeEntity(get("vehicleEntity"));
-      const campaign = get("campaign") || get("batch");
-
-      const employeeData = {
-        employee,
-        employeeCode,
-        driverId,
-        vehicleId,
-        driverRecord,
-        vendorName,
-        vehicleType,
-        shiftTiming,
-        areaRecord,
-        campaign,
-        serviceType,
-        officeArrivalDate,
-        dropDate,
-        pickupDate,
-        dayFields,
-        vehicleEntity,
-        sheetName,
-        rowNum,
-        raw,
-        driverEntries,
-        driverNamedButUnmatched,
-        location: get("location"), // <-- ADD THIS
-        vehicleEntity: get("vehicleEntity"),
-        assigned: false,
-        assignedTrip: null,
-        assignedRoute: null,
-        scheduleData: {
-          weekStart: weekStartDate,
-          employeeId: employee.id,
-          driverId,
-          vendorId: null,
-          vehicleId,
-          vehicleEntity: vehicleEntity || undefined,
-          serviceType,
-          shiftTiming: shiftTiming || undefined,
-          pickupTime: pickupDate || undefined,
-          officeArrivalTime: officeArrivalDate || undefined,
-          dropTime: dropDate || undefined,
-          offDay: get("offDay") || undefined,
-          ...dayFields,
-          status: "DRAFT",
-        },
-      };
-
-      processedEmployees.push(employeeData);
-    } catch (error) {
-      console.error(`[Processing] Error row ${rowNum}:`, error);
-      await skipRow(sheetName, rowNum, employeeCode, error.message, raw);
-    }
-  }
-
-  // ---------- GROUPING FIX: group by area + shift + driverId ----------
-  const employeeGroups = new Map();
-  for (const emp of processedEmployees) {
-    if (!emp.areaRecord) continue;
-    const driverKey = emp.driverId || "no-driver";
-    const key = `${emp.areaRecord.id}::${normalizeShift(emp.shiftTiming)}::${driverKey}`;
-    if (!employeeGroups.has(key)) {
-      employeeGroups.set(key, {
-        areaRecord: emp.areaRecord,
-        shiftTiming: emp.shiftTiming,
-        driverId: emp.driverId,
-        employees: [],
-      });
-    }
-    employeeGroups.get(key).employees.push(emp);
-  }
-
-  console.log(
-    `[weeklySchedule][job ${jobId}] Grouped ${processedEmployees.length} employees into ${employeeGroups.size} groups`,
-  );
-  // ---------- END GROUPING FIX ----------
-
-  // Helper to sort trips by occupancy (highest first)
-  const sortByOccupancy = (trips) => {
-    return [...trips].sort((a, b) => {
-      const aOcc = caches.tripOccupancy.get(a.id) || 0;
-      const bOcc = caches.tripOccupancy.get(b.id) || 0;
-      return bOcc - aOcc;
-    });
-  };
-
-  for (const [key, group] of employeeGroups) {
-    const { areaRecord, shiftTiming, employees, driverId } = group;
-    const areaShiftKey = `${areaRecord.id}::${normalizeShift(shiftTiming)}`;
-
-    // Get all trips for this area/shift
-    const allTrips = tripsByAreaShift.get(areaShiftKey) || [];
-
-    // Split trips into those with matching driver (if any) and others
-    let matchingDriverTrips = [];
-    let otherTrips = [];
-    if (driverId) {
-      matchingDriverTrips = allTrips.filter((t) => t.driverId === driverId);
-      otherTrips = allTrips.filter((t) => t.driverId !== driverId);
-    } else {
-      // No driver specified; treat all trips as available
-      otherTrips = allTrips;
-    }
-
-    let unassigned = [...employees];
-
-    // ---------- PHASE 1: Assign to matching driver trips ----------
-    if (matchingDriverTrips.length > 0) {
-      const sortedMatching = sortByOccupancy(matchingDriverTrips);
-      for (const trip of sortedMatching) {
-        const capacity = caches.tripCapacity.get(trip.id) || 10;
-        let occupancy = caches.tripOccupancy.get(trip.id) || 0;
-        const availableSlots = capacity - occupancy;
-        if (availableSlots <= 0) continue;
-
-        const canAssign = [];
-        for (const emp of unassigned) {
-          if (emp.assigned) continue;
-          canAssign.push(emp);
-          if (canAssign.length >= availableSlots) break;
-        }
-
-        for (const emp of canAssign) {
-          emp.assigned = true;
-          emp.assignedTrip = trip;
-          emp.assignedRoute = trip.route;
-
-          if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
-            await prisma.trip.update({
-              where: { id: trip.id },
-              data: { driverId: emp.driverId },
-            });
-            trip.driverId = emp.driverId;
-            if (caches) {
-              caches.tripDriverMap?.set(trip.id, emp.driverId);
-              caches.tripIdByDriver?.set(emp.driverId, trip.id);
-            }
-          }
-
-          const assignment = await resolveConflictFreeAssignment({
-            trip,
-            weekStartDate,
-            candidateShiftTiming: shiftTiming,
-            proposedDriverId: emp.driverId,
-            proposedVehicleId: emp.vehicleId,
-            vehicleTypeHint: emp.vehicleType,
-            excludeEmployeeId: emp.employee.id,
-            caches,
-            options: {
-              trustProposedDriver: true,
-              skipAutoAssignDriver: emp.driverNamedButUnmatched,
-            },
-          });
-
-          emp.driverId = assignment.driverId;
-          emp.vehicleId = assignment.vehicleId;
-          emp.scheduleData.routeId = trip.routeId;
-          emp.scheduleData.tripId = trip.id;
-          emp.scheduleData.driverId = emp.driverId;
-          emp.scheduleData.vehicleId = emp.vehicleId;
-          emp.scheduleData.status =
-            emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
-
-          occupancy++;
-          caches.tripOccupancy.set(trip.id, occupancy);
-          results.tripsReused++;
-
-          const existing =
-            caches.scheduleByEmployeeId.get(emp.employee.id) || null;
-          const existingHasId = Boolean(existing?.id);
-          if (existingHasId) results.updated++;
-          else results.created++;
-
-          pendingWrites.push({
-            employee: emp.employee,
-            existing: existingHasId ? existing : null,
-            scheduleData: emp.scheduleData,
-            dayFields: emp.dayFields,
-            route: trip.route,
-            sheetName: emp.sheetName,
-            rowNum: emp.rowNum,
-            employeeCode: emp.employeeCode,
-            raw: emp.raw,
-            driverRaw: emp.driverEntries[0]?.name || null,
-          });
-
-          caches.scheduleByEmployeeId.set(emp.employee.id, {
-            ...(existing || {}),
-            ...emp.scheduleData,
-            ...(existing?.id ? { id: existing.id } : {}),
-          });
-
-          const idx = unassigned.indexOf(emp);
-          if (idx > -1) unassigned.splice(idx, 1);
-        }
-      }
-    }
-
-    // ---------- PHASE 2: Assign remaining (overflow) to any other trip ----------
-    if (unassigned.length > 0 && otherTrips.length > 0) {
-      const sortedOther = sortByOccupancy(otherTrips);
-      for (const trip of sortedOther) {
-        const capacity = caches.tripCapacity.get(trip.id) || 10;
-        let occupancy = caches.tripOccupancy.get(trip.id) || 0;
-        const availableSlots = capacity - occupancy;
-        if (availableSlots <= 0) continue;
-
-        const canAssign = [];
-        for (const emp of unassigned) {
-          if (emp.assigned) continue;
-          canAssign.push(emp);
-          if (canAssign.length >= availableSlots) break;
-        }
-
-        for (const emp of canAssign) {
-          emp.assigned = true;
-          emp.assignedTrip = trip;
-          emp.assignedRoute = trip.route;
-
-          // Override driver if sheet specifies one
-          if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
-            await prisma.trip.update({
-              where: { id: trip.id },
-              data: { driverId: emp.driverId },
-            });
-            trip.driverId = emp.driverId;
-            if (caches) {
-              caches.tripDriverMap?.set(trip.id, emp.driverId);
-              caches.tripIdByDriver?.set(emp.driverId, trip.id);
-            }
-          }
-
-          const assignment = await resolveConflictFreeAssignment({
-            trip,
-            weekStartDate,
-            candidateShiftTiming: shiftTiming,
-            proposedDriverId: emp.driverId,
-            proposedVehicleId: emp.vehicleId,
-            vehicleTypeHint: emp.vehicleType,
-            excludeEmployeeId: emp.employee.id,
-            caches,
-            options: {
-              trustProposedDriver: true,
-              skipAutoAssignDriver: emp.driverNamedButUnmatched,
-            },
-          });
-
-          emp.driverId = assignment.driverId;
-          emp.vehicleId = assignment.vehicleId;
-          emp.scheduleData.routeId = trip.routeId;
-          emp.scheduleData.tripId = trip.id;
-          emp.scheduleData.driverId = emp.driverId;
-          emp.scheduleData.vehicleId = emp.vehicleId;
-          emp.scheduleData.status =
-            emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
-
-          occupancy++;
-          caches.tripOccupancy.set(trip.id, occupancy);
-          results.tripsReused++;
-
-          const existing =
-            caches.scheduleByEmployeeId.get(emp.employee.id) || null;
-          const existingHasId = Boolean(existing?.id);
-          if (existingHasId) results.updated++;
-          else results.created++;
-
-          pendingWrites.push({
-            employee: emp.employee,
-            existing: existingHasId ? existing : null,
-            scheduleData: emp.scheduleData,
-            dayFields: emp.dayFields,
-            route: trip.route,
-            sheetName: emp.sheetName,
-            rowNum: emp.rowNum,
-            employeeCode: emp.employeeCode,
-            raw: emp.raw,
-            driverRaw: emp.driverEntries[0]?.name || null,
-          });
-
-          caches.scheduleByEmployeeId.set(emp.employee.id, {
-            ...(existing || {}),
-            ...emp.scheduleData,
-            ...(existing?.id ? { id: existing.id } : {}),
-          });
-
-          const idx = unassigned.indexOf(emp);
-          if (idx > -1) unassigned.splice(idx, 1);
-        }
-      }
-    }
-
-    // ---------- PHASE 3: Create new trips for leftovers ----------
-    const remainingEmployees = unassigned.filter((e) => !e.assigned);
-    while (remainingEmployees.length > 0) {
-      const firstEmp = remainingEmployees[0];
-
-      const routeResult = await findOrCreateRouteAndTrip(
-        areaRecord,
-        firstEmp.vehicleType,
-        shiftTiming,
-        firstEmp.campaign,
-        firstEmp.driverId,
-        firstEmp.vehicleId,
-        weekStartDate,
-        firstEmp.employee.id,
-        caches,
-        {
-          disableMultiTrip: false,
-          trustProposedDriver: true,
-          allowCreate: true,
-        },
-        firstEmp.vendorName,
-        firstEmp.location, // <-- ADD THIS
-        firstEmp.vehicleEntity, // <-- ADD THIS
-      );
-
-      const trip = routeResult.trip;
-      if (!trip) {
-        await skipRow(
-          firstEmp.sheetName,
-          firstEmp.rowNum,
-          firstEmp.employeeCode,
-          "Failed to create new trip",
-          firstEmp.raw,
-        );
-        remainingEmployees.shift();
-        continue;
-      }
-
-      // Override trip driver if sheet specified one
-      if (
-        firstEmp.driverId &&
-        trip.driverId &&
-        firstEmp.driverId !== trip.driverId
-      ) {
-        await prisma.trip.update({
-          where: { id: trip.id },
-          data: { driverId: firstEmp.driverId },
-        });
-        trip.driverId = firstEmp.driverId;
-        if (caches) {
-          caches.tripDriverMap?.set(trip.id, firstEmp.driverId);
-          caches.tripIdByDriver?.set(firstEmp.driverId, trip.id);
-        }
-      }
-
-      results.tripsCreated++;
-      const capacity = caches.tripCapacity.get(trip.id) || 10;
-      let assignedCount = 0;
-
-      const toAssign = [];
-      for (
-        let i = 0;
-        i < remainingEmployees.length && assignedCount < capacity;
-        i++
-      ) {
-        const emp = remainingEmployees[i];
-        // For new trips, we can assign anyone (they share same area/shift)
-        toAssign.push(emp);
-        assignedCount++;
-      }
-
-      for (const emp of toAssign) {
-        if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
-          await prisma.trip.update({
-            where: { id: trip.id },
-            data: { driverId: emp.driverId },
-          });
-          trip.driverId = emp.driverId;
-          if (caches) {
-            caches.tripDriverMap?.set(trip.id, emp.driverId);
-            caches.tripIdByDriver?.set(emp.driverId, trip.id);
-          }
-        }
-
-        const assignment = await resolveConflictFreeAssignment({
-          trip,
-          weekStartDate,
-          candidateShiftTiming: shiftTiming,
-          proposedDriverId: emp.driverId,
-          proposedVehicleId: emp.vehicleId,
-          vehicleTypeHint: emp.vehicleType,
-          excludeEmployeeId: emp.employee.id,
-          caches,
-          options: {
-            trustProposedDriver: true,
-            skipAutoAssignDriver: emp.driverNamedButUnmatched,
-          },
-        });
-
-        emp.driverId = assignment.driverId;
-        emp.vehicleId = assignment.vehicleId;
-        emp.scheduleData.routeId = trip.routeId;
-        emp.scheduleData.tripId = trip.id;
-        emp.scheduleData.driverId = emp.driverId;
-        emp.scheduleData.vehicleId = emp.vehicleId;
-        emp.scheduleData.status =
-          emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
-
-        emp.assigned = true;
-        results.employeesReassigned++;
-
-        caches.tripOccupancy.set(trip.id, assignedCount);
-
-        const existing =
-          caches.scheduleByEmployeeId.get(emp.employee.id) || null;
-        const existingHasId = Boolean(existing?.id);
-        if (existingHasId) results.updated++;
-        else results.created++;
-
-        pendingWrites.push({
-          employee: emp.employee,
-          existing: existingHasId ? existing : null,
-          scheduleData: emp.scheduleData,
-          dayFields: emp.dayFields,
-          route: trip.route,
-          sheetName: emp.sheetName,
-          rowNum: emp.rowNum,
-          employeeCode: emp.employeeCode,
-          raw: emp.raw,
-          driverRaw: emp.driverEntries[0]?.name || null,
-        });
-
-        caches.scheduleByEmployeeId.set(emp.employee.id, {
-          ...(existing || {}),
-          ...emp.scheduleData,
-          ...(existing?.id ? { id: existing.id } : {}),
-        });
-
-        const idx = remainingEmployees.indexOf(emp);
-        if (idx > -1) remainingEmployees.splice(idx, 1);
-      }
-    }
-
-    if (pendingWrites.length >= 25) {
-      await flushPendingWrites();
-    }
-  }
-
-  console.log(
-    `[weeklySchedule][job ${jobId}] Flushing ${pendingWrites.length} pending writes...`,
-  );
-  await flushPendingWrites();
-  console.log(`[weeklySchedule][job ${jobId}] Final flush complete.`);
-
-  let totalCapacity = 0;
-  let totalUsed = 0;
-  for (const [tripId, occupancy] of caches.tripOccupancy) {
-    const capacity = caches.tripCapacity.get(tripId) || 0;
-    totalCapacity += capacity;
-    totalUsed += occupancy;
-  }
-  results.totalCapacityUsed = totalUsed;
-  results.totalCapacityAvailable = totalCapacity;
-
-  console.log(
-    `[weeklySchedule][job ${jobId}] COMPLETE. ` +
-      `Created: ${results.created}, Updated: ${results.updated}, ` +
-      `Trips Created: ${results.tripsCreated}, Trips Reused: ${results.tripsReused}, ` +
-      `Capacity: ${totalUsed}/${totalCapacity} filled (${totalCapacity > 0 ? Math.round((totalUsed / totalCapacity) * 100) : 0}%)`,
-  );
-
-  return results;
-};
-
-const getDriverOptions = async (req, res, next) => {
-  try {
-    const drivers = await prisma.driver.findMany({
-      where: {
-        vehicle: {
-          isNot: null,
-        },
-      },
-      select: {
-        id: true,
-        name: true,
-        status: true,
-      },
-      orderBy: {
-        name: "asc",
-      },
-    });
-
-    const response = okResponse(
-      drivers,
-      "Available driver options retrieved successfully.",
-    );
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-// ---------- Validate Upload ----------
 
 const validateBulkUploadFile = async (req, res, next) => {
   try {
@@ -5570,8 +2418,6 @@ const validateBulkUploadFile = async (req, res, next) => {
     next(error);
   }
 };
-
-// ---------- Bulk Upload Controller ----------
 
 const bulkUploadWeeklySchedule = async (req, res, next) => {
   try {
@@ -5676,13 +2522,6 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
 };
 
 module.exports = {
-  analyzeAddressMatch,
-  normalizeEntity,
-  parseSheetTimeOfDay,
-  parseSheetTimeToDate,
-  toShiftTimeDate,
-  toIsoOrNull,
-  computePickupTime,
   getDriverOptions,
   updateTripDriver,
   createWeeklySchedule,
@@ -5704,4 +2543,7 @@ module.exports = {
   resyncPendingRides,
   updateSingleEmployeeSchedule,
   deleteSingleEmployeeSchedule,
+  // resolvePendingVehicleAssignments is defined above but, same as in your
+  // original file, was never wired into module.exports (so no route reaches
+  // it). Add it here if that was unintentional.
 };
