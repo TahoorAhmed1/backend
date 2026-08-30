@@ -2,8 +2,12 @@ const { prisma } = require("../../../lib/prisma");
 const {
   badRequestResponse,
   okResponse,
+  createSuccessResponse,
 } = require("../../../constants/responses");
 const { shiftTimesOverlap } = require("../../../utils/shiftTime");
+const {
+  syncPendingRidesForWeekBestEffort,
+} = require("../../../lib/rideplaing");
 
 // ---------- helpers ----------
 
@@ -14,13 +18,6 @@ const toDateOnly = (d) => {
   );
 };
 
-/**
- * Monday (UTC, date-only) of the week containing "now". Mirrors the
- * frontend's mondayOf() so "current week" means the same thing on both
- * sides. Used to give every trip a real assigned/remaining seat count
- * wherever trips are listed, instead of requiring a second per-route
- * weekly-view call just to avoid showing a false "0/capacity".
- */
 const currentWeekMonday = () => {
   const now = new Date();
   const d = new Date(
@@ -32,11 +29,6 @@ const currentWeekMonday = () => {
   return d;
 };
 
-/** Shapes a Trip (with its vehicle + weeklySchedules already loaded) into
- * the capacity/assigned/remaining triple the UI needs, everywhere trips are
- * listed — the single source of truth for "how full is this trip", so the
- * route list, stats, and weekly view all agree instead of each computing it
- * (or not computing it) slightly differently. */
 const shapeTripOccupancy = (trip) => {
   const capacity = trip.vehicle?.capacity || 0;
   const assigned = trip.weeklySchedules?.length || 0;
@@ -50,24 +42,9 @@ const shapeTripOccupancy = (trip) => {
 const cleanString = (v) =>
   v === undefined || v === null ? "" : String(v).trim();
 
-/**
- * A trip's "effective" shift is its own shiftTiming if set, otherwise the
- * parent route's. Trips usually don't override the route's shift — they
- * only would if a second vehicle on the same route genuinely runs a
- * different window.
- */
 const effectiveTripShift = (trip, route) =>
   trip.shiftTiming || route?.shiftTiming;
 
-/**
- * Requirement 9: before a driver or vehicle is put on a route/trip, make
- * sure they're not already committed to a DIFFERENT route/trip whose shift
- * overlaps this one. Unlike WeeklySchedule's conflict checks (which are
- * week-scoped), Trips represent a standing assignment, so this checks
- * across every currently ACTIVE trip for that driver/vehicle.
- *
- * Returns the conflicting Trip (with its route) or null.
- */
 const findStandingConflict = async ({
   driverId,
   vehicleId,
@@ -101,12 +78,6 @@ const findStandingConflict = async ({
   return null;
 };
 
-/**
- * Recomputes Route.maxCapacity as the sum of every ACTIVE trip's vehicle
- * capacity, and keeps the legacy Route.driverId pointer aligned with the
- * first ACTIVE trip so older single-driver queries/UI still show something
- * sensible. Call this after any trip create/update/remove.
- */
 const syncRouteFromTrips = async (routeId) => {
   const trips = await prisma.trip.findMany({
     where: { routeId, status: "ACTIVE" },
@@ -128,9 +99,6 @@ const syncRouteFromTrips = async (routeId) => {
   });
 };
 
-/**
- * How many employees are currently riding a given Trip for a given week.
- */
 const countTripOccupancy = async (tripId, weekStartDate, excludeEmployeeId) =>
   prisma.weeklySchedule.count({
     where: {
@@ -141,21 +109,12 @@ const countTripOccupancy = async (tripId, weekStartDate, excludeEmployeeId) =>
     },
   });
 
-/** Loads a trip with everything needed to compute capacity/remaining seats. */
 const loadTripFull = (tripId) =>
   prisma.trip.findUnique({
     where: { id: tripId },
     include: { route: true, driver: true, vehicle: true },
   });
 
-/**
- * Normalizes the free-form route payload used by create/update:
- * - resolves `area`/`subArea` names to areaId/subAreaId
- * - aliases `location`/`shiftTime` onto the real schema fields
- * - strips UI-only/legacy fields. Capacity and the route-level driver are
- *   derived from Trips now (see syncRouteFromTrips) and are never settable
- *   by hand through the route payload.
- */
 const normalizeRoutePayload = async (payload = {}) => {
   const normalized = { ...payload };
 
@@ -204,18 +163,6 @@ const normalizeRoutePayload = async (payload = {}) => {
 
 // ---------- Route creation ----------
 
-/**
- * Step 1-2 of the requested workflow: create the route and assign a driver;
- * the vehicle and its seating capacity are fetched directly from that
- * driver's assigned vehicle rather than being entered by hand, so the route
- * can never show a capacity that doesn't match the vehicle actually on it.
- *
- * Body:
- *   routeCode, routeName (routeName required; routeCode auto-generated if omitted)
- *   areaId, subAreaId, officeLocation, serviceType
- *   shiftTiming, pickupStartTime, dropTime
- *   driverId (required — a route always starts with a driver assigned)
- */
 const createRoute = async (req, res, next) => {
   try {
     const {
@@ -231,10 +178,13 @@ const createRoute = async (req, res, next) => {
       driverId,
     } = req.body;
 
-    if (!routeName || !driverId) {
-      const response = badRequestResponse(
-        "routeName and driverId are required.",
-      );
+    if (!routeName || !routeName.trim()) {
+      const response = badRequestResponse("Route name is required.");
+      return res.status(response.status.code).json(response);
+    }
+
+    if (!driverId) {
+      const response = badRequestResponse("Driver is required.");
       return res.status(response.status.code).json(response);
     }
 
@@ -259,9 +209,6 @@ const createRoute = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // Requirement 9: verify the driver (and, transitively, their vehicle)
-    // isn't already committed to a different route/trip during an
-    // overlapping shift before we let this route claim them.
     const conflict = await findStandingConflict({
       driverId,
       vehicleId: driver.vehicle.id,
@@ -297,19 +244,15 @@ const createRoute = async (req, res, next) => {
       const route = await tx.route.create({
         data: {
           routeCode: code,
-          routeName,
+          routeName: routeName.trim(),
           areaId: areaId || undefined,
           subAreaId: subAreaId || undefined,
           officeLocation: officeLocation || undefined,
           serviceType: serviceType || "PICK_AND_DROP",
           shiftTiming: shiftTiming || undefined,
-          pickupStartTime: pickupStartTime
-            ? new Date(pickupStartTime)
-            : undefined,
+          pickupStartTime: pickupStartTime ? new Date(pickupStartTime) : undefined,
           dropTime: dropTime ? new Date(dropTime) : undefined,
           driverId,
-          // Capacity is fetched directly from the assigned driver's vehicle,
-          // never entered manually.
           maxCapacity: driver.vehicle.capacity,
         },
       });
@@ -328,7 +271,7 @@ const createRoute = async (req, res, next) => {
       return { route, trip };
     });
 
-    const response = okResponse(
+    const response = createSuccessResponse(
       {
         route: result.route,
         trip: result.trip,
@@ -338,21 +281,13 @@ const createRoute = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
 
 // ---------- Overflow: additional trip on the same route ----------
 
-/**
- * Step 4/6 of the workflow (Option 2): when a route's current trip(s) are at
- * capacity, open ANOTHER trip on the SAME route — its own driver, vehicle,
- * and (derived) capacity — instead of creating a lookalike route. Multiple
- * trips share the route name; they're told apart by tripNumber.
- *
- * Route param (preferred) or body: routeId
- * Body: { driverId, shiftTiming? }
- */
 const addTripToRoute = async (req, res, next) => {
   try {
     const routeId = req.params.routeId || req.body.routeId;
@@ -378,7 +313,7 @@ const addTripToRoute = async (req, res, next) => {
     }
     if (!driver.vehicle) {
       const response = badRequestResponse(
-        "This driver has no vehicle assigned yet — assign a vehicle to the driver before adding this trip.",
+        "This driver has no vehicle assigned yet.",
       );
       return res.status(response.status.code).json(response);
     }
@@ -415,26 +350,19 @@ const addTripToRoute = async (req, res, next) => {
 
     await syncRouteFromTrips(routeId);
 
-    const response = okResponse(
+    const response = createSuccessResponse(
       { trip, capacity: driver.vehicle.capacity },
       `Trip ${tripNumber} opened on route "${route.routeName}" for overflow.`,
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
 
 // ---------- Driver/vehicle changes on an existing trip ----------
 
-/**
- * Requirement 8: if a trip's driver or vehicle changes, the route details
- * (capacity, and every already-assigned employee's denormalized
- * driver/vehicle) update automatically instead of going stale.
- *
- * Route param: tripId
- * Body (PATCH): { driverId?, vehicleId? } — at least one required.
- */
 const updateTripAssignment = async (req, res, next) => {
   try {
     const { tripId } = req.params;
@@ -456,10 +384,6 @@ const updateTripAssignment = async (req, res, next) => {
     let nextDriverId = driverId !== undefined ? driverId : trip.driverId;
     let nextVehicleId = vehicleId !== undefined ? vehicleId : trip.vehicleId;
 
-    // If only the driver changed and no vehicle was explicitly given, follow
-    // the driver's own paired vehicle — same "vehicle comes from the driver"
-    // rule used at route creation — unless the caller explicitly passed a
-    // vehicleId (including null, to intentionally detach).
     if (driverId !== undefined && vehicleId === undefined) {
       const newDriver = await prisma.driver.findUnique({
         where: { id: driverId },
@@ -471,7 +395,7 @@ const updateTripAssignment = async (req, res, next) => {
       }
       if (!newDriver.vehicle) {
         const response = badRequestResponse(
-          "This driver has no vehicle assigned yet — assign a vehicle to the driver before reassigning this trip to them.",
+          "This driver has no vehicle assigned yet.",
         );
         return res.status(response.status.code).json(response);
       }
@@ -502,9 +426,6 @@ const updateTripAssignment = async (req, res, next) => {
         include: { driver: true, vehicle: true },
       });
 
-      // Cascade the new driver/vehicle onto every WeeklySchedule row already
-      // riding this trip, so the weekly schedule reflects who's actually
-      // driving/using without a separate manual edit per employee.
       await tx.weeklySchedule.updateMany({
         where: { tripId: trip.id, status: { not: "CANCELLED" } },
         data: {
@@ -518,27 +439,40 @@ const updateTripAssignment = async (req, res, next) => {
 
     await syncRouteFromTrips(trip.routeId);
 
+    // Re-sync any already-generated PENDING rides so they pick up the new
+    // driver/vehicle too — not just the weeklySchedule template rows above.
+    // A trip can have active schedules across multiple weeks, so re-sync
+    // each distinct affected week rather than assuming a single weekStart.
+    const affectedWeeks = await prisma.weeklySchedule.findMany({
+      where: { tripId: trip.id, status: { not: "CANCELLED" } },
+      select: { weekStart: true },
+      distinct: ["weekStart"],
+    });
+
+    await Promise.all(
+      affectedWeeks.map(({ weekStart }) =>
+        syncPendingRidesForWeekBestEffort(weekStart, {
+          driverIds: [trip.driverId, nextDriverId].filter(Boolean),
+          tripIds: [trip.id],
+          vehicleIds: [trip.vehicleId, nextVehicleId].filter(Boolean),
+          routeIds: [trip.routeId],
+        }).catch(() => {}),
+      ),
+    );
+
     const response = okResponse(
       updatedTrip,
-      "Trip driver/vehicle updated and route details synced.",
+      "Trip driver/vehicle updated, route details synced, and pending rides re-synced.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
 
 // ---------- Employee assignment with capacity validation ----------
 
-/**
- * Steps 3-5 of the workflow: before assigning an employee, check remaining
- * capacity on the trip. If it's full, don't silently overbook — report the
- * overflow with the two options the workflow calls for (open a new route,
- * or open another trip on this route) so the caller/UI can act on it.
- *
- * Route param (preferred) or body: tripId
- * Body: { employeeId, weekStart, ...other WeeklySchedule fields }
- */
 const assignEmployeeToTrip = async (req, res, next) => {
   try {
     const tripId = req.params.tripId || req.body.tripId;
@@ -564,16 +498,10 @@ const assignEmployeeToTrip = async (req, res, next) => {
 
     const weekStartDate = toDateOnly(weekStart);
     const capacity = trip.vehicle.capacity;
-    const occupancy = await countTripOccupancy(
-      tripId,
-      weekStartDate,
-      employeeId,
-    );
+    const occupancy = await countTripOccupancy(tripId, weekStartDate, employeeId);
     const remaining = capacity - occupancy;
 
     if (remaining <= 0) {
-      // Requirement 5: never assign past capacity. Surface the two options
-      // from the workflow instead — the caller decides which to take.
       const siblingTrips = await prisma.trip.findMany({
         where: {
           routeId: trip.routeId,
@@ -590,8 +518,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
           weekStartDate,
           employeeId,
         );
-        const siblingRemaining =
-          (sibling.vehicle?.capacity || 0) - siblingOccupancy;
+        const siblingRemaining = (sibling.vehicle?.capacity || 0) - siblingOccupancy;
         if (siblingRemaining > 0) {
           tripsWithRoom.push({
             tripId: sibling.id,
@@ -602,8 +529,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
       }
 
       const response = badRequestResponse(
-        `Trip ${trip.tripNumber} on route "${trip.route.routeName}" is at capacity (${capacity}/${capacity}). ` +
-          "Either assign this employee to another trip with room, add a new trip to this route (a different available driver/vehicle), or create a new route for the overflow.",
+        `Trip ${trip.tripNumber} on route "${trip.route.routeName}" is at capacity (${capacity}/${capacity}).`,
       );
       response.data = {
         routeId: trip.routeId,
@@ -629,8 +555,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
       tripId: trip.id,
       driverId: trip.driverId,
       vehicleId: trip.vehicleId,
-      shiftTiming:
-        scheduleFields.shiftTiming || effectiveTripShift(trip, trip.route),
+      shiftTiming: scheduleFields.shiftTiming || effectiveTripShift(trip, trip.route),
       status: scheduleFields.status || "ACTIVE",
     };
 
@@ -650,12 +575,96 @@ const assignEmployeeToTrip = async (req, res, next) => {
       schedule = await prisma.weeklySchedule.create({ data });
     }
 
-    const response = okResponse(
+    const response = createSuccessResponse(
       { schedule, remainingSeats: remaining - 1, capacity },
       "Employee assigned to trip.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
+    next(error);
+  }
+};
+
+// ---------- Eligible employees for a trip's "Assign employee" picker ----------
+// Two things narrow the list down from "every employee in the company":
+//   1. Relevance — only employees in the route's area, on the route/trip's
+//      shift. Someone from a different area/shift is never a real candidate
+//      for this run.
+//   2. Availability — exclude anyone who already has an ACTIVE (non-
+//      CANCELLED) WeeklySchedule for the target week, on ANY trip. Without
+//      this, picking an already-scheduled employee here would silently
+//      move them off their existing trip (assignEmployeeToTrip upserts on
+//      employeeId+weekStart), with no visibility into that in the UI.
+const getEligibleEmployeesForTrip = async (req, res, next) => {
+  try {
+    const { tripId } = req.params;
+    const { weekStart, search } = req.query;
+
+    const trip = await prisma.trip.findUnique({
+      where: { id: tripId },
+      include: { route: true },
+    });
+    if (!trip) {
+      const response = badRequestResponse("Trip not found.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const weekStartDate = weekStart
+      ? toDateOnly(weekStart)
+      : currentWeekMonday();
+    const effectiveShift = effectiveTripShift(trip, trip.route);
+
+    const employeeWhere = {
+      status: "ACTIVE",
+      ...(trip.route?.areaId ? { areaId: trip.route.areaId } : {}),
+      ...(effectiveShift ? { shiftTiming: effectiveShift } : {}),
+      ...(search
+        ? {
+            OR: [
+              { name: { contains: search, mode: "insensitive" } },
+              { employeeCode: { contains: search, mode: "insensitive" } },
+            ],
+          }
+        : {}),
+    };
+
+    const [candidates, alreadyScheduled] = await Promise.all([
+      prisma.employee.findMany({
+        where: employeeWhere,
+        select: {
+          id: true,
+          name: true,
+          employeeCode: true,
+          areaId: true,
+          shiftTiming: true,
+        },
+        orderBy: { name: "asc" },
+        take: 200,
+      }),
+      prisma.weeklySchedule.findMany({
+        where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
+        select: { employeeId: true },
+      }),
+    ]);
+
+    const scheduledIds = new Set(alreadyScheduled.map((s) => s.employeeId));
+    const eligible = candidates.filter((e) => !scheduledIds.has(e.id));
+
+    const response = okResponse(
+      {
+        tripId,
+        weekStart: weekStartDate.toISOString().slice(0, 10),
+        shiftTiming: effectiveShift || null,
+        areaId: trip.route?.areaId || null,
+        employees: eligible,
+        excludedAlreadyScheduled: candidates.length - eligible.length,
+      },
+      "Eligible employees retrieved successfully.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -664,95 +673,164 @@ const assignEmployeeToTrip = async (req, res, next) => {
 
 const getAllRoutes = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10, status, areaId, serviceType } = req.query;
-    const offset = Math.max(Number.parseInt(skip, 10) || 0, 0);
-    const limit = Math.min(Math.max(Number.parseInt(take, 10) || 10, 1), 100);
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      areaId,
+      serviceType,
+      search,
+      sortBy = "createdAt",
+      sortOrder = "desc",
+    } = req.query;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
 
     const where = {};
     if (status) where.status = status;
     if (areaId) where.areaId = areaId;
     if (serviceType) where.serviceType = serviceType;
 
-    // Which week counts as "current" for the seats-badge on every route
-    // card. Default to today's real week, but if nobody anywhere has been
-    // scheduled for that exact week yet (e.g. rosters were set up for a
-    // different week), fall back to the most recent week that actually has
-    // active assignments — one query for the whole list rather than
-    // resolving per route, so this stays cheap regardless of page size.
-    let occupancyWeekStart = currentWeekMonday();
-    const hasCurrentWeekData =
-      (await prisma.weeklySchedule.count({
-        where: { weekStart: occupancyWeekStart, status: { not: "CANCELLED" } },
-      })) > 0;
-    if (!hasCurrentWeekData) {
-      const mostRecent = await prisma.weeklySchedule.findFirst({
-        where: { status: { not: "CANCELLED" } },
-        orderBy: { weekStart: "desc" },
-        select: { weekStart: true },
-      });
-      if (mostRecent) occupancyWeekStart = mostRecent.weekStart;
+    // Search functionality
+    if (search) {
+      where.OR = [
+        { routeCode: { contains: search, mode: "insensitive" } },
+        { routeName: { contains: search, mode: "insensitive" } },
+      ];
     }
+
+    let occupancyWeekStart = currentWeekMonday();
 
     const [routes, total] = await Promise.all([
       prisma.route.findMany({
         where,
-        // skip: offset,
-        // take: limit,
-
+        skip,
+        take,
         include: {
           area: { select: { id: true, name: true } },
           subArea: { select: { id: true, name: true } },
           trips: {
             where: { status: "ACTIVE" },
             include: {
-              // Trip owns driver/vehicle now — Route.driver is only kept
-              // around for legacy back-compat writes (see schema comment),
-              // it's not selected here since every current-flow route's
-              // "who's driving" answer comes from its trips.
               driver: { select: { id: true, name: true } },
               vehicle: {
                 select: { id: true, vehicleNumber: true, capacity: true },
-              },
-              // Occupancy for occupancyWeekStart (resolved above), computed
-              // once here so every route card can show real
-              // "assigned/capacity" seats without a second round trip.
-              weeklySchedules: {
-                where: {
-                  weekStart: occupancyWeekStart,
-                  status: { not: "CANCELLED" },
-                },
-                select: { id: true },
               },
             },
             orderBy: { tripNumber: "asc" },
           },
         },
-        orderBy: { createdAt: "desc" },
+        orderBy: { [sortBy]: sortOrder },
       }),
       prisma.route.count({ where }),
     ]);
 
-    const shapedRoutes = routes.map((route) => ({
-      ...route,
-      trips: route.trips.map((trip) => ({
-        ...trip,
-        ...shapeTripOccupancy(trip),
-      })),
-    }));
+    // Occupancy is resolved PER ROUTE, not once globally — a route with no
+    // schedules for the current week must fall back to *its own* most
+    // recent scheduled week, never another route's. Applying one
+    // system-wide "most recent" week to every route on the page made a
+    // quiet route borrow a busy route's week (or vice versa), showing
+    // occupancy for a week that route had nothing to do with.
+    const allTripIds = routes.flatMap((route) => route.trips.map((t) => t.id));
+
+    const currentWeekCounts = allTripIds.length
+      ? await prisma.weeklySchedule.groupBy({
+          by: ["tripId"],
+          where: {
+            tripId: { in: allTripIds },
+            weekStart: occupancyWeekStart,
+            status: { not: "CANCELLED" },
+          },
+          _count: { _all: true },
+        })
+      : [];
+    const currentWeekCountByTrip = new Map(
+      currentWeekCounts.map((c) => [c.tripId, c._count._all]),
+    );
+
+    const routesNeedingFallback = routes.filter((route) => {
+      const tripIds = route.trips.map((t) => t.id);
+      return (
+        tripIds.length > 0 &&
+        tripIds.every((id) => !currentWeekCountByTrip.get(id))
+      );
+    });
+
+    const fallbackWeekByRoute = new Map();
+    await Promise.all(
+      routesNeedingFallback.map(async (route) => {
+        const tripIds = route.trips.map((t) => t.id);
+        const mostRecent = await prisma.weeklySchedule.findFirst({
+          where: { tripId: { in: tripIds }, status: { not: "CANCELLED" } },
+          orderBy: { weekStart: "desc" },
+          select: { weekStart: true },
+        });
+        if (mostRecent) fallbackWeekByRoute.set(route.id, mostRecent.weekStart);
+      }),
+    );
+
+    const fallbackCountByTrip = new Map();
+    await Promise.all(
+      routesNeedingFallback.map(async (route) => {
+        const weekStart = fallbackWeekByRoute.get(route.id);
+        if (!weekStart) return;
+        const tripIds = route.trips.map((t) => t.id);
+        const counts = await prisma.weeklySchedule.groupBy({
+          by: ["tripId"],
+          where: {
+            tripId: { in: tripIds },
+            weekStart,
+            status: { not: "CANCELLED" },
+          },
+          _count: { _all: true },
+        });
+        counts.forEach((c) => fallbackCountByTrip.set(c.tripId, c._count._all));
+      }),
+    );
+
+    const shapedRoutes = routes.map((route) => {
+      const usesFallback = fallbackWeekByRoute.has(route.id);
+      const resolvedWeekStart = usesFallback
+        ? fallbackWeekByRoute.get(route.id)
+        : occupancyWeekStart;
+
+      return {
+        ...route,
+        occupancyWeekStart: resolvedWeekStart.toISOString().slice(0, 10),
+        occupancyResolvedAutomatically: usesFallback,
+        trips: route.trips.map((trip) => {
+          const assignedEmployees = usesFallback
+            ? fallbackCountByTrip.get(trip.id) || 0
+            : currentWeekCountByTrip.get(trip.id) || 0;
+          const capacity = trip.vehicle?.capacity || 0;
+          return {
+            ...trip,
+            capacity,
+            assignedEmployees,
+            remainingSeats: Math.max(capacity - assignedEmployees, 0),
+          };
+        }),
+      };
+    });
 
     const response = okResponse(
       {
         routes: shapedRoutes,
-        // pagination: {
-        //   total,
-        //   limit,
-        //   offset,
-        // },
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
       },
       "Routes retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -777,10 +855,19 @@ const getRouteById = async (req, res, next) => {
           },
         },
         rides: {
+          take: 10,
+          orderBy: { rideDate: "desc" },
           include: {
             driver: { select: { id: true, name: true } },
             vehicle: { select: { id: true, vehicleNumber: true } },
             passengers: true,
+          },
+        },
+        _count: {
+          select: {
+            trips: true,
+            weeklySchedules: true,
+            rides: true,
           },
         },
       },
@@ -794,15 +881,11 @@ const getRouteById = async (req, res, next) => {
     const response = okResponse(route, "Route retrieved successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
 
-/**
- * Route-level fields only (name, area, office location, shift, etc). Driver
- * and capacity are NOT editable here — they're derived from Trips, so use
- * addTripToRoute / updateTripAssignment to change who's actually driving.
- */
 const updateRoute = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -827,7 +910,7 @@ const updateRoute = async (req, res, next) => {
 
     const updated = await prisma.route.update({
       where: { id },
-      data: { ...updateData, updatedAt: new Date() },
+      data: updateData,
       include: {
         area: true,
         subArea: true,
@@ -842,6 +925,7 @@ const updateRoute = async (req, res, next) => {
     const response = okResponse(updated, "Route updated successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -853,9 +937,13 @@ const deleteRoute = async (req, res, next) => {
     const route = await prisma.route.findUnique({
       where: { id },
       include: {
-        trips: { where: { status: "ACTIVE" } },
-        weeklySchedules: { where: { status: { not: "CANCELLED" } } },
-        rides: true,
+        _count: {
+          select: {
+            trips: true,
+            weeklySchedules: true,
+            rides: true,
+          },
+        },
       },
     });
 
@@ -864,22 +952,27 @@ const deleteRoute = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    if (
-      route.trips.length > 0 ||
-      route.weeklySchedules.length > 0 ||
-      route.rides.length > 0
-    ) {
+    const blocking = [];
+    if (route._count.trips > 0) blocking.push(`${route._count.trips} trip(s)`);
+    if (route._count.weeklySchedules > 0) blocking.push(`${route._count.weeklySchedules} schedule(s)`);
+    if (route._count.rides > 0) blocking.push(`${route._count.rides} ride(s)`);
+
+    if (blocking.length > 0) {
       const response = badRequestResponse(
-        "Cannot delete route with active trips, schedules, or rides.",
+        `Cannot delete route: referenced by ${blocking.join(", ")}. Remove related records first.`
       );
       return res.status(response.status.code).json(response);
     }
 
     await prisma.route.delete({ where: { id } });
 
-    const response = okResponse(null, "Route deleted successfully.");
+    const response = okResponse(
+      { id: route.id, routeName: route.routeName },
+      "Route deleted successfully."
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -887,12 +980,30 @@ const deleteRoute = async (req, res, next) => {
 const getRouteEmployees = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const { page = 1, limit = 10, search } = req.query;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
 
     const route = await prisma.route.findUnique({
       where: { id },
       include: {
         weeklySchedules: {
-          where: { status: { not: "CANCELLED" } },
+          where: {
+            status: { not: "CANCELLED" },
+            ...(search
+              ? {
+                  employee: {
+                    OR: [
+                      { name: { contains: search, mode: "insensitive" } },
+                      { employeeCode: { contains: search, mode: "insensitive" } },
+                    ],
+                  },
+                }
+              : {}),
+          },
+          skip,
+          take,
           include: {
             employee: {
               select: {
@@ -902,15 +1013,20 @@ const getRouteEmployees = async (req, res, next) => {
                 contactNumber: true,
               },
             },
-            // Driver is read off the employee's Trip, not the schedule's
-            // own denormalized driverId/route — Trip is the source of
-            // truth for "who's actually driving this employee".
             trip: {
               select: {
                 id: true,
                 tripNumber: true,
                 driver: { select: { id: true, name: true, phone: true } },
               },
+            },
+          },
+          orderBy: { createdAt: "desc" },
+        },
+        _count: {
+          select: {
+            weeklySchedules: {
+              where: { status: { not: "CANCELLED" } },
             },
           },
         },
@@ -922,6 +1038,8 @@ const getRouteEmployees = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
+    const total = route._count.weeklySchedules;
+
     const response = okResponse(
       {
         routeId: route.id,
@@ -932,11 +1050,20 @@ const getRouteEmployees = async (req, res, next) => {
           driver: schedule.trip?.driver ?? null,
           schedule,
         })),
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
       },
       "Route employees retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -944,36 +1071,58 @@ const getRouteEmployees = async (req, res, next) => {
 const getRouteRides = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { skip = 0, take = 10, status } = req.query;
+    const { page = 1, limit = 10, status, fromDate, toDate } = req.query;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
 
     const where = { routeId: id };
     if (status) where.status = status;
+    if (fromDate || toDate) {
+      where.rideDate = {};
+      if (fromDate) where.rideDate.gte = new Date(fromDate);
+      if (toDate) where.rideDate.lte = new Date(toDate);
+    }
 
     const [rides, total] = await Promise.all([
       prisma.ride.findMany({
         where,
-        skip: parseInt(skip),
-        take: parseInt(take),
+        skip,
+        take,
         include: {
           driver: { select: { id: true, name: true } },
           vehicle: { select: { id: true, vehicleNumber: true } },
-          passengers: true,
+          _count: { select: { passengers: true } },
         },
         orderBy: { rideDate: "desc" },
       }),
       prisma.ride.count({ where }),
     ]);
 
+    const ridesWithCounts = rides.map((ride) => ({
+      ...ride,
+      passengerCount: ride._count.passengers,
+      _count: undefined,
+    }));
+
     const response = okResponse(
       {
         routeId: id,
-        rides,
-        pagination: { total, limit: parseInt(take), offset: parseInt(skip) },
+        rides: ridesWithCounts,
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
       },
       "Route rides retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -999,7 +1148,12 @@ const getRouteStats = async (req, res, next) => {
           },
           orderBy: { tripNumber: "asc" },
         },
-        rides: { select: { id: true } },
+        _count: {
+          select: {
+            rides: true,
+            weeklySchedules: true,
+          },
+        },
       },
     });
 
@@ -1023,7 +1177,8 @@ const getRouteStats = async (req, res, next) => {
       maxCapacity: route.maxCapacity,
       tripCount: trips.length,
       employeeCount: trips.reduce((sum, t) => sum + t.assignedEmployees, 0),
-      totalRides: route.rides.length,
+      totalRides: route._count.rides,
+      totalSchedules: route._count.weeklySchedules,
       trips,
       status: route.status,
     };
@@ -1034,20 +1189,11 @@ const getRouteStats = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
 
-// ---------- Weekly schedule display for a route ----------
-
-/**
- * Requirement 7: everything the weekly schedule needs to show for a route —
- * route name, shift, each trip's number/driver/vehicle/capacity, assigned
- * count, and remaining seats — in one call.
- *
- * Route param: routeId
- * Query: weekStart (optional — see resolution below)
- */
 const getRouteWeeklyView = async (req, res, next) => {
   try {
     const { routeId } = req.params;
@@ -1068,15 +1214,6 @@ const getRouteWeeklyView = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // Resolve which week to show. An explicit weekStart is always honored —
-    // the caller is intentionally looking at that week. Otherwise, default
-    // to "today's" week, but if that week has zero assignments for this
-    // route while some OTHER week does, show the most recent week that
-    // actually has assignments instead. Without this, a route whose roster
-    // was scheduled for a different week (e.g. seeded/demo data, or a
-    // roster set up ahead of/behind the literal calendar week) silently
-    // renders as "0/N seats" even though people really are assigned —
-    // indistinguishable from a genuinely empty trip.
     let weekStartDate = weekStart ? toDateOnly(weekStart) : currentWeekMonday();
     let resolvedAutomatically = false;
 
@@ -1112,9 +1249,7 @@ const getRouteWeeklyView = async (req, res, next) => {
         return {
           tripId: trip.id,
           tripNumber: trip.tripNumber,
-          driver: trip.driver
-            ? { id: trip.driver.id, name: trip.driver.name }
-            : null,
+          driver: trip.driver ? { id: trip.driver.id, name: trip.driver.name } : null,
           vehicle: trip.vehicle
             ? {
                 id: trip.vehicle.id,
@@ -1136,9 +1271,6 @@ const getRouteWeeklyView = async (req, res, next) => {
         routeCode: route.routeCode,
         shiftTiming: route.shiftTiming,
         multiTrip: trips.length > 1,
-        // The actual week these numbers reflect — always echoed back so the
-        // UI can label it, since it may not be the caller's requested/
-        // assumed week when resolvedAutomatically is true.
         weekStart: weekStartDate.toISOString().slice(0, 10),
         resolvedAutomatically,
         trips,
@@ -1147,6 +1279,7 @@ const getRouteWeeklyView = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -1156,6 +1289,7 @@ module.exports = {
   addTripToRoute,
   updateTripAssignment,
   assignEmployeeToTrip,
+  getEligibleEmployeesForTrip,
   getAllRoutes,
   getRouteById,
   updateRoute,

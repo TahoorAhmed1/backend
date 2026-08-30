@@ -5,9 +5,42 @@ const {
   okResponse,
   unauthorizedResponse,
 } = require("../../constants/responses");
-const { comparePasswords, createToken } = require("../../services/auth.service");
+const { comparePasswords, createToken, hashPassword } = require("../../services/auth.service");
 
+const registerUser = async (req, res, next) => {
+  try {
+    const { email, password, role } = req.body;
 
+    const existingUser = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (existingUser) {
+      const response = badRequestResponse("Email already exists.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const passwordHash = await hashPassword(password);
+
+    const newUser = await prisma.user.create({
+      data: {
+        email,
+        passwordHash,
+        role,
+      },
+    });
+    
+
+    const response = createSuccessResponse(
+      { user: newUser },
+      "User registered successfully.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log('error', error)
+    next(error);
+  }
+}
 
 const login = async (req, res, next) => {
   try {
@@ -85,4 +118,5 @@ module.exports = {
   login,
   getMe,
   userList,
+  registerUser
 };

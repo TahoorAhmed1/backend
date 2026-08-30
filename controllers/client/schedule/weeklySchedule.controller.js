@@ -5,7 +5,6 @@ const {
   getRecords,
   getRecordById,
   updateRecord,
-  deleteRecord,
 } = require("../../../utils/crudHelper");
 const {
   badRequestResponse,
@@ -57,6 +56,63 @@ const {
   MAX_BATCH_SIZE,
   DEFAULT_BATCH_SIZE,
 } = require("../../../services/bulkUpload.service");
+
+const FK_CHECKS = [
+  { field: "routeId", model: "route", label: "Route" },
+  { field: "tripId", model: "trip", label: "Trip" },
+  { field: "driverId", model: "driver", label: "Driver" },
+  { field: "vehicleId", model: "vehicle", label: "Vehicle" },
+];
+
+const validateWeeklyScheduleForeignKeys = async (data) => {
+  const checks = FK_CHECKS.filter(
+    ({ field }) => field in data && data[field] != null,
+  );
+  if (checks.length === 0) return null;
+
+  const results = await Promise.all(
+    checks.map(({ model, field }) =>
+      prisma[model].findUnique({
+        where: { id: data[field] },
+        select: { id: true },
+      }),
+    ),
+  );
+
+  const missing = checks
+    .filter((_, i) => !results[i])
+    .map(({ label }) => label);
+
+  if (missing.length === 0) return null;
+  return `${missing.join(", ")} not found for the given id${missing.length > 1 ? "s" : ""}.`;
+};
+
+const deleteScheduleAndOrphanedRides = async (schedule) => {
+  const weekStartDate = schedule.weekStart;
+  const employeeId = schedule.employeeId;
+  const weekEnd = new Date(weekStartDate);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.ridePassenger.deleteMany({
+      where: {
+        employeeId,
+        ride: { rideDate: { gte: weekStartDate, lt: weekEnd } },
+      },
+    });
+
+    await tx.ride.deleteMany({
+      where: {
+        rideDate: { gte: weekStartDate, lt: weekEnd },
+        passengers: { none: {} },
+      },
+    });
+
+    await tx.weeklySchedule.delete({ where: { id: schedule.id } });
+  });
+
+  return { weekStartDate, employeeId };
+};
 
 const resolvePendingVehicleAssignments = async (req, res, next) => {
   try {
@@ -119,6 +175,8 @@ const resolvePendingVehicleAssignments = async (req, res, next) => {
     };
 
     const driverCache = new Map();
+    const affectedDriverIds = [];
+    const affectedRouteIds = [];
 
     for (const entry of candidates) {
       const before = { ...entry };
@@ -213,6 +271,9 @@ const resolvePendingVehicleAssignments = async (req, res, next) => {
       );
 
       summary.vehiclesLinked++;
+      affectedDriverIds.push(entry.driverId);
+      if (entry.routeId) affectedRouteIds.push(entry.routeId);
+
       summary.details.push({
         weeklyScheduleId: entry.id,
         employeeId: entry.employeeId,
@@ -223,7 +284,10 @@ const resolvePendingVehicleAssignments = async (req, res, next) => {
     }
 
     if (summary.vehiclesLinked > 0) {
-      await syncPendingRidesForWeekBestEffort(weekStartDate);
+      syncPendingRidesForWeekBestEffort(weekStartDate, {
+        driverIds: [...new Set(affectedDriverIds)],
+        routeIds: [...new Set(affectedRouteIds)],
+      }).catch(() => {});
     }
 
     const response = okResponse(
@@ -243,7 +307,17 @@ const optimizeRouteAssignments = async (req, res, next) => {
       const response = badRequestResponse("weekStart is required.");
       return res.status(response.status.code).json(response);
     }
-    const summary = await optimizeWeekAssignments(toDateOnly(weekStart));
+    const weekStartDate = toDateOnly(weekStart);
+    const summary = await optimizeWeekAssignments(weekStartDate);
+
+    if (summary?.optimizedRoutes?.length > 0) {
+      syncPendingRidesForWeekBestEffort(weekStartDate, {
+        routeIds: summary.optimizedRoutes.map((r) => r.id),
+        driverIds: summary.affectedDriverIds || [],
+        tripIds: summary.affectedTripIds || [],
+      }).catch(() => {});
+    }
+
     const response = okResponse(
       summary,
       "Route assignments optimized for the week.",
@@ -352,6 +426,17 @@ const createWeeklySchedule = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
+    const fkError = await validateWeeklyScheduleForeignKeys({
+      routeId,
+      tripId,
+      driverId,
+      vehicleId,
+    });
+    if (fkError) {
+      const response = badRequestResponse(fkError);
+      return res.status(response.status.code).json(response);
+    }
+
     const response = await createRecord(prisma.weeklySchedule, {
       weekStart: toDateOnly(weekStart),
       employeeId,
@@ -383,7 +468,11 @@ const createWeeklySchedule = async (req, res, next) => {
       }
     }
 
-    await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
+    syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+      driverId,
+      tripId,
+      routeId,
+    }).catch(() => {});
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -395,7 +484,7 @@ const getAllWeeklySchedules = async (req, res, next) => {
   try {
     const {
       page = 1,
-      limit = 10,  
+      limit = 10,
       employeeId,
       status,
       weekStart,
@@ -405,13 +494,11 @@ const getAllWeeklySchedules = async (req, res, next) => {
       sortOrder = "desc",
     } = req.query;
 
-    // Parse pagination parameters
     const pageNumber = Math.max(1, parseInt(page, 10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
     const skip = (pageNumber - 1) * pageSize;
     const take = pageSize;
 
-    // Build where clause
     const where = {};
     if (employeeId) where.employeeId = employeeId;
     if (routeId) where.routeId = routeId;
@@ -438,7 +525,6 @@ const getAllWeeklySchedules = async (req, res, next) => {
       ];
     }
 
-    // Build orderBy clause
     const orderBy = [];
     switch (sortBy) {
       case "employeeName":
@@ -457,10 +543,8 @@ const getAllWeeklySchedules = async (req, res, next) => {
         break;
     }
 
-    // Get total count for pagination
     const totalCount = await prisma.weeklySchedule.count({ where });
 
-    // Get paginated records
     const schedules = await prisma.weeklySchedule.findMany({
       where,
       skip,
@@ -515,12 +599,10 @@ const getAllWeeklySchedules = async (req, res, next) => {
       orderBy,
     });
 
-    // Calculate pagination metadata
     const totalPages = Math.ceil(totalCount / pageSize);
     const hasNextPage = pageNumber < totalPages;
     const hasPrevPage = pageNumber > 1;
 
-    // Build response
     const response = okResponse(
       {
         data: schedules,
@@ -625,6 +707,12 @@ const updateWeeklySchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    const fkError = await validateWeeklyScheduleForeignKeys(updateData);
+    if (fkError) {
+      const errorResponse = badRequestResponse(fkError);
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
     const response = await updateRecord(prisma.weeklySchedule, id, updateData, {
       employee: true,
       route: true,
@@ -649,9 +737,14 @@ const updateWeeklySchedule = async (req, res, next) => {
       }
     }
 
-    await syncPendingRidesForWeekBestEffort(
+    syncPendingRidesForWeekBestEffort(
       updateData.weekStart || schedule.weekStart,
-    );
+      {
+        driverIds: [schedule.driverId, updateData.driverId].filter(Boolean),
+        tripIds: [schedule.tripId, updateData.tripId].filter(Boolean),
+        routeIds: [schedule.routeId, updateData.routeId].filter(Boolean),
+      },
+    ).catch(() => {});
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -672,10 +765,18 @@ const deleteWeeklySchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const response = await deleteRecord(prisma.weeklySchedule, id);
+    await deleteScheduleAndOrphanedRides(schedule);
 
-    await syncPendingRidesForWeekBestEffort(schedule.weekStart);
+    syncPendingRidesForWeekBestEffort(schedule.weekStart, {
+      driverId: schedule.driverId,
+      tripId: schedule.tripId,
+      routeId: schedule.routeId,
+    }).catch(() => {});
 
+    const response = okResponse(
+      { id },
+      "Weekly schedule and associated rides deleted successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -687,18 +788,17 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
     const { id } = req.params;
     const updateData = { ...req.body };
 
-    // Remove fields that shouldn't be updated directly
     delete updateData.id;
     delete updateData.createdAt;
     delete updateData.updatedAt;
-    delete updateData.employeeId; // Prevent changing employee
+    delete updateData.employeeId;
 
-    // Handle weekStart if provided
+    delete updateData.pickupTime;
+
     if (updateData.weekStart) {
       updateData.weekStart = toDateOnly(updateData.weekStart);
     }
 
-    // Parse time fields
     if ("officeArrivalTime" in updateData) {
       const parsed = updateData.officeArrivalTime
         ? toShiftTimeDate(updateData.officeArrivalTime)
@@ -739,7 +839,6 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
       updateData.vehicleEntity = normalized;
     }
 
-    // Check if schedule exists
     const schedule = await prisma.weeklySchedule.findUnique({
       where: { id },
     });
@@ -748,7 +847,12 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Update ONLY this schedule - no side effects
+    const fkError = await validateWeeklyScheduleForeignKeys(updateData);
+    if (fkError) {
+      const errorResponse = badRequestResponse(fkError);
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
     const updated = await prisma.weeklySchedule.update({
       where: { id },
       data: updateData,
@@ -766,10 +870,6 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
       },
     });
 
-    // ✅ NO syncPendingRidesForWeekBestEffort()
-    // ✅ NO optimizeWeekAssignments()
-    // ✅ ONLY this employee's schedule is updated
-
     const response = okResponse(
       updated,
       "Employee schedule updated successfully. No rides were resynced.",
@@ -784,7 +884,6 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    // Check if schedule exists
     const schedule = await prisma.weeklySchedule.findUnique({
       where: { id },
     });
@@ -794,44 +893,8 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const weekStartDate = schedule.weekStart;
-    const employeeId = schedule.employeeId;
-    const weekEnd = new Date(weekStartDate);
-    weekEnd.setDate(weekEnd.getDate() + 7);
-
-    // ✅ Delete ONLY Rides and RidePassenger for this employee in this week
-    await prisma.$transaction(async (tx) => {
-      // 1. Delete RidePassenger entries
-      await tx.ridePassenger.deleteMany({
-        where: {
-          employeeId: employeeId,
-          ride: {
-            rideDate: {
-              gte: weekStartDate,
-              lt: weekEnd,
-            },
-          },
-        },
-      });
-
-      // 2. Delete Ride entries (only if no passengers left)
-      await tx.ride.deleteMany({
-        where: {
-          rideDate: {
-            gte: weekStartDate,
-            lt: weekEnd,
-          },
-          passengers: {
-            none: {},
-          },
-        },
-      });
-
-      // 3. Delete the WeeklySchedule
-      await tx.weeklySchedule.delete({
-        where: { id },
-      });
-    });
+    const { weekStartDate, employeeId } =
+      await deleteScheduleAndOrphanedRides(schedule);
 
     const response = okResponse(
       {
@@ -853,7 +916,6 @@ const updateTripDriver = async (req, res, next) => {
     const { tripId } = req.params;
     const { driverId, weekStart } = req.body;
 
-    // ✅ Step 1: Get the trip with its details
     const trip = await prisma.trip.findUnique({
       where: { id: tripId },
       include: {
@@ -885,14 +947,11 @@ const updateTripDriver = async (req, res, next) => {
     let driverData = null;
     let conflictingTrip = null;
 
-    // ✅ Step 2: If assigning a driver, validate and get their vehicle
     if (safeDriverId) {
-      // Get the driver with their vehicle
       const driver = await prisma.driver.findUnique({
         where: { id: safeDriverId },
         include: {
           vehicle: true,
-          // Get all active trips for this driver to check for conflicts
           trips: {
             where: {
               status: "ACTIVE",
@@ -916,7 +975,6 @@ const updateTripDriver = async (req, res, next) => {
 
       driverData = driver;
 
-      // ✅ Check if driver has a vehicle
       if (!driver.vehicle) {
         const errorResponse = badRequestResponse(
           `Driver ${driver.name} does not have a vehicle assigned. Please assign a vehicle to this driver first.`,
@@ -924,13 +982,10 @@ const updateTripDriver = async (req, res, next) => {
         return res.status(errorResponse.status.code).json(errorResponse);
       }
 
-      // ✅ REMOVED: Driver status check - allow assigning drivers regardless of status
-      // A driver can be ON_RIDE for their current trip but still be assigned to future trips
       console.log(
         `[updateTripDriver] Assigning driver ${driver.name} (status: ${driver.status}) to trip. Status doesn't prevent assignment.`,
       );
 
-      // ✅ Set new vehicle to driver's vehicle ID
       newVehicleId = driver.vehicle.id;
 
       console.log(
@@ -942,13 +997,14 @@ const updateTripDriver = async (req, res, next) => {
         driver.vehicle.id,
       );
 
-      // ✅ Check for conflicting trips ONLY at the same shift timing
-      // A driver can have multiple trips for different shifts/days
+      // ✅ ONLY look for conflicting trips on the SAME ROUTE
+      // Different routes = different trips, even if shift timing is the same
       conflictingTrip = await prisma.trip.findFirst({
         where: {
           driverId: safeDriverId,
           shiftTiming: trip.shiftTiming,
           status: "ACTIVE",
+          routeId: trip.routeId, // ✅ SAME ROUTE ONLY
           id: { not: tripId },
           weeklySchedules: {
             some: {
@@ -971,15 +1027,14 @@ const updateTripDriver = async (req, res, next) => {
         },
       });
 
-      // ✅ If driver has conflicting trip at same shift, MERGE employees into that trip
       if (conflictingTrip) {
+        // ✅ We found a trip on the SAME ROUTE with the same shift
         console.log(
-          "[updateTripDriver] Driver has conflicting trip at same shift:",
+          "[updateTripDriver] Driver has conflicting trip at same shift on SAME ROUTE:",
           conflictingTrip.id,
           "- Will merge employees",
         );
 
-        // Check if driver's trip has available seats
         const vehicleCapacity = driver.vehicle.capacity || 6;
         const currentEmployees = conflictingTrip.weeklySchedules.length;
         const employeesToMove = trip.weeklySchedules.length;
@@ -987,16 +1042,14 @@ const updateTripDriver = async (req, res, next) => {
 
         if (totalEmployees > vehicleCapacity) {
           const errorResponse = badRequestResponse(
-            `Cannot merge trips. Driver ${driver.name}'s trip has ${currentEmployees} employees ` +
-              `and this trip has ${employeesToMove} employees. Total (${totalEmployees}) exceeds ` +
+            `Cannot merge trips. Driver ${driver.name}'s trip on route ${conflictingTrip.route?.code || "N/A"} has ${currentEmployees} employees ` +
+              `and this trip on route ${trip.route?.code || "N/A"} has ${employeesToMove} employees. Total (${totalEmployees}) exceeds ` +
               `vehicle capacity (${vehicleCapacity} seats). Please reduce employees or assign a larger vehicle.`,
           );
           return res.status(errorResponse.status.code).json(errorResponse);
         }
 
-        // ✅ Use a transaction for all the merge operations
         const result = await prisma.$transaction(async (tx) => {
-          // MOVE all employees from current trip to driver's existing trip
           await tx.weeklySchedule.updateMany({
             where: {
               tripId: tripId,
@@ -1011,9 +1064,11 @@ const updateTripDriver = async (req, res, next) => {
             },
           });
 
-          // Delete the old trip (now empty)
           await tx.ride.deleteMany({
-            where: { tripId: tripId },
+            where: {
+              tripId: tripId,
+              status: "PENDING",
+            },
           });
 
           await tx.trip.delete({
@@ -1023,9 +1078,12 @@ const updateTripDriver = async (req, res, next) => {
           return { employeesMoved: employeesToMove };
         });
 
-        // ✅ Sync rides
         if (weekStart) {
-          await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
+          syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+            driverIds: [trip.driverId, safeDriverId].filter(Boolean),
+            tripIds: [tripId, conflictingTrip.id],
+            vehicleIds: [trip.vehicleId, driver.vehicle.id].filter(Boolean),
+          }).catch(() => {});
         }
 
         const response = okResponse(
@@ -1040,14 +1098,33 @@ const updateTripDriver = async (req, res, next) => {
             totalEmployeesInTarget: totalEmployees,
             vehicleCapacity: vehicleCapacity,
             seatsRemaining: vehicleCapacity - totalEmployees,
-            message: `Employees merged into driver ${driver.name}'s existing trip at same shift. Empty trip deleted.`,
+            routeCode: conflictingTrip.route?.code || "N/A",
+            message: `Employees merged into driver ${driver.name}'s existing trip on the same route. Empty trip deleted.`,
           },
-          `Trip merged into existing trip. ${result.employeesMoved} employee(s) moved to ${driver.name}'s trip with vehicle ${driver.vehicle.vehicleNumber}.`,
+          `Trip merged into existing trip on route ${conflictingTrip.route?.code || "N/A"}. ${result.employeesMoved} employee(s) moved to ${driver.name}'s trip with vehicle ${driver.vehicle.vehicleNumber}.`,
         );
         return res.status(response.status.code).json(response);
       }
 
-      // ✅ Check vehicle capacity vs employees (only if no conflicting trip)
+      // ✅ Check if driver has trips on DIFFERENT routes at the same shift
+      const otherTripsDifferentRoutes = driver.trips.filter(
+        (t) =>
+          t.id !== tripId &&
+          t.shiftTiming === trip.shiftTiming &&
+          t.routeId !== trip.routeId && // Different route
+          t.status === "ACTIVE",
+      );
+
+      if (otherTripsDifferentRoutes.length > 0) {
+        // ✅ This is fine! Driver can have separate trips on different routes
+        // with the same shift timing (e.g., Route A and Route B are different areas)
+        console.log(
+          `[updateTripDriver] Driver has ${otherTripsDifferentRoutes.length} other trip(s) at same shift but on DIFFERENT routes. ` +
+            `These will remain separate trips. Routes: ${otherTripsDifferentRoutes.map((t) => t.route?.code || "N/A").join(", ")}`,
+        );
+        // ✅ No blocking - just log it
+      }
+
       const employeeCount = trip.weeklySchedules.length;
       const vehicleCapacity = driver.vehicle.capacity || 6;
 
@@ -1059,7 +1136,6 @@ const updateTripDriver = async (req, res, next) => {
         return res.status(errorResponse.status.code).json(errorResponse);
       }
 
-      // ✅ Check if vehicle is available
       if (driver.vehicle.status !== "ACTIVE") {
         const errorResponse = badRequestResponse(
           `Driver's vehicle ${driver.vehicle.vehicleNumber} is currently ${driver.vehicle.status}. Only ACTIVE vehicles can be used.`,
@@ -1075,7 +1151,6 @@ const updateTripDriver = async (req, res, next) => {
       );
     }
 
-    // ✅ Step 3: If removing driver (driverId = null), validate
     if (!safeDriverId) {
       if (trip.weeklySchedules.length > 0) {
         const errorResponse = badRequestResponse(
@@ -1086,10 +1161,8 @@ const updateTripDriver = async (req, res, next) => {
       }
     }
 
-    // ✅ Step 4: Perform the update using a single transaction
     const [updatedTrip, updatedSchedules, auditLog] = await prisma.$transaction(
       async (tx) => {
-        // Update trip
         const tripResult = await tx.trip.update({
           where: { id: tripId },
           data: {
@@ -1107,7 +1180,6 @@ const updateTripDriver = async (req, res, next) => {
           },
         });
 
-        // Update all associated weekly schedules
         const schedulesResult = await tx.weeklySchedule.updateMany({
           where: {
             tripId,
@@ -1119,7 +1191,6 @@ const updateTripDriver = async (req, res, next) => {
           },
         });
 
-        // Create audit log within the same transaction
         const auditResult = await tx.auditLog.create({
           data: {
             userId: req.user?.id || null,
@@ -1146,12 +1217,15 @@ const updateTripDriver = async (req, res, next) => {
       },
     );
 
-    // ✅ Sync rides for the week (outside transaction)
     if (weekStart) {
-      await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart));
+      syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+        driverIds: [trip.driverId, safeDriverId].filter(Boolean),
+        tripIds: [tripId],
+        vehicleIds: [trip.vehicleId, newVehicleId].filter(Boolean),
+        routeIds: [trip.routeId, updatedTrip.routeId].filter(Boolean),
+      }).catch(() => {});
     }
 
-    // ✅ Return response with details
     const response = okResponse(
       {
         action: "UPDATED_TRIP",
@@ -1187,13 +1261,11 @@ const findExistingTripWithSeats = async ({
 }) => {
   if (!areaId || !shiftTiming) return null;
 
-  // ✅ Find trips with matching shift and area (via route)
   const trips = await prisma.trip.findMany({
     where: {
       shiftTiming: shiftTiming,
       status: "ACTIVE",
       id: excludeTripId ? { not: excludeTripId } : undefined,
-      // ✅ Join with route to filter by areaId
       route: {
         areaId: areaId,
       },
@@ -1214,9 +1286,7 @@ const findExistingTripWithSeats = async ({
     },
   });
 
-  // Check each trip for available seats
   for (const trip of trips) {
-    // ✅ Get vehicle capacity from driver's vehicle or trip's vehicle
     const vehicle = trip.vehicle || trip.driver?.vehicle;
 
     if (!vehicle) {
@@ -1244,6 +1314,287 @@ const findExistingTripWithSeats = async ({
   return null;
 };
 
+// API: POST /api/trips/merge
+// Body: { sourceTripId: string, targetTripId: string, weekStart?: string }
+const mergeTrips = async (req, res, next) => {
+  try {
+    const { sourceTripId, targetTripId, weekStart } = req.body;
+
+    if (!sourceTripId || !targetTripId) {
+      const errorResponse = badRequestResponse(
+        "Both sourceTripId and targetTripId are required."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (sourceTripId === targetTripId) {
+      const errorResponse = badRequestResponse(
+        "Cannot merge a trip with itself."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Fetch both trips with their data
+    const [sourceTrip, targetTrip] = await Promise.all([
+      prisma.trip.findUnique({
+        where: { id: sourceTripId },
+        include: {
+          route: true,
+          vehicle: true,
+          driver: {
+            include: {
+              vehicle: true,
+            },
+          },
+          weeklySchedules: {
+            where: {
+              status: { not: "CANCELLED" },
+            },
+            include: {
+              employee: true,
+            },
+          },
+        },
+      }),
+      prisma.trip.findUnique({
+        where: { id: targetTripId },
+        include: {
+          route: true,
+          vehicle: true,
+          driver: {
+            include: {
+              vehicle: true,
+            },
+          },
+          weeklySchedules: {
+            where: {
+              status: { not: "CANCELLED" },
+            },
+            include: {
+              employee: true,
+            },
+          },
+        },
+      }),
+    ]);
+
+    if (!sourceTrip) {
+      const errorResponse = badRequestResponse("Source trip not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (!targetTrip) {
+      const errorResponse = badRequestResponse("Target trip not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Check if trips have the same shift timing
+    if (sourceTrip.shiftTiming !== targetTrip.shiftTiming) {
+      const errorResponse = badRequestResponse(
+        `Cannot merge trips with different shift timings. Source: ${sourceTrip.shiftTiming}, Target: ${targetTrip.shiftTiming}`
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Check if trips are on the same route or different routes
+    const isSameRoute = sourceTrip.routeId === targetTrip.routeId;
+    const routeInfo = isSameRoute 
+      ? `same route (${sourceTrip.route?.code || 'N/A'})` 
+      : `different routes (${sourceTrip.route?.code || 'N/A'} → ${targetTrip.route?.code || 'N/A'})`;
+
+    console.log(`[mergeTrips] Merging trips on ${routeInfo}`);
+
+    // Determine which trip's driver/vehicle to use (target trip takes precedence)
+    const targetDriverId = targetTrip.driverId;
+    const targetVehicleId = targetTrip.vehicleId;
+    const targetRouteId = targetTrip.routeId;
+    const targetShiftTiming = targetTrip.shiftTiming;
+
+    if (!targetDriverId || !targetVehicleId) {
+      const errorResponse = badRequestResponse(
+        "Target trip must have a driver and vehicle assigned before merging."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Get target driver with vehicle details for capacity check
+    const targetDriver = await prisma.driver.findUnique({
+      where: { id: targetDriverId },
+      include: {
+        vehicle: true,
+      },
+    });
+
+    if (!targetDriver || !targetDriver.vehicle) {
+      const errorResponse = badRequestResponse(
+        "Target trip's driver or vehicle not found."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const vehicleCapacity = targetDriver.vehicle.capacity || 6;
+    const sourceEmployeeCount = sourceTrip.weeklySchedules.length;
+    const targetEmployeeCount = targetTrip.weeklySchedules.length;
+    const totalEmployees = sourceEmployeeCount + targetEmployeeCount;
+
+    // Check capacity
+    if (totalEmployees > vehicleCapacity) {
+      const errorResponse = badRequestResponse(
+        `Cannot merge trips. Target trip has ${targetEmployeeCount} employees ` +
+        `and source trip has ${sourceEmployeeCount} employees. Total (${totalEmployees}) exceeds ` +
+        `vehicle capacity (${vehicleCapacity} seats). Please reduce employees or assign a larger vehicle.`
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Check if target driver's vehicle is active
+    if (targetDriver.vehicle.status !== "ACTIVE") {
+      const errorResponse = badRequestResponse(
+        `Target driver's vehicle (${targetDriver.vehicle.vehicleNumber}) is currently ${targetDriver.vehicle.status}. Only ACTIVE vehicles can be used.`
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // If routes are different, check if target driver has any other trips at same shift
+    // that might conflict
+    if (!isSameRoute) {
+      const existingTripsAtSameShift = await prisma.trip.findMany({
+        where: {
+          driverId: targetDriverId,
+          shiftTiming: targetShiftTiming,
+          status: "ACTIVE",
+          id: { notIn: [sourceTripId, targetTripId] },
+          weeklySchedules: {
+            some: {
+              status: { not: "CANCELLED" },
+            },
+          },
+        },
+      });
+
+      if (existingTripsAtSameShift.length > 0) {
+        console.log(
+          `[mergeTrips] Warning: Driver already has ${existingTripsAtSameShift.length} other trip(s) at same shift.`
+        );
+        // This is a warning but we'll allow it
+      }
+    }
+
+    // Perform the merge in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Move all employees from source trip to target trip
+      const movedSchedules = await tx.weeklySchedule.updateMany({
+        where: {
+          tripId: sourceTripId,
+          status: { not: "CANCELLED" },
+        },
+        data: {
+          tripId: targetTripId,
+          routeId: targetRouteId,
+          driverId: targetDriverId,
+          vehicleId: targetVehicleId,
+          shiftTiming: targetShiftTiming,
+        },
+      });
+
+      // 2. Delete all pending rides for source trip
+      await tx.ride.deleteMany({
+        where: {
+          tripId: sourceTripId,
+          status: "PENDING",
+        },
+      });
+
+      // 3. Delete the source trip
+      await tx.trip.delete({
+        where: { id: sourceTripId },
+      });
+
+      // 4. Create audit log
+      await tx.auditLog.create({
+        data: {
+          userId: req.user?.id || null,
+          action: "TRIP_MERGE",
+          model: "Trip",
+          recordId: targetTripId,
+          before: {
+            sourceTripId: sourceTripId,
+            sourceTripRoute: sourceTrip.route?.code || null,
+            sourceTripEmployees: sourceEmployeeCount,
+            targetTripId: targetTripId,
+            targetTripRoute: targetTrip.route?.code || null,
+            targetTripEmployees: targetEmployeeCount,
+          },
+          after: {
+            mergedTripId: targetTripId,
+            totalEmployees: totalEmployees,
+            driverId: targetDriverId,
+            driverName: targetDriver.name,
+            vehicleId: targetVehicleId,
+            vehicleNumber: targetDriver.vehicle.vehicleNumber,
+            routeId: targetRouteId,
+            routeCode: targetTrip.route?.code || null,
+            isSameRoute: isSameRoute,
+          },
+          ipAddress: req.ip || req.connection.remoteAddress || null,
+        },
+      });
+
+      return {
+        employeesMoved: movedSchedules.count || 0,
+        totalEmployees: totalEmployees,
+      };
+    });
+
+    // 5. Sync pending rides for the week if weekStart provided
+    if (weekStart) {
+      syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+        driverIds: [targetDriverId],
+        tripIds: [targetTripId],
+        vehicleIds: [targetVehicleId],
+        routeIds: [targetRouteId],
+      }).catch(() => {});
+    }
+
+    // 6. Prepare response
+    const response = okResponse(
+      {
+        action: "TRIP_MERGED",
+        sourceTripId: sourceTripId,
+        targetTripId: targetTripId,
+        sourceTripRoute: sourceTrip.route?.code || 'N/A',
+        targetTripRoute: targetTrip.route?.code || 'N/A',
+        isSameRoute: isSameRoute,
+        employeesMoved: result.employeesMoved,
+        totalEmployees: result.totalEmployees,
+        vehicleCapacity: vehicleCapacity,
+        seatsRemaining: vehicleCapacity - totalEmployees,
+        driver: {
+          id: targetDriver.id,
+          name: targetDriver.name,
+        },
+        vehicle: {
+          id: targetDriver.vehicle.id,
+          number: targetDriver.vehicle.vehicleNumber,
+          capacity: vehicleCapacity,
+        },
+        targetTrip: {
+          id: targetTrip.id,
+          shiftTiming: targetShiftTiming,
+          route: targetTrip.route?.code || 'N/A',
+        },
+        message: `Successfully merged ${sourceEmployeeCount} employee(s) from ${sourceTrip.route?.code || 'N/A'} into ${targetTrip.route?.code || 'N/A'}. Total employees: ${totalEmployees}/${vehicleCapacity} seats.`,
+      },
+      `Trip merge completed: ${sourceTrip.route?.code || 'N/A'} (${sourceEmployeeCount} employees) → ${targetTrip.route?.code || 'N/A'} (${targetEmployeeCount} employees). Total: ${totalEmployees}/${vehicleCapacity} seats.`
+    );
+    return res.status(response.status.code).json(response);
+
+  } catch (error) {
+    console.error("[mergeTrips] Error:", error);
+    next(error);
+  }
+};
+
 const reassignMismatchedShiftEmployees = async (req, res, next) => {
   try {
     const { routeCode, weekStart, employeeIds } = req.body;
@@ -1269,7 +1620,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 
     const weekStartDate = toDateOnly(weekStart);
 
-    // Get the route
     const route = await prisma.route.findUnique({
       where: { routeCode },
       include: { area: true },
@@ -1286,12 +1636,11 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       shiftTiming: route.shiftTiming,
     });
 
-    // ✅ Use schedule IDs
     const whereClause = {
       routeId: route.id,
       weekStart: weekStartDate,
       status: { not: "CANCELLED" },
-      id: { in: employeeIds },
+      employeeIds: { in: employeeIds },
     };
 
     console.log(
@@ -1329,7 +1678,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     const routeShiftNorm = normalizeShift(route.shiftTiming);
     console.log("[reassign] Route shift norm:", routeShiftNorm);
 
-    // Filter to ONLY mismatched employees
     const mismatched = schedules.filter((s) => {
       const shiftNorm = normalizeShift(s.shiftTiming);
       const isMismatch = s.shiftTiming && shiftNorm !== routeShiftNorm;
@@ -1356,7 +1704,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // ✅ Track old trips that need to be checked for deletion
     const oldTripIds = new Set();
     mismatched.forEach((s) => {
       if (s.tripId) {
@@ -1364,7 +1711,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       }
     });
 
-    // Group by shift timing
     const groups = new Map();
     mismatched.forEach((s) => {
       const key = normalizeShift(s.shiftTiming);
@@ -1389,10 +1735,11 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       deletedTrips: [],
     };
 
-    // ✅ Track which employees were moved to new trips
     const movedEmployeeIds = new Set();
+    const affectedTripIds = new Set();
+    const affectedRouteIds = new Set([route.id]);
+    const affectedDriverIds = new Set();
 
-    // Process each mismatched employee
     for (const { shiftTiming, entries } of groups.values()) {
       console.log(
         "[reassign] Processing group shift:",
@@ -1409,8 +1756,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           entry.id,
         );
 
-        // ✅ Get the vehicle capacity for this employee's current trip
-        let maxSeats = 6; // default fallback
+        let maxSeats = 6;
         const currentTrip = entry.trip;
         if (currentTrip) {
           const vehicle = currentTrip.vehicle || currentTrip.driver?.vehicle;
@@ -1419,7 +1765,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           }
         }
 
-        // ✅ FIRST: Try to find existing trip with same shift and available seats
         const existingTripResult = await findExistingTripWithSeats({
           areaId: areaRecord?.id,
           shiftTiming: shiftTiming,
@@ -1431,7 +1776,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
         let movedToExisting = false;
 
         if (existingTripResult) {
-          // ✅ Found existing trip with available seats - move employee there
           console.log(
             "[reassign] Found existing trip with seats:",
             existingTripResult.trip.id,
@@ -1445,7 +1789,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             existingTripResult.availableSeats,
           );
 
-          // Update the schedule to the existing trip
           await prisma.weeklySchedule.update({
             where: { id: entry.id },
             data: {
@@ -1461,6 +1804,10 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           movedToExisting = true;
           results.updated++;
           movedEmployeeIds.add(entry.id);
+          affectedTripIds.add(existingTripResult.trip.id);
+          affectedRouteIds.add(existingTripResult.route.id);
+          if (existingTripResult.trip.driverId)
+            affectedDriverIds.add(existingTripResult.trip.driverId);
 
           results.details.push({
             scheduleId: entry.id,
@@ -1478,7 +1825,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             seatsRemaining: existingTripResult.availableSeats - 1,
           });
         } else {
-          // ✅ No existing trip found - create new one
           routeResult = await findOrCreateRouteAndTrip(
             areaRecord,
             undefined,
@@ -1502,7 +1848,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           if (routeResult.created) results.routesCreated++;
           if (routeResult.newTrip) results.legsOpened++;
 
-          // Get vehicle capacity for the new trip
           let newVehicleCapacity = maxSeats;
           if (routeResult.trip) {
             const newTrip = await prisma.trip.findUnique({
@@ -1518,7 +1863,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             }
           }
 
-          // Update the schedule to the new trip
           await prisma.weeklySchedule.update({
             where: { id: entry.id },
             data: {
@@ -1533,6 +1877,10 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 
           results.updated++;
           movedEmployeeIds.add(entry.id);
+          affectedTripIds.add(routeResult.trip.id);
+          affectedRouteIds.add(routeResult.route.id);
+          if (routeResult.trip.driverId)
+            affectedDriverIds.add(routeResult.trip.driverId);
 
           results.details.push({
             scheduleId: entry.id,
@@ -1548,14 +1896,22 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             seatsRemaining: newVehicleCapacity - 1,
           });
         }
+
+        if (entry.tripId) {
+          affectedTripIds.add(entry.tripId);
+        }
+        if (entry.driverId) {
+          affectedDriverIds.add(entry.driverId);
+        }
+        if (entry.routeId) {
+          affectedRouteIds.add(entry.routeId);
+        }
       }
     }
 
-    // ✅ STEP 2: Check old trips for deletion
     console.log("[reassign] Checking old trips for deletion:", oldTripIds.size);
 
     for (const tripId of oldTripIds) {
-      // Get the trip with its schedules
       const trip = await prisma.trip.findUnique({
         where: { id: tripId },
         include: {
@@ -1577,7 +1933,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 
       if (!trip) continue;
 
-      // Count remaining active schedules (excluding moved ones)
       const remainingSchedules = trip.weeklySchedules.filter(
         (s) => !movedEmployeeIds.has(s.id),
       );
@@ -1589,11 +1944,9 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
         remainingSchedules.length,
       );
 
-      // ✅ If no remaining employees, delete the trip
       if (remainingSchedules.length === 0) {
         console.log("[reassign] Deleting empty trip:", tripId);
 
-        // Get vehicle info before deletion for the response
         const vehicle = trip.vehicle || trip.driver?.vehicle;
         const vehicleInfo = vehicle
           ? {
@@ -1604,12 +1957,10 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             }
           : null;
 
-        // Delete all rides for this trip
         const rideCount = await prisma.ride.deleteMany({
           where: { tripId: tripId },
         });
 
-        // Delete the trip
         await prisma.trip.delete({
           where: { id: tripId },
         });
@@ -1628,7 +1979,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           employeesMoved: movedEmployeeIds.size,
         });
 
-        // ✅ Free up driver
         if (trip.driverId) {
           await prisma.driver.update({
             where: { id: trip.driverId },
@@ -1637,7 +1987,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           results.driversFreed++;
         }
 
-        // ✅ Free up vehicle
         if (trip.vehicleId) {
           await prisma.vehicle.update({
             where: { id: trip.vehicleId },
@@ -1646,7 +1995,6 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           results.vehiclesFreed++;
         }
 
-        // ✅ Clean up the route if it has no active trips
         const remainingTrips = await prisma.trip.count({
           where: {
             routeId: trip.routeId,
@@ -1678,10 +2026,13 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       }
     }
 
-    // Auto resync using existing function
     if (results.updated > 0) {
       console.log(`[reassign] Triggering ride sync for week ${weekStartDate}`);
-      await syncPendingRidesForWeekBestEffort(weekStartDate);
+      await syncPendingRidesForWeekBestEffort(weekStartDate, {
+        routeIds: Array.from(affectedRouteIds),
+        tripIds: Array.from(affectedTripIds),
+        driverIds: Array.from(affectedDriverIds).filter(Boolean),
+      });
     }
 
     console.log("[reassign] Results:", results);
@@ -1769,9 +2120,9 @@ const getEmployeeScheduleRange = async (req, res, next) => {
 
 const getGroupedSchedules = async (req, res, next) => {
   try {
-    const { 
-      weeks = 1, 
-      search, 
+    const {
+      weeks = 1,
+      search,
       routeId,
       page = 1,
       limit = 10,
@@ -1779,7 +2130,6 @@ const getGroupedSchedules = async (req, res, next) => {
       sortOrder = "asc",
     } = req.query;
 
-    // Parse pagination parameters
     const pageNumber = Math.max(1, parseInt(page, 10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
     const skip = (pageNumber - 1) * pageSize;
@@ -1811,8 +2161,6 @@ const getGroupedSchedules = async (req, res, next) => {
     });
     const weekStarts = distinctWeeks.map((w) => w.weekStart);
 
-    // ✅ Added `{ id: "asc" }` as a deterministic tiebreaker so row order
-    // never depends on incidental DB return order when weekStart + name tie.
     const schedules = await prisma.weeklySchedule.findMany({
       where: { ...where, weekStart: { in: weekStarts } },
       include: {
@@ -1897,8 +2245,6 @@ const getGroupedSchedules = async (req, res, next) => {
       });
     }
 
-    // ✅ Sort rows within each week deterministically too — otherwise the
-    // employee row order inside a route/week can also shuffle on refetch.
     for (const routeEntry of routeMap.values()) {
       for (const weekEntry of routeEntry.weekMap.values()) {
         weekEntry.rows.sort((a, b) => a.name.localeCompare(b.name));
@@ -1980,17 +2326,14 @@ const getGroupedSchedules = async (req, res, next) => {
           ),
         };
       })
-      // ✅ Explicit, stable ordering of the routes array by routeCode
-      // (numeric-aware, so "R2" sorts before "R10"). Unassigned always last.
       .sort((a, b) => {
         if (a.code === "—") return 1;
         if (b.code === "—") return -1;
-        
-        // Dynamic sorting based on sortBy parameter
+
         switch (sortBy) {
           case "empCount":
-            return sortOrder === "asc" 
-              ? a.empCount - b.empCount 
+            return sortOrder === "asc"
+              ? a.empCount - b.empCount
               : b.empCount - a.empCount;
           case "area":
             return sortOrder === "asc"
@@ -2014,13 +2357,11 @@ const getGroupedSchedules = async (req, res, next) => {
         }
       });
 
-    // ✅ Calculate total routes before pagination
     const totalRoutes = routes.length;
     const totalPages = Math.ceil(totalRoutes / pageSize);
     const hasNextPage = pageNumber < totalPages;
     const hasPrevPage = pageNumber > 1;
 
-    // ✅ Apply pagination to routes array
     routes = routes.slice(skip, skip + take);
 
     const response = okResponse(
@@ -2239,7 +2580,7 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
               type: schedule.vehicle.type,
             }
           : null,
-        pattern: schedule ? DAY_FIELD_KEYS.map((day) => schedule[day]) : null,
+        pattern: schedule ? DAY_KEYS.map((day) => schedule[day]) : null,
       });
     }
 
@@ -2520,7 +2861,320 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
     next(error);
   }
 };
+const deleteAllWeeklySchedules = async (req, res, next) => {
+  try {
+    const { weekStart, confirm } = req.body;
 
+    // Validate required fields
+    if (!weekStart) {
+      const errorResponse = badRequestResponse(
+        "weekStart is required. Please provide the week starting date."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Security: Require confirmation
+    if (confirm !== true) {
+      const errorResponse = badRequestResponse(
+        "Please confirm this action by setting confirm: true"
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Parse the week start date
+    const weekStartDate = new Date(weekStart);
+    if (isNaN(weekStartDate.getTime())) {
+      const errorResponse = badRequestResponse(
+        "Invalid weekStart date format. Please use YYYY-MM-DD."
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Calculate week end date (7 days later)
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekEndDate.getDate() + 7);
+
+    // Get ALL schedules for this week
+    const schedulesToDelete = await prisma.weeklySchedule.findMany({
+      where: {
+        weekStart: {
+          gte: weekStartDate,
+          lt: weekEndDate,
+        },
+        status: { not: "CANCELLED" },
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        routeId: true,
+        tripId: true,
+        route: {
+          select: {
+            routeCode: true, // ✅ Fixed: use routeCode instead of code
+          },
+        },
+      },
+    });
+
+    if (schedulesToDelete.length === 0) {
+      const response = okResponse(
+        {
+          deleted: 0,
+          message: `No schedules found for week ${weekStart}`,
+        },
+        "No schedules found to delete."
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    // Get all trip IDs from the schedules
+    const tripIds = [...new Set(schedulesToDelete.map(s => s.tripId).filter(Boolean))];
+    
+    // Get all route IDs from the schedules
+    const routeIds = [...new Set(schedulesToDelete.map(s => s.routeId).filter(Boolean))];
+
+    // Get all employee IDs from the schedules
+    const employeeIds = schedulesToDelete.map(s => s.employeeId);
+
+    // Get all schedule IDs
+    const scheduleIds = schedulesToDelete.map(s => s.id);
+
+    // Count statistics
+    const stats = {
+      totalSchedules: schedulesToDelete.length,
+      tripsAffected: tripIds.length,
+      routesAffected: routeIds.length,
+      employeeCount: schedulesToDelete.length,
+    };
+
+    // Start transaction with increased timeout
+    const result = await prisma.$transaction(
+      async (tx) => {
+        // 1. Get all rides that are associated with these trips (via tripId)
+        //    and also get rides for these employees (via ride passengers)
+        const ridesToDelete = await tx.ride.findMany({
+          where: {
+            OR: [
+              { tripId: { in: tripIds } },
+              {
+                passengers: {
+                  some: {
+                    employeeId: { in: employeeIds },
+                  },
+                },
+              },
+            ],
+          },
+          select: {
+            id: true,
+          },
+        });
+
+        const rideIds = ridesToDelete.map(r => r.id);
+
+        // 2. Delete ride passengers for these rides
+        if (rideIds.length > 0) {
+          await tx.ridePassenger.deleteMany({
+            where: {
+              rideId: { in: rideIds },
+            },
+          });
+        }
+
+        // 3. Delete attendances for these rides
+        if (rideIds.length > 0) {
+          await tx.attendance.deleteMany({
+            where: {
+              rideId: { in: rideIds },
+            },
+          });
+        }
+
+        // 4. Delete complaints for these rides
+        if (rideIds.length > 0) {
+          await tx.complaint.deleteMany({
+            where: {
+              rideId: { in: rideIds },
+            },
+          });
+        }
+
+        // 5. Delete the rides
+        const ridesDeleted = await tx.ride.deleteMany({
+          where: {
+            id: { in: rideIds },
+          },
+        });
+
+        // 6. Delete all weekly schedules
+        const schedulesDeleted = await tx.weeklySchedule.deleteMany({
+          where: {
+            weekStart: {
+              gte: weekStartDate,
+              lt: weekEndDate,
+            },
+            status: { not: "CANCELLED" },
+          },
+        });
+
+        // 7. Delete trips that no longer have any schedules
+        const tripsWithNoSchedules = await tx.trip.findMany({
+          where: {
+            id: {
+              in: tripIds,
+            },
+            weeklySchedules: {
+              none: {},
+            },
+          },
+          select: {
+            id: true,
+            tripNumber: true,
+            driver: {
+              select: {
+                name: true,
+              },
+            },
+            vehicle: {
+              select: {
+                vehicleNumber: true,
+              },
+            },
+            route: {
+              select: {
+                routeCode: true, // ✅ Fixed: use routeCode instead of code
+              },
+            },
+          },
+        });
+
+        // Delete trips with no schedules
+        const tripsDeleted = await tx.trip.deleteMany({
+          where: {
+            id: {
+              in: tripsWithNoSchedules.map(t => t.id),
+            },
+          },
+        });
+
+        // 8. Find routes that no longer have any schedules
+        const routesWithNoSchedules = await tx.route.findMany({
+          where: {
+            id: {
+              in: routeIds,
+            },
+            weeklySchedules: {
+              none: {},
+            },
+          },
+          select: {
+            id: true,
+            routeCode: true, // ✅ Fixed: use routeCode
+            routeName: true, // ✅ Fixed: use routeName
+            area: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        });
+
+        // 9. Delete routes with no schedules
+        const routesDeleted = await tx.route.deleteMany({
+          where: {
+            id: {
+              in: routesWithNoSchedules.map(r => r.id),
+            },
+          },
+        });
+
+        // 10. Audit log
+        const routeNames = [...new Set(schedulesToDelete.map(s => s.route?.routeCode).filter(Boolean))];
+
+        await tx.auditLog.create({
+          data: {
+            userId: req.user?.id || null,
+            action: "BULK_DELETE_ALL_WEEKLY_SCHEDULES",
+            model: "WeeklySchedule",
+            recordId: `week-${weekStart}`,
+            before: {
+              weekStart: weekStart,
+              schedulesCount: stats.totalSchedules,
+              tripIds: tripIds,
+              routeIds: routeIds,
+              employeeIds: employeeIds,
+              scheduleIds: scheduleIds,
+              routeNames: routeNames,
+            },
+            after: {
+              deleted: {
+                schedules: schedulesDeleted.count,
+                trips: tripsDeleted.count,
+                routes: routesDeleted.count,
+                rides: ridesDeleted.count,
+              },
+            },
+            ipAddress: req.ip || req.connection.remoteAddress || null,
+          },
+        });
+
+        return {
+          schedulesDeleted: schedulesDeleted.count,
+          tripsDeleted: tripsDeleted.count,
+          routesDeleted: routesDeleted.count,
+          ridesDeleted: ridesDeleted.count,
+          tripsWithNoSchedules: tripsWithNoSchedules.map(t => ({
+            id: t.id,
+            tripNumber: t.tripNumber,
+            driver: t.driver?.name || 'Unassigned',
+            vehicle: t.vehicle?.vehicleNumber || 'Unassigned',
+            route: t.route?.routeCode || 'Unknown', // ✅ Fixed: use routeCode
+          })),
+          routesWithNoSchedules: routesWithNoSchedules.map(r => ({
+            id: r.id,
+            code: r.routeCode, // ✅ Fixed: use routeCode
+            name: r.routeName, // ✅ Fixed: use routeName
+            area: r.area?.name || 'Unknown',
+          })),
+          routesAffected: routeNames,
+        };
+      },
+      {
+        timeout: 30000, // Increase transaction timeout to 30 seconds
+      }
+    );
+
+    // Response
+    const response = okResponse(
+      {
+        action: "BULK_DELETE_ALL_COMPLETED",
+        weekStart: weekStart,
+        stats: {
+          ...stats,
+          schedulesDeleted: result.schedulesDeleted,
+          tripsDeleted: result.tripsDeleted,
+          routesDeleted: result.routesDeleted,
+          ridesDeleted: result.ridesDeleted,
+          routesAffected: result.routesAffected,
+        },
+        deletedTrips: result.tripsWithNoSchedules,
+        deletedRoutes: result.routesWithNoSchedules,
+        message: `✅ Successfully deleted ALL schedules for week ${weekStart}: 
+          ${result.schedulesDeleted} schedule(s), 
+          ${result.tripsDeleted} trip(s), 
+          ${result.routesDeleted} route(s), 
+          ${result.ridesDeleted} ride(s)
+          from ${result.routesAffected.length} route(s).`,
+      },
+      `Bulk delete completed for week ${weekStart}`
+    );
+    return res.status(response.status.code).json(response);
+
+  } catch (error) {
+    console.error("[deleteAllWeeklySchedules] Error:", error);
+    next(error);
+  }
+};
 module.exports = {
   getDriverOptions,
   updateTripDriver,
@@ -2543,7 +3197,7 @@ module.exports = {
   resyncPendingRides,
   updateSingleEmployeeSchedule,
   deleteSingleEmployeeSchedule,
-  // resolvePendingVehicleAssignments is defined above but, same as in your
-  // original file, was never wired into module.exports (so no route reaches
-  // it). Add it here if that was unintentional.
+  resolvePendingVehicleAssignments,
+  mergeTrips,
+  deleteAllWeeklySchedules
 };

@@ -14,10 +14,12 @@ const {
   getRouteRides,
   getRouteStats,
   getRouteWeeklyView,
+  getEligibleEmployeesForTrip,
 } = require("../../../controllers/client/route/route.controller");
 
 router.post("/", createRoute);
 router.get("/", getAllRoutes);
+router.get("/employee/:tripId", getEligibleEmployeesForTrip);
 router.get("/:id", getRouteById);
 router.patch("/:id", updateRoute);
 router.delete("/:id", deleteRoute);

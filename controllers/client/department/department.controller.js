@@ -9,14 +9,23 @@ const {
 const {
   badRequestResponse,
   okResponse,
+  createSuccessResponse,
 } = require("../../../constants/responses");
 
 const createDepartment = async (req, res, next) => {
   try {
     const { name } = req.body;
 
+    // Validate name
+    if (!name || !name.trim()) {
+      const response = badRequestResponse("Department name is required.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const trimmedName = name.trim();
+
     const existingDepartment = await prisma.department.findUnique({
-      where: { name },
+      where: { name: trimmedName },
     });
     if (existingDepartment) {
       const response = badRequestResponse(
@@ -25,29 +34,82 @@ const createDepartment = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    const response = await createRecord(prisma.department, { name });
+    const department = await prisma.department.create({
+      data: { name: trimmedName },
+    });
+
+    const response = createSuccessResponse(
+      department,
+      "Department created successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error)
+    console.log('error', error);
     next(error);
   }
 };
 
 const getAllDepartments = async (req, res, next) => {
   try {
-    const { skip = 0, take = 10 } = req.query;
-    const departments = await prisma.department.findMany({
-  
+    const {
+      page = 1,
+      limit = 10,
+      search,
+      sortBy = "createdAt",
+      sortOrder = "desc",
+    } = req.query;
 
-      orderBy: { createdAt: "desc" },
-    });
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
+
+    const where = {};
+
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: "insensitive" } },
+      ];
+    }
+
+    const [departments, total] = await Promise.all([
+      prisma.department.findMany({
+        where,
+        skip,
+        take,
+        include: {
+          _count: {
+            select: { employees: true },
+          },
+        },
+        orderBy: { [sortBy]: sortOrder },
+      }),
+      prisma.department.count({ where }),
+    ]);
+
+    // Map departments to include employee count
+    const departmentsWithCount = departments.map((dept) => ({
+      ...dept,
+      employeeCount: dept._count.employees,
+      _count: undefined, // Remove _count from response
+    }));
+
     const response = okResponse(
-      departments,
+      {
+        departments: departmentsWithCount,
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
+      },
       "Departments retrieved successfully.",
     );
-    
+
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -55,17 +117,45 @@ const getAllDepartments = async (req, res, next) => {
 const getDepartmentById = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const response = await getRecordById(prisma.department, id, {
-      employees: { select: { id: true, employeeCode: true, name: true } },
+
+    const department = await prisma.department.findUnique({
+      where: { id },
+      include: {
+        employees: {
+          select: {
+            id: true,
+            employeeCode: true,
+            name: true,
+            designation: true,
+            status: true,
+          },
+          orderBy: { createdAt: "desc" },
+        },
+        _count: {
+          select: { employees: true },
+        },
+      },
     });
 
-    if (!response) {
+    if (!department) {
       const errorResponse = badRequestResponse("Department not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    const departmentWithCount = {
+      ...department,
+      employeeCount: department._count.employees,
+      _count: undefined,
+    };
+
+    const response = okResponse(
+      departmentWithCount,
+      "Department retrieved successfully.",
+    );
+
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -75,15 +165,23 @@ const updateDepartment = async (req, res, next) => {
     const { id } = req.params;
     const { name } = req.body;
 
+    // Validate name
+    if (!name || !name.trim()) {
+      const response = badRequestResponse("Department name is required.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const trimmedName = name.trim();
+
     const department = await prisma.department.findUnique({ where: { id } });
     if (!department) {
       const errorResponse = badRequestResponse("Department not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    if (name && name !== department.name) {
+    if (trimmedName !== department.name) {
       const existingDepartment = await prisma.department.findUnique({
-        where: { name },
+        where: { name: trimmedName },
       });
       if (existingDepartment) {
         const errorResponse = badRequestResponse(
@@ -93,9 +191,29 @@ const updateDepartment = async (req, res, next) => {
       }
     }
 
-    const response = await updateRecord(prisma.department, id, { name });
+    const updatedDepartment = await prisma.department.update({
+      where: { id },
+      data: { name: trimmedName },
+      include: {
+        _count: {
+          select: { employees: true },
+        },
+      },
+    });
+
+    const departmentWithCount = {
+      ...updatedDepartment,
+      employeeCount: updatedDepartment._count.employees,
+      _count: undefined,
+    };
+
+    const response = okResponse(
+      departmentWithCount,
+      "Department updated successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -106,7 +224,11 @@ const deleteDepartment = async (req, res, next) => {
 
     const department = await prisma.department.findUnique({
       where: { id },
-      include: { employees: true },
+      include: {
+        _count: {
+          select: { employees: true },
+        },
+      },
     });
 
     if (!department) {
@@ -114,16 +236,24 @@ const deleteDepartment = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    if (department.employees.length > 0) {
+    if (department._count.employees > 0) {
       const errorResponse = badRequestResponse(
-        "Cannot delete department with assigned employees.",
+        `Cannot delete department. It has ${department._count.employees} assigned employee(s). Remove or reassign employees first.`,
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const response = await deleteRecord(prisma.department, id);
+    await prisma.department.delete({
+      where: { id },
+    });
+
+    const response = okResponse(
+      { id, name: department.name },
+      "Department deleted successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error);
     next(error);
   }
 };
@@ -134,4 +264,4 @@ module.exports = {
   getDepartmentById,
   updateDepartment,
   deleteDepartment,
-};  
+};

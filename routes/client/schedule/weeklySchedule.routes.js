@@ -23,6 +23,8 @@ const {
   getDriverOptions,
   updateSingleEmployeeSchedule,
   deleteSingleEmployeeSchedule,
+  mergeTrips,
+  deleteAllWeeklySchedules,
 } = require("../../../controllers/client/schedule/weeklySchedule.controller");
 const upload = require("../../../middlewares/upload.middleware");
 
@@ -47,6 +49,8 @@ router.get("/driver-options", getDriverOptions);
 router.get("/:id", getWeeklyScheduleById);
 router.patch("/:id", updateWeeklySchedule);
 router.patch("/trip/:tripId/driver", updateTripDriver);
+router.patch("/trips/merge", mergeTrips);
+router.delete("/delete-all", deleteAllWeeklySchedules);
 
 router.patch("/:id/single", updateSingleEmployeeSchedule);
 router.delete("/:id/single", deleteSingleEmployeeSchedule);
