@@ -9,11 +9,18 @@ const {
   badRequestResponse,
   okResponse,
 } = require("../../../constants/responses");
-const { notifyUser, notifyUsers, notifyRoles } = require("../../../services/notification.service");
+const {
+  notifyUser,
+  notifyUsers,
+  notifyRoles,
+  ADMIN_NOTIFY_ROLES,
+} = require("../../../services/notification.service");
 
 // Roles that should be told about complaints, license submissions,
 // account deactivations, etc. — anything without one obvious recipient.
-const STAFF_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
+// Sourced from the notification service so this can't silently drift
+// out of sync with the role set the service itself uses for notifyAdmins.
+const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
 
 const getDriverFromReq = async (req) => {
   const userId = req.user?.userId;
@@ -1232,6 +1239,7 @@ const markNotificationAsRead = async (req, res, next) => {
       data: { status: "READ" },
     });
 
+    // ✅ NO Pusher events - just return success
     const response = okResponse(updated, "Notification marked as read.");
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1280,6 +1288,7 @@ const markAllNotificationsAsRead = async (req, res, next) => {
       data: { status: 'READ' },
     });
 
+    // ✅ NO Pusher events - just return success
     const response = okResponse(
       { markedCount: count }, 
       `${count} notification(s) marked as read.`
@@ -1290,6 +1299,7 @@ const markAllNotificationsAsRead = async (req, res, next) => {
     next(error);
   }
 };
+
 const deleteAccount = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);

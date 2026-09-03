@@ -10,7 +10,7 @@ const {
 } = require("../../../lib/rideplaing");
 const {
   notifyDriverById,
-  notifyAdmins,
+  notifyEmployeeById,
 } = require("../../../services/notification.service");
 
 // ---------- helpers ----------
@@ -275,7 +275,7 @@ const createRoute = async (req, res, next) => {
       return { route, trip };
     });
 
-    // ---- Notify the assigned driver and admins/dispatchers ----
+    // ---- Notify the assigned driver ----
     notifyDriverById(driverId, {
       title: "New route assigned",
       body: `You've been assigned to route "${result.route.routeName}"${shiftTiming ? ` (${shiftTiming} shift)` : ""}.`,
@@ -284,17 +284,11 @@ const createRoute = async (req, res, next) => {
         routeId: result.route.id,
         tripId: result.trip.id,
       },
+      event: "schedule-updated",
     }).catch((err) =>
       console.error("[createRoute] Failed to notify driver:", err),
     );
 
-    notifyAdmins({
-      title: "New route created",
-      body: `Route "${result.route.routeName}" was created and assigned to driver ${driver.name}.`,
-      data: { type: "ROUTE_CREATED", routeId: result.route.id },
-    }).catch((err) =>
-      console.error("[createRoute] Failed to notify admins:", err),
-    );
 
     const response = createSuccessResponse(
       {
@@ -375,22 +369,16 @@ const addTripToRoute = async (req, res, next) => {
 
     await syncRouteFromTrips(routeId);
 
-    // ---- Notify the assigned driver and admins/dispatchers ----
+    // ---- Notify the assigned driver ----
     notifyDriverById(driverId, {
       title: "New trip assigned",
       body: `You've been assigned to Trip ${tripNumber} on route "${route.routeName}"${effectiveShift ? ` (${effectiveShift} shift)` : ""}.`,
       data: { type: "TRIP_DRIVER_ASSIGNED", tripId: trip.id, routeId },
+      event: "schedule-updated",
     }).catch((err) =>
       console.error("[addTripToRoute] Failed to notify driver:", err),
     );
 
-    notifyAdmins({
-      title: "New trip opened",
-      body: `Trip ${tripNumber} opened on route "${route.routeName}" with driver ${driver.name}.`,
-      data: { type: "TRIP_CREATED", tripId: trip.id, routeId },
-    }).catch((err) =>
-      console.error("[addTripToRoute] Failed to notify admins:", err),
-    );
 
     const response = createSuccessResponse(
       { trip, capacity: driver.vehicle.capacity },
@@ -481,7 +469,7 @@ const updateTripAssignment = async (req, res, next) => {
 
     await syncRouteFromTrips(trip.routeId);
 
-    // ---- Notify old/new driver and admins/dispatchers of the change ----
+    // ---- Notify old/new driver and affected employees ----
     const driverChanged = trip.driverId !== nextDriverId;
     if (driverChanged) {
       const routeLabel =
@@ -497,6 +485,7 @@ const updateTripAssignment = async (req, res, next) => {
             tripId: trip.id,
             routeId: trip.routeId,
           },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error(
             "[updateTripAssignment] Failed to notify previous driver:",
@@ -514,6 +503,7 @@ const updateTripAssignment = async (req, res, next) => {
             tripId: trip.id,
             routeId: trip.routeId,
           },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error(
             "[updateTripAssignment] Failed to notify new driver:",
@@ -522,17 +512,31 @@ const updateTripAssignment = async (req, res, next) => {
         );
       }
 
-      notifyAdmins({
-        title: "Trip driver changed",
-        body: `${tripLabel} on ${routeLabel}: driver changed from ${trip.driver?.name || "Unassigned"} to ${updatedTrip.driver?.name || "Unassigned"}.`,
-        data: {
-          type: "TRIP_DRIVER_CHANGED",
-          tripId: trip.id,
-          routeId: trip.routeId,
-        },
-      }).catch((err) =>
-        console.error("[updateTripAssignment] Failed to notify admins:", err),
-      );
+      // Employees riding this trip weren't notified at all before — they
+      // only found out their driver changed when they opened the app.
+      const affectedSchedules = await prisma.weeklySchedule.findMany({
+        where: { tripId: trip.id, status: { not: "CANCELLED" } },
+        select: { employeeId: true },
+      });
+      affectedSchedules.forEach(({ employeeId }) => {
+        if (!employeeId) return;
+        notifyEmployeeById(employeeId, {
+          title: "Trip driver changed",
+          body: `Your driver on ${routeLabel} has changed to ${updatedTrip.driver?.name || "a new driver"}.`,
+          data: {
+            type: "SCHEDULE_TRIP_DRIVER_CHANGED",
+            tripId: trip.id,
+            routeId: trip.routeId,
+          },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error(
+            "[updateTripAssignment] Failed to notify affected employee:",
+            err,
+          ),
+        );
+      });
+
     }
 
     // Re-sync any already-generated PENDING rides so they pick up the new
@@ -907,6 +911,62 @@ const updateRoute = async (req, res, next) => {
         },
       },
     });
+
+    // ---- Notify affected drivers and employees ----
+    // This endpoint previously sent no notifications at all, despite being
+    // able to change pickup/office-arrival/drop times, area, or status on
+    // a route that already has active trips and schedules — exactly the
+    // kind of manual edit that needs to reach riders in real time.
+    const NOTIFY_WORTHY_FIELDS = [
+      "pickupStartTime",
+      "officeArrivalTime",
+      "dropTime",
+      "shiftTiming",
+      "status",
+      "areaId",
+      "subAreaId",
+      "officeLocation",
+    ];
+    const notifyWorthy = NOTIFY_WORTHY_FIELDS.some((f) => f in updateData);
+
+    if (notifyWorthy) {
+      const routeLabel = updated.routeName || updated.routeCode || "your route";
+
+      // Drivers currently on this route's active trips.
+      const driverIds = new Set(
+        (updated.trips || []).map((t) => t.driverId).filter(Boolean),
+      );
+      driverIds.forEach((driverId) => {
+        notifyDriverById(driverId, {
+          title: "Route updated",
+          body: `Route "${routeLabel}" was updated — check pickup/drop times.`,
+          data: { type: "ROUTE_UPDATED", routeId: id },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error("[updateRoute] Failed to notify driver:", err),
+        );
+      });
+
+      // Employees currently scheduled on this route (not week-scoped —
+      // this endpoint has no weekStart param, so we notify everyone with
+      // a non-cancelled schedule on the route).
+      const affectedSchedules = await prisma.weeklySchedule.findMany({
+        where: { routeId: id, status: { not: "CANCELLED" } },
+        select: { employeeId: true },
+      });
+      affectedSchedules.forEach(({ employeeId }) => {
+        if (!employeeId) return;
+        notifyEmployeeById(employeeId, {
+          title: "Route updated",
+          body: `Your route "${routeLabel}" was updated — check pickup/drop times.`,
+          data: { type: "ROUTE_UPDATED", routeId: id },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error("[updateRoute] Failed to notify employee:", err),
+        );
+      });
+
+    }
 
     const response = okResponse(updated, "Route updated successfully.");
     return res.status(response.status.code).json(response);

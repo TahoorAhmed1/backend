@@ -6,11 +6,17 @@ const {
   badRequestResponse,
   okResponse,
 } = require("../../../constants/responses");
-const { notifyUser, notifyRoles } = require("../../../services/notification.service");
+const {
+  notifyUser,
+  notifyRoles,
+  ADMIN_NOTIFY_ROLES,
+} = require("../../../services/notification.service");
 
 // Roles that should be told about complaints — anything without
 // one obvious single recipient.
-const STAFF_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
+// Sourced from the notification service so this can't silently drift
+// out of sync with the role set the service itself uses for notifyAdmins.
+const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
 
 const getEmployeeFromReq = async (req) => {
   const userId = req.user?.userId;
@@ -28,19 +34,11 @@ const endOfDay = (date = new Date()) => {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
 };
 
-// ✅ Saturday as week start
+// Saturday as week start
 const saturdayOf = (date = new Date()) => {
   const d = new Date(date);
   const day = d.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
   
-  // Calculate days to go back to reach Saturday
-  // If today is Saturday (6), diff = 0
-  // If today is Sunday (0), diff = -1
-  // If today is Monday (1), diff = -2
-  // If today is Tuesday (2), diff = -3
-  // If today is Wednesday (3), diff = -4
-  // If today is Thursday (4), diff = -5
-  // If today is Friday (5), diff = -6
   const diff = day === 6 ? 0 : -(day + 1);
   
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diff, 0, 0, 0, 0));
@@ -100,6 +98,7 @@ const markNotificationAsRead = async (req, res, next) => {
       data: { status: "READ" },
     });
 
+    // ✅ NO Pusher events - just return success
     const response = okResponse(updated, "Notification marked as read.");
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -519,7 +518,7 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
 const acceptRide = (req, res, next) => setRideResponse(req, res, next, { confirmed: true });
 const rejectRide = (req, res, next) => setRideResponse(req, res, next, { confirmed: false });
 
-// ✅ UPDATED: Saturday to Friday week
+// UPDATED: Saturday to Friday week
 const getWeeklySchedule = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -528,12 +527,11 @@ const getWeeklySchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // ✅ Saturday as week start
     const weekStart = req.query.weekStart
       ? saturdayOf(new Date(req.query.weekStart))
       : saturdayOf();
     const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6); // Friday
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
     weekEnd.setUTCHours(23, 59, 59, 999);
 
     const [schedule, attendances] = await Promise.all([
@@ -559,7 +557,6 @@ const getWeeklySchedule = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // ✅ Saturday to Friday order
     const WEEK_FIELD_ORDER = [
       "saturday",
       "sunday",
@@ -587,7 +584,7 @@ const getWeeklySchedule = async (req, res, next) => {
   }
 };
 
-// ✅ NEW: Get all weekly schedules (multiple weeks)
+// NEW: Get all weekly schedules (multiple weeks)
 const getAllWeeklySchedules = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -660,7 +657,7 @@ const getAllWeeklySchedules = async (req, res, next) => {
   }
 };
 
-// ✅ UPDATED: Saturday to Friday week summary
+// UPDATED: Saturday to Friday week summary
 const getWeekSummary = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -669,10 +666,9 @@ const getWeekSummary = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // ✅ Saturday as week start
     const weekStart = saturdayOf();
     const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6); // Friday
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
     weekEnd.setUTCHours(23, 59, 59, 999);
 
     const attendances = await prisma.attendance.findMany({
@@ -792,10 +788,18 @@ const markAttendanceByQr = async (req, res, next) => {
       create: { employeeId: employee.id, rideId: ride.id, rideDate, status, arrivalTime: now },
     });
 
-    notifyUser(scannedUser.id, {
+    // scannedUser IS the driver's user account (that's what the QR encodes),
+    // so scannedUser.id is already the driverUserId — no extra
+    // driver -> userId join needed here, unlike markMyAttendance below
+    // where we only have the driver relation and must pull .driver.userId.
+    const driverUserId = scannedUser.id;
+    notifyUser(driverUserId, {
       title: "Passenger checked in",
       body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
-      data: { rideId: ride.id, type: "ATTENDANCE_MARKED", status },
+      // type aligned with driver_controller's attendance notifications
+      // (ATTENDANCE_UPDATED) — both represent the same underlying
+      // Attendance-record change, just triggered by different actors.
+      data: { rideId: ride.id, type: "ATTENDANCE_UPDATED", status },
       event: "attendance-updated",
     }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
 
@@ -881,7 +885,10 @@ const markMyAttendance = async (req, res, next) => {
       notifyUser(driverUserId, {
         title: "Passenger checked in",
         body: `${employee.name} checked in for ${routeName}${status === "LATE" ? " (late)" : ""}.`,
-        data: { rideId: ridePassenger.rideId, type: "ATTENDANCE_MARKED", status },
+        // type aligned with driver_controller's attendance notifications
+        // (ATTENDANCE_UPDATED) — both represent the same underlying
+        // Attendance-record change, just triggered by different actors.
+        data: { rideId: ridePassenger.rideId, type: "ATTENDANCE_UPDATED", status },
         event: "attendance-updated",
       }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
     }
@@ -1092,6 +1099,7 @@ const markAllNotificationsAsRead = async (req, res, next) => {
       data: { status: 'READ' },
     });
 
+    // ✅ NO Pusher events - just return success
     const response = okResponse(
       { markedCount: count }, 
       `${count} notification(s) marked as read.`
@@ -1109,7 +1117,7 @@ module.exports = {
   getTodayRide,
   confirmTodayRide,
   getWeeklySchedule,
-  getAllWeeklySchedules, // ✅ NEW
+  getAllWeeklySchedules,
   markAllNotificationsAsRead,
   getWeekSummary,
   markMyAttendance,

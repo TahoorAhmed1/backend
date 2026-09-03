@@ -59,7 +59,6 @@ const {
 const {
   notifyEmployeeById,
   notifyDriverById,
-  notifyAdmins,
 } = require("../../../services/notification.service");
 
 const FK_CHECKS = [
@@ -620,7 +619,10 @@ const assignEmployeeToTrip = async (req, res, next) => {
         routeIds: [trip.routeId].filter(Boolean),
       }).catch(() => {});
 
-      // ---- Notify the employee and admins/dispatchers ----
+      // ---- Notify the employee and the trip's driver ----
+      // event: "schedule-updated" (not the default "notification-created")
+      // so driverStore/employeeStore also refetch today's rides/dashboard/
+      // weekly schedule data, not just the notification bell.
       const routeLabel =
         trip.route?.routeName || trip.route?.routeCode || "a route";
       const weekLabel = weekStartDate.toISOString().slice(0, 10);
@@ -634,6 +636,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
           tripId: trip.id,
           routeId: trip.routeId,
         },
+        event: "schedule-updated",
       }).catch((err) =>
         console.error(
           "[assignEmployeeToTrip] Failed to notify employee:",
@@ -641,18 +644,25 @@ const assignEmployeeToTrip = async (req, res, next) => {
         ),
       );
 
-      notifyAdmins({
-        title: "Employee assigned to trip",
-        body: `An employee was assigned to Trip ${trip.tripNumber} on ${routeLabel} for the week of ${weekLabel}.`,
-        data: {
-          type: "SCHEDULE_EMPLOYEE_ASSIGNED",
-          scheduleId: schedule.id,
-          tripId: trip.id,
-          routeId: trip.routeId,
-        },
-      }).catch((err) =>
-        console.error("[assignEmployeeToTrip] Failed to notify admins:", err),
-      );
+      if (trip.driverId) {
+        notifyDriverById(trip.driverId, {
+          title: "New passenger on your trip",
+          body: `An employee was added to Trip ${trip.tripNumber} on ${routeLabel} for the week of ${weekLabel}.`,
+          data: {
+            type: "SCHEDULE_EMPLOYEE_ASSIGNED",
+            scheduleId: schedule.id,
+            tripId: trip.id,
+            routeId: trip.routeId,
+          },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error(
+            "[assignEmployeeToTrip] Failed to notify driver:",
+            err,
+          ),
+        );
+      }
+
 
       const response = createSuccessResponse(
         { schedule, remainingSeats: remaining - 1, capacity },
@@ -905,7 +915,7 @@ const createWeeklySchedule = async (req, res, next) => {
       routeId,
     }).catch(() => {});
 
-    // ---- Notify the employee and admins/dispatchers ----
+    // ---- Notify the employee ----
     let routeLabel = "your weekly schedule";
     if (routeId) {
       const route = await prisma.route.findUnique({
@@ -920,17 +930,22 @@ const createWeeklySchedule = async (req, res, next) => {
       title: "Weekly schedule added",
       body: `A schedule was created for you on ${routeLabel} for the week of ${weekLabel}.`,
       data: { type: "SCHEDULE_EMPLOYEE_ADDED", employeeId, routeId, tripId },
+      event: "schedule-updated",
     }).catch((err) =>
       console.error("[createWeeklySchedule] Failed to notify employee:", err),
     );
 
-    notifyAdmins({
-      title: "Employee added to schedule",
-      body: `An employee was added to the schedule on ${routeLabel} for the week of ${weekLabel}.`,
-      data: { type: "SCHEDULE_EMPLOYEE_ADDED", employeeId, routeId, tripId },
-    }).catch((err) =>
-      console.error("[createWeeklySchedule] Failed to notify admins:", err),
-    );
+    if (driverId) {
+      notifyDriverById(driverId, {
+        title: "New passenger on your trip",
+        body: `An employee was added to your schedule on ${routeLabel} for the week of ${weekLabel}.`,
+        data: { type: "SCHEDULE_EMPLOYEE_ADDED", employeeId, routeId, tripId },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error("[createWeeklySchedule] Failed to notify driver:", err),
+      );
+    }
+
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1159,7 +1174,10 @@ const updateWeeklySchedule = async (req, res, next) => {
       updateData.vehicleEntity = normalized;
     }
 
-    const schedule = await prisma.weeklySchedule.findUnique({ where: { id } });
+    const schedule = await prisma.weeklySchedule.findUnique({
+      where: { id },
+      include: { employee: { select: { name: true } } },
+    });
     if (!schedule) {
       const errorResponse = badRequestResponse("Weekly schedule not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -1204,6 +1222,96 @@ const updateWeeklySchedule = async (req, res, next) => {
       },
     ).catch(() => {});
 
+    // ---- Notify the employee and old/new driver ----
+    // This endpoint previously sent no notifications at all — an admin
+    // could change an employee's route/trip/driver/pickup time here and
+    // neither the employee nor the driver would find out until they
+    // happened to refresh. Notify whenever a field that actually affects
+    // the ride (not just serviceType) changes.
+    const NOTIFY_WORTHY_FIELDS = [
+      "routeId",
+      "tripId",
+      "driverId",
+      "vehicleId",
+      "officeArrivalTime",
+      "dropTime",
+      "status",
+    ];
+    const notifyWorthy = NOTIFY_WORTHY_FIELDS.some((f) => f in updateData);
+
+    if (notifyWorthy) {
+      const updated = response?.data;
+      const routeLabel =
+        updated?.route?.routeName ||
+        updated?.route?.routeCode ||
+        "their route";
+      const weekLabel = (updateData.weekStart || schedule.weekStart)
+        .toISOString()
+        .slice(0, 10);
+
+      notifyEmployeeById(schedule.employeeId, {
+        title: "Schedule updated",
+        body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was updated.`,
+        data: {
+          type: "SCHEDULE_EMPLOYEE_UPDATED",
+          employeeId: schedule.employeeId,
+          scheduleId: id,
+          routeId: updated?.routeId ?? schedule.routeId,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error("[updateWeeklySchedule] Failed to notify employee:", err),
+      );
+
+      const driverChanged =
+        "driverId" in updateData && schedule.driverId !== updateData.driverId;
+
+      if (driverChanged) {
+        if (schedule.driverId) {
+          notifyDriverById(schedule.driverId, {
+            title: "Passenger removed from your trip",
+            body: `An employee's schedule on ${routeLabel} was moved off your trip.`,
+            data: { type: "TRIP_DRIVER_REMOVED", scheduleId: id },
+            event: "schedule-updated",
+          }).catch((err) =>
+            console.error(
+              "[updateWeeklySchedule] Failed to notify previous driver:",
+              err,
+            ),
+          );
+        }
+        if (updateData.driverId) {
+          notifyDriverById(updateData.driverId, {
+            title: "New passenger on your trip",
+            body: `An employee's schedule on ${routeLabel} was moved onto your trip.`,
+            data: { type: "TRIP_DRIVER_ASSIGNED", scheduleId: id },
+            event: "schedule-updated",
+          }).catch((err) =>
+            console.error(
+              "[updateWeeklySchedule] Failed to notify new driver:",
+              err,
+            ),
+          );
+        }
+      } else if (schedule.driverId) {
+        // Driver unchanged but something else about this passenger's
+        // trip (timing, route/trip, vehicle) changed — still relevant
+        // to the driver currently carrying them.
+        notifyDriverById(schedule.driverId, {
+          title: "Passenger schedule updated",
+          body: `An employee's schedule on ${routeLabel} for the week of ${weekLabel} was updated.`,
+          data: { type: "SCHEDULE_EMPLOYEE_UPDATED", scheduleId: id },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error(
+            "[updateWeeklySchedule] Failed to notify driver:",
+            err,
+          ),
+        );
+      }
+
+    }
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1235,7 +1343,7 @@ const deleteWeeklySchedule = async (req, res, next) => {
       routeId: schedule.routeId,
     }).catch(() => {});
 
-    // ---- Notify the employee and admins/dispatchers ----
+    // ---- Notify the employee ----
     const routeLabel =
       schedule.route?.routeName || schedule.route?.routeCode || "their route";
     const weekLabel = schedule.weekStart.toISOString().slice(0, 10);
@@ -1248,21 +1356,26 @@ const deleteWeeklySchedule = async (req, res, next) => {
         employeeId: schedule.employeeId,
         routeId: schedule.routeId,
       },
+      event: "schedule-updated",
     }).catch((err) =>
       console.error("[deleteWeeklySchedule] Failed to notify employee:", err),
     );
 
-    notifyAdmins({
-      title: "Employee removed from schedule",
-      body: `${schedule.employee?.name || "An employee"} was removed from the schedule on ${routeLabel} for the week of ${weekLabel}.`,
-      data: {
-        type: "SCHEDULE_EMPLOYEE_REMOVED",
-        employeeId: schedule.employeeId,
-        routeId: schedule.routeId,
-      },
-    }).catch((err) =>
-      console.error("[deleteWeeklySchedule] Failed to notify admins:", err),
-    );
+    if (schedule.driverId) {
+      notifyDriverById(schedule.driverId, {
+        title: "Passenger removed from your trip",
+        body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
+        data: {
+          type: "SCHEDULE_EMPLOYEE_REMOVED",
+          employeeId: schedule.employeeId,
+          routeId: schedule.routeId,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error("[deleteWeeklySchedule] Failed to notify driver:", err),
+      );
+    }
+
 
     const response = okResponse(
       { id },
@@ -1361,6 +1474,89 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
       },
     });
 
+    // ---- Notify the employee and old/new driver ----
+    // This endpoint previously sent no notifications at all.
+    const NOTIFY_WORTHY_FIELDS = [
+      "routeId",
+      "tripId",
+      "driverId",
+      "vehicleId",
+      "officeArrivalTime",
+      "dropTime",
+      "status",
+    ];
+    const notifyWorthy = NOTIFY_WORTHY_FIELDS.some((f) => f in updateData);
+
+    if (notifyWorthy) {
+      const routeLabel =
+        updated.route?.routeName || updated.route?.routeCode || "their route";
+      const weekLabel = (updateData.weekStart || schedule.weekStart)
+        .toISOString()
+        .slice(0, 10);
+
+      notifyEmployeeById(schedule.employeeId, {
+        title: "Schedule updated",
+        body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was updated.`,
+        data: {
+          type: "SCHEDULE_EMPLOYEE_UPDATED",
+          employeeId: schedule.employeeId,
+          scheduleId: id,
+          routeId: updated.routeId,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error(
+          "[updateSingleEmployeeSchedule] Failed to notify employee:",
+          err,
+        ),
+      );
+
+      const driverChanged =
+        "driverId" in updateData && schedule.driverId !== updateData.driverId;
+
+      if (driverChanged) {
+        if (schedule.driverId) {
+          notifyDriverById(schedule.driverId, {
+            title: "Passenger removed from your trip",
+            body: `An employee's schedule on ${routeLabel} was moved off your trip.`,
+            data: { type: "TRIP_DRIVER_REMOVED", scheduleId: id },
+            event: "schedule-updated",
+          }).catch((err) =>
+            console.error(
+              "[updateSingleEmployeeSchedule] Failed to notify previous driver:",
+              err,
+            ),
+          );
+        }
+        if (updateData.driverId) {
+          notifyDriverById(updateData.driverId, {
+            title: "New passenger on your trip",
+            body: `An employee's schedule on ${routeLabel} was moved onto your trip.`,
+            data: { type: "TRIP_DRIVER_ASSIGNED", scheduleId: id },
+            event: "schedule-updated",
+          }).catch((err) =>
+            console.error(
+              "[updateSingleEmployeeSchedule] Failed to notify new driver:",
+              err,
+            ),
+          );
+        }
+      } else if (schedule.driverId) {
+        notifyDriverById(schedule.driverId, {
+          title: "Passenger schedule updated",
+          body: `An employee's schedule on ${routeLabel} for the week of ${weekLabel} was updated.`,
+          data: { type: "SCHEDULE_EMPLOYEE_UPDATED", scheduleId: id },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error(
+            "[updateSingleEmployeeSchedule] Failed to notify driver:",
+            err,
+          ),
+        );
+      }
+
+    }
+
     const response = okResponse(
       updated,
       "Employee schedule updated successfully. No rides were resynced.",
@@ -1391,7 +1587,7 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
     const { weekStartDate, employeeId } =
       await deleteScheduleAndOrphanedRides(schedule);
 
-    // ---- Notify the employee and admins/dispatchers ----
+    // ---- Notify the employee ----
     const routeLabel =
       schedule.route?.routeName || schedule.route?.routeCode || "their route";
     const weekLabel = weekStartDate.toISOString().slice(0, 10);
@@ -1404,6 +1600,7 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
         employeeId,
         routeId: schedule.routeId,
       },
+      event: "schedule-updated",
     }).catch((err) =>
       console.error(
         "[deleteSingleEmployeeSchedule] Failed to notify employee:",
@@ -1411,20 +1608,24 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
       ),
     );
 
-    notifyAdmins({
-      title: "Employee removed from schedule",
-      body: `${schedule.employee?.name || "An employee"} was removed from the schedule on ${routeLabel} for the week of ${weekLabel}.`,
-      data: {
-        type: "SCHEDULE_EMPLOYEE_REMOVED",
-        employeeId,
-        routeId: schedule.routeId,
-      },
-    }).catch((err) =>
-      console.error(
-        "[deleteSingleEmployeeSchedule] Failed to notify admins:",
-        err,
-      ),
-    );
+    if (schedule.driverId) {
+      notifyDriverById(schedule.driverId, {
+        title: "Passenger removed from your trip",
+        body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
+        data: {
+          type: "SCHEDULE_EMPLOYEE_REMOVED",
+          employeeId,
+          routeId: schedule.routeId,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error(
+          "[deleteSingleEmployeeSchedule] Failed to notify driver:",
+          err,
+        ),
+      );
+    }
+
 
     const response = okResponse(
       {
@@ -1616,7 +1817,7 @@ const updateTripDriver = async (req, res, next) => {
           }).catch(() => {});
         }
 
-        // ---- Notify moved employees, old driver, new driver, and admins ----
+        // ---- Notify moved employees, old driver, and new driver ----
         const mergedRouteLabel =
           conflictingTrip.route?.routeName ||
           conflictingTrip.route?.routeCode ||
@@ -1633,6 +1834,7 @@ const updateTripDriver = async (req, res, next) => {
               tripId: conflictingTrip.id,
               routeId: conflictingTrip.routeId,
             },
+            event: "schedule-updated",
           }).catch((err) =>
             console.error(
               "[updateTripDriver] Failed to notify moved employee:",
@@ -1646,6 +1848,7 @@ const updateTripDriver = async (req, res, next) => {
             title: "Trip merged",
             body: `Your trip on ${trip.route?.routeName || "your route"} was merged into another driver's trip and no longer needs you.`,
             data: { type: "TRIP_DRIVER_REMOVED", tripId },
+            event: "schedule-updated",
           }).catch((err) =>
             console.error(
               "[updateTripDriver] Failed to notify previous driver:",
@@ -1662,17 +1865,11 @@ const updateTripDriver = async (req, res, next) => {
             tripId: conflictingTrip.id,
             routeId: conflictingTrip.routeId,
           },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error("[updateTripDriver] Failed to notify new driver:", err),
         );
 
-        notifyAdmins({
-          title: "Trips merged",
-          body: `Trip on ${trip.route?.routeName || "a route"} was merged into driver ${driver.name}'s trip on ${mergedRouteLabel}. ${result.employeesMoved} employee(s) moved.`,
-          data: { type: "TRIP_DRIVER_CHANGED", tripId: conflictingTrip.id },
-        }).catch((err) =>
-          console.error("[updateTripDriver] Failed to notify admins:", err),
-        );
 
         const response = okResponse(
           {
@@ -1814,7 +2011,7 @@ const updateTripDriver = async (req, res, next) => {
       }).catch(() => {});
     }
 
-    // ---- Notify old/new driver, affected employees, and admins ----
+    // ---- Notify old/new driver and affected employees ----
     if (trip.driverId !== safeDriverId) {
       const tripRouteLabel =
         updatedTrip.route?.routeName || trip.route?.routeName || "a route";
@@ -1824,6 +2021,7 @@ const updateTripDriver = async (req, res, next) => {
           title: "Removed from trip",
           body: `You've been unassigned from your trip on ${tripRouteLabel}.`,
           data: { type: "TRIP_DRIVER_REMOVED", tripId },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error(
             "[updateTripDriver] Failed to notify previous driver:",
@@ -1837,6 +2035,7 @@ const updateTripDriver = async (req, res, next) => {
           title: "New trip assigned",
           body: `You've been assigned to a trip on ${tripRouteLabel} with ${trip.weeklySchedules.length} employee(s).`,
           data: { type: "TRIP_DRIVER_ASSIGNED", tripId },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error(
             "[updateTripDriver] Failed to notify new driver:",
@@ -1851,6 +2050,7 @@ const updateTripDriver = async (req, res, next) => {
           title: "Trip driver changed",
           body: `Your driver on ${tripRouteLabel} has changed to ${updatedTrip.driver?.name || "a new driver"}.`,
           data: { type: "SCHEDULE_TRIP_DRIVER_CHANGED", tripId },
+          event: "schedule-updated",
         }).catch((err) =>
           console.error(
             "[updateTripDriver] Failed to notify affected employee:",
@@ -1859,13 +2059,6 @@ const updateTripDriver = async (req, res, next) => {
         );
       });
 
-      notifyAdmins({
-        title: "Trip driver changed",
-        body: `Trip on ${tripRouteLabel}: driver changed from ${trip.driver?.name || "Unassigned"} to ${updatedTrip.driver?.name || "Unassigned"}.`,
-        data: { type: "TRIP_DRIVER_CHANGED", tripId },
-      }).catch((err) =>
-        console.error("[updateTripDriver] Failed to notify admins:", err),
-      );
     }
 
     const response = okResponse(
@@ -2197,6 +2390,56 @@ const mergeTrips = async (req, res, next) => {
         routeIds: [targetRouteId],
       }).catch(() => {});
     }
+
+    // ---- Notify moved employees, old driver, and new driver ----
+    // This endpoint previously sent no notifications at all.
+    const mergedRouteLabel =
+      targetTrip.route?.routeName || targetTrip.route?.routeCode || "the merged route";
+
+    sourceTrip.weeklySchedules.forEach((sched) => {
+      if (!sched.employeeId) return;
+      notifyEmployeeById(sched.employeeId, {
+        title: "Trip driver changed",
+        body: `Your trip was merged onto ${mergedRouteLabel} with driver ${targetDriver.name}.`,
+        data: {
+          type: "SCHEDULE_TRIP_MERGED",
+          employeeId: sched.employeeId,
+          tripId: targetTripId,
+          routeId: targetRouteId,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error("[mergeTrips] Failed to notify moved employee:", err),
+      );
+    });
+
+    if (sourceTrip.driverId && sourceTrip.driverId !== targetDriverId) {
+      notifyDriverById(sourceTrip.driverId, {
+        title: "Trip merged",
+        body: `Your trip on ${sourceTrip.route?.routeName || "your route"} was merged into another driver's trip and no longer needs you.`,
+        data: { type: "TRIP_DRIVER_REMOVED", tripId: sourceTripId },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error(
+          "[mergeTrips] Failed to notify previous driver:",
+          err,
+        ),
+      );
+    }
+
+    notifyDriverById(targetDriverId, {
+      title: "Employees added to your trip",
+      body: `${sourceEmployeeCount} employee(s) were merged into your trip on ${mergedRouteLabel}.`,
+      data: {
+        type: "TRIP_DRIVER_ASSIGNED",
+        tripId: targetTripId,
+        routeId: targetRouteId,
+      },
+      event: "schedule-updated",
+    }).catch((err) =>
+      console.error("[mergeTrips] Failed to notify new driver:", err),
+    );
+
 
     // 6. Prepare response
     const response = okResponse(
@@ -2684,6 +2927,45 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
         tripIds: Array.from(affectedTripIds),
         driverIds: Array.from(affectedDriverIds).filter(Boolean),
       });
+
+      // ---- Notify moved employees and affected drivers ----
+      // This endpoint previously sent no notifications at all, despite
+      // moving employees to a different route/trip/driver in bulk.
+      mismatched.forEach((entry) => {
+        if (!entry.employeeId) return;
+        notifyEmployeeById(entry.employeeId, {
+          title: "Schedule reassigned",
+          body: `Your schedule on ${route.routeName || route.routeCode} was reassigned to match your shift timing.`,
+          data: {
+            type: "SCHEDULE_EMPLOYEE_UPDATED",
+            employeeId: entry.employeeId,
+            scheduleId: entry.id,
+          },
+          event: "schedule-updated",
+        }).catch((err) =>
+          console.error(
+            "[reassign] Failed to notify reassigned employee:",
+            err,
+          ),
+        );
+      });
+
+      Array.from(affectedDriverIds)
+        .filter(Boolean)
+        .forEach((driverId) => {
+          notifyDriverById(driverId, {
+            title: "Trip employees changed",
+            body: `Your trip's passenger list changed after a shift-timing reassignment on route ${route.routeName || route.routeCode}.`,
+            data: { type: "TRIP_DRIVER_ASSIGNED", routeId: route.id },
+            event: "schedule-updated",
+          }).catch((err) =>
+            console.error(
+              "[reassign] Failed to notify affected driver:",
+              err,
+            ),
+          );
+        });
+
     }
 
     console.log("[reassign] Results:", results);
@@ -3559,6 +3841,7 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
         employeeId: true,
         routeId: true,
         tripId: true,
+        driverId: true, // needed to notify affected drivers below
         route: {
           select: {
             routeCode: true, // ✅ Fixed: use routeCode instead of code
@@ -3804,6 +4087,48 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
     );
 
     // Response
+    // ---- Notify all affected employees and their drivers ----
+    // This is a destructive bulk action — employees whose schedule (and
+    // therefore ride) just vanished need to know.
+    const affectedDriverIdsSet = new Set(
+      schedulesToDelete.map((s) => s.driverId).filter(Boolean),
+    );
+    const weekLabelForNotify = weekStartDate.toISOString().slice(0, 10);
+
+    schedulesToDelete.forEach((s) => {
+      if (!s.employeeId) return;
+      notifyEmployeeById(s.employeeId, {
+        title: "Schedule removed",
+        body: `Your schedule for the week of ${weekLabelForNotify} was removed.`,
+        data: {
+          type: "SCHEDULE_EMPLOYEE_REMOVED",
+          employeeId: s.employeeId,
+          weekStart: weekLabelForNotify,
+        },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error(
+          "[deleteAllWeeklySchedules] Failed to notify employee:",
+          err,
+        ),
+      );
+    });
+
+    affectedDriverIdsSet.forEach((driverId) => {
+      notifyDriverById(driverId, {
+        title: "Trips removed",
+        body: `Your trip(s) for the week of ${weekLabelForNotify} were removed in a bulk schedule deletion.`,
+        data: { type: "TRIP_DRIVER_REMOVED", weekStart: weekLabelForNotify },
+        event: "schedule-updated",
+      }).catch((err) =>
+        console.error(
+          "[deleteAllWeeklySchedules] Failed to notify driver:",
+          err,
+        ),
+      );
+    });
+
+
     const response = okResponse(
       {
         action: "BULK_DELETE_ALL_COMPLETED",
