@@ -33,6 +33,7 @@ const {
   getDriverStats,
   getActiveRide,
   getMyQrCode,
+  markAllNotificationsAsRead,
 } = require("../../../controllers/admin/driver/driver.controller");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const {
@@ -106,5 +107,7 @@ router.delete("/complaints/:id", deleteComplaint);
 router.get("/notifications", validateRequest(listQuerySchema), getNotifications);
 router.patch("/notifications/:id/read", markNotificationAsRead);
 router.delete("/notifications/:id", deleteNotification);
+router.patch("/notifications/read-all", markAllNotificationsAsRead);
+
 
 module.exports = router;

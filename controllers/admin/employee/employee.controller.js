@@ -1,24 +1,20 @@
 const { prisma } = require("../../../lib/prisma");
 const {
   createRecord,
-  getRecords,
 } = require("../../../utils/crudHelper");
 const {
   badRequestResponse,
   okResponse,
 } = require("../../../constants/responses");
+const { notifyUser, notifyRoles } = require("../../../services/notification.service");
 
-// ---------------------------------------------------------------------------
-// Helper: resolve the logged-in employee from the authenticated user.
-// Assumes an auth middleware has already run and attached `req.user`
-// (the User row) to the request — adjust this if your auth middleware
-// exposes the employee differently (e.g. req.user.employeeId).
-// ---------------------------------------------------------------------------
+// Roles that should be told about complaints — anything without
+// one obvious single recipient.
+const STAFF_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
+
 const getEmployeeFromReq = async (req) => {
-  // req.user is the decoded JWT payload set by verifyUserByToken: { userId, role }
   const userId = req.user?.userId;
   if (!userId) return null;
-
   return prisma.employee.findUnique({ where: { userId } });
 };
 
@@ -32,18 +28,24 @@ const endOfDay = (date = new Date()) => {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
 };
 
-// Normalizes any date to the Monday of its week (UTC), matching how
-// WeeklySchedule.weekStart is stored.
-const mondayOf = (date = new Date()) => {
+// ✅ Saturday as week start
+const saturdayOf = (date = new Date()) => {
   const d = new Date(date);
-  const day = d.getUTCDay(); // 0 = Sunday
-  const diff = day === 0 ? -6 : 1 - day;
+  const day = d.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  
+  // Calculate days to go back to reach Saturday
+  // If today is Saturday (6), diff = 0
+  // If today is Sunday (0), diff = -1
+  // If today is Monday (1), diff = -2
+  // If today is Tuesday (2), diff = -3
+  // If today is Wednesday (3), diff = -4
+  // If today is Thursday (4), diff = -5
+  // If today is Friday (5), diff = -6
+  const diff = day === 6 ? 0 : -(day + 1);
+  
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diff, 0, 0, 0, 0));
 };
 
-// Pickup times are free-text (e.g. "6:00 PM", "8:00AM", "1: 30PM" — see the
-// same tolerant parsing in home.tsx on the driver app). Grace period before
-// a scan counts as LATE rather than PRESENT.
 const LATE_GRACE_MINUTES = 10;
 
 function parsePickupTimeToMinutes(raw) {
@@ -60,19 +62,6 @@ function parsePickupTimeToMinutes(raw) {
   return hour * 60 + minute;
 }
 
-// Decides PRESENT vs LATE from the ride's scheduled pickup time rather than
-// trusting whatever status the client sends — a scan is proof of *when*
-// someone showed up, so the server should be the one deciding what that
-// means, not the app. Unparsable/missing pickup times fall back to PRESENT
-// rather than guessing.
-//
-// NOTE: pickupTime strings ("6:00 PM" etc.) are operational/local times, so
-// this compares against the server's local wall clock, not UTC — unlike
-// startOfDay/endOfDay above, which deliberately use UTC for date-bucketing.
-// If this server ever runs with TZ=UTC while pickup times are meant in
-// local (e.g. Asia/Karachi) time, this comparison will be off by the UTC
-// offset — worth confirming your deployment's TZ env var before relying on
-// this in production.
 function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
   const scheduledMinutes = parsePickupTimeToMinutes(pickupTime);
   if (scheduledMinutes === null) return "PRESENT";
@@ -80,9 +69,68 @@ function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
   return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES ? "LATE" : "PRESENT";
 }
 
-// ---------------------------------------------------------------------------
-// Profile
-// ---------------------------------------------------------------------------
+function isValidDate(date) {
+  return date instanceof Date && !isNaN(date.getTime());
+}
+
+function parsePagination(query) {
+  const skip = parseInt(query.skip) || 0;
+  const take = parseInt(query.take) || 10;
+  return { skip: Math.max(0, skip), take: Math.max(1, Math.min(take, 100)) };
+}
+
+const markNotificationAsRead = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      const errorResponse = badRequestResponse("User not authenticated.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const notification = await prisma.notification.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!notification || notification.userId !== userId) {
+      const errorResponse = badRequestResponse("Notification not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const updated = await prisma.notification.update({
+      where: { id: req.params.id },
+      data: { status: "READ" },
+    });
+
+    const response = okResponse(updated, "Notification marked as read.");
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const deleteNotification = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      const errorResponse = badRequestResponse("User not authenticated.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const notification = await prisma.notification.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!notification || notification.userId !== userId) {
+      const errorResponse = badRequestResponse("Notification not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    await prisma.notification.delete({ where: { id: req.params.id } });
+
+    const response = okResponse(null, "Notification deleted successfully.");
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
 
 const getMyProfile = async (req, res, next) => {
   try {
@@ -122,9 +170,6 @@ const updateMyProfile = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Employees can self-edit contact/personal details only. Designation,
-    // department, entity, office location, and service type stay
-    // dispatch/HR-managed, matching the schema's ownership.
     const { name, contactNumber, cnic, gender, address } = req.body;
 
     if (cnic && cnic !== employee.cnic) {
@@ -140,13 +185,20 @@ const updateMyProfile = async (req, res, next) => {
     const updated = await prisma.employee.update({
       where: { id: employee.id },
       data: {
-        ...(name && { name }),
-        ...(contactNumber && { contactNumber }),
-        ...(cnic && { cnic }),
-        ...(gender && { gender }),
-        ...(address && { address }),
+        ...(name !== undefined && { name }),
+        ...(contactNumber !== undefined && { contactNumber }),
+        ...(cnic !== undefined && { cnic }),
+        ...(gender !== undefined && { gender }),
+        ...(address !== undefined && { address }),
       },
     });
+
+    notifyRoles(STAFF_ROLES, {
+      title: "Employee profile updated",
+      body: `${updated.name} updated their profile.`,
+      data: { employeeId: employee.id, type: "EMPLOYEE_PROFILE_UPDATED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[employee_controller] notifyRoles failed:", err));
 
     const response = okResponse(updated, "Profile updated successfully.");
     return res.status(response.status.code).json(response);
@@ -155,19 +207,6 @@ const updateMyProfile = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Today's ride
-// ---------------------------------------------------------------------------
-
-// The Ride (PENDING or later) is provisioned by dispatch the moment the
-// WeeklySchedule is assigned (see services/ridePlanning.js), so — same as
-// driver_controller's getTodayRide — there is no WeeklySchedule fallback
-// here anymore. Employee and driver now read from the exact same source
-// of truth for "does a ride exist today", so they can no longer disagree
-// about whether today has a ride. A missing Ride is a normal "day off /
-// not dispatched yet" state, not an error, so this returns 200 + null
-// rather than a 400 (matching driver_controller's convention) so the app
-// can render its empty state instead of an error banner.
 const getTodayRide = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -207,9 +246,6 @@ const getTodayRide = async (req, res, next) => {
     const response = okResponse(
       {
         ...ridePassenger.ride,
-        // These live on RidePassenger, not Ride — this is the employee's own
-        // pickup confirmation, separate from the ride's dispatch status
-        // (Ride.status), so it has to be spread in explicitly here.
         confirmationStatus: ridePassenger.confirmationStatus,
         confirmedAt: ridePassenger.confirmedAt,
         source: "RIDE",
@@ -222,11 +258,6 @@ const getTodayRide = async (req, res, next) => {
   }
 };
 
-// Confirmation now lives on RidePassenger.confirmationStatus (see
-// schema.prisma) instead of only being logged to AuditLog — the AuditLog
-// write stays for the historical "who/when" trail, but confirmationStatus
-// is what the app actually reads back, so tapping Confirm/Decline has a
-// visible, persistent effect.
 const confirmTodayRide = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -248,7 +279,16 @@ const confirmTodayRide = async (req, res, next) => {
         employeeId: employee.id,
         ride: { rideDate: { gte: startOfDay(), lte: endOfDay() } },
       },
-      select: { id: true, rideId: true },
+      select: {
+        id: true,
+        rideId: true,
+        ride: {
+          select: {
+            driver: { select: { userId: true } },
+            route: { select: { routeName: true } },
+          },
+        },
+      },
     });
 
     if (!ridePassenger) {
@@ -276,6 +316,17 @@ const confirmTodayRide = async (req, res, next) => {
       },
     });
 
+    const driverUserId = ridePassenger.ride?.driver?.userId;
+    if (driverUserId) {
+      const routeName = ridePassenger.ride?.route?.routeName ?? "today's ride";
+      notifyUser(driverUserId, {
+        title: confirmed ? "Pickup confirmed" : "Pickup declined",
+        body: `${employee.name} ${confirmed ? "confirmed" : "declined"} pickup for ${routeName}.`,
+        data: { rideId: ridePassenger.rideId, type: confirmed ? "PICKUP_CONFIRMED" : "PICKUP_DECLINED" },
+        event: "ride-response",
+      }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
+    }
+
     const response = okResponse(
       {
         rideId: ridePassenger.rideId,
@@ -293,8 +344,6 @@ const confirmTodayRide = async (req, res, next) => {
   }
 };
 
-// GET /rides — paginated ride history for this employee, via their
-// RidePassenger links (Employee has no direct Ride relation).
 const getMyRides = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -303,36 +352,56 @@ const getMyRides = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { skip = 0, take = 10, status, startDate, endDate } = req.query;
+    const { skip, take } = parsePagination(req.query);
+    const { status, startDate, endDate } = req.query;
 
-    const ridePassengers = await prisma.ridePassenger.findMany({
-      where: {
-        employeeId: employee.id,
-        ride: {
-          ...(status && { status }),
-          ...((startDate || endDate) && {
-            rideDate: {
-              ...(startDate && { gte: new Date(startDate) }),
-              ...(endDate && { lte: new Date(endDate) }),
-            },
-          }),
-        },
+    let dateFilter = {};
+    if (startDate) {
+      const parsedStart = new Date(startDate);
+      if (!isValidDate(parsedStart)) {
+        const errorResponse = badRequestResponse("Invalid startDate.");
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+      dateFilter.gte = startOfDay(parsedStart);
+    }
+    if (endDate) {
+      const parsedEnd = new Date(endDate);
+      if (!isValidDate(parsedEnd)) {
+        const errorResponse = badRequestResponse("Invalid endDate.");
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+      dateFilter.lte = endOfDay(parsedEnd);
+    }
+
+    const where = {
+      employeeId: employee.id,
+      ride: {
+        ...(status && { status }),
+        ...(Object.keys(dateFilter).length > 0 && { rideDate: dateFilter }),
       },
-  
-      orderBy: { ride: { rideDate: "desc" } },
-      include: {
-        ride: {
-          include: {
-            route: { select: { id: true, routeName: true } },
-            driver: { select: { id: true, name: true, phone: true } },
-            vehicle: { select: { id: true, vehicleNumber: true } },
+    };
+
+    const [ridePassengers, total] = await Promise.all([
+      prisma.ridePassenger.findMany({
+        where,
+        orderBy: { ride: { rideDate: "desc" } },
+        skip,
+        take,
+        include: {
+          ride: {
+            include: {
+              route: { select: { id: true, routeName: true } },
+              driver: { select: { id: true, name: true, phone: true } },
+              vehicle: { select: { id: true, vehicleNumber: true } },
+            },
           },
         },
-      },
-    });
+      }),
+      prisma.ridePassenger.count({ where }),
+    ]);
 
     const response = okResponse(
-      ridePassengers.map((rp) => rp.ride),
+      { data: ridePassengers.map((rp) => rp.ride), total, skip, take },
       "Rides retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
@@ -341,7 +410,6 @@ const getMyRides = async (req, res, next) => {
   }
 };
 
-// GET /rides/:id — a single ride this employee is/was a passenger on.
 const getRideDetails = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -375,8 +443,6 @@ const getRideDetails = async (req, res, next) => {
   }
 };
 
-// Same "no dedicated confirmation model" situation as confirmTodayRide —
-// accept/reject on any ride (not just today's) is logged to AuditLog.
 const setRideResponse = async (req, res, next, { confirmed }) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -395,11 +461,27 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
 
     const ridePassenger = await prisma.ridePassenger.findUnique({
       where: { rideId_employeeId: { rideId, employeeId: employee.id } },
+      include: {
+        ride: {
+          select: {
+            driver: { select: { userId: true } },
+            route: { select: { routeName: true } },
+          },
+        },
+      },
     });
     if (!ridePassenger) {
       const errorResponse = badRequestResponse("Ride not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
+    const updated = await prisma.ridePassenger.update({
+      where: { id: ridePassenger.id },
+      data: {
+        confirmationStatus: confirmed ? "CONFIRMED" : "DECLINED",
+        confirmedAt: new Date(),
+      },
+    });
 
     await prisma.auditLog.create({
       data: {
@@ -411,8 +493,21 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
       },
     });
 
+    const driverUserId = ridePassenger.ride?.driver?.userId;
+    if (driverUserId) {
+      const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
+      notifyUser(driverUserId, {
+        title: confirmed ? "Ride accepted" : "Ride rejected",
+        body: confirmed
+          ? `${employee.name} accepted the ride for ${routeName}.`
+          : `${employee.name} rejected the ride for ${routeName}${reason ? `: ${String(reason).trim()}` : "."}`,
+        data: { rideId, type: confirmed ? "RIDE_ACCEPTED" : "RIDE_REJECTED" },
+        event: "ride-response",
+      }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
+    }
+
     const response = okResponse(
-      { rideId, confirmed },
+      { rideId, confirmed, confirmationStatus: updated.confirmationStatus },
       confirmed ? "Ride accepted." : "Ride rejected. Dispatch has been notified.",
     );
     return res.status(response.status.code).json(response);
@@ -424,17 +519,7 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
 const acceptRide = (req, res, next) => setRideResponse(req, res, next, { confirmed: true });
 const rejectRide = (req, res, next) => setRideResponse(req, res, next, { confirmed: false });
 
-// ---------------------------------------------------------------------------
-// Weekly schedule
-// ---------------------------------------------------------------------------
-
-// A missing WeeklySchedule row (week not planned yet, employee is new,
-// or the requested week is simply in the past/future with nothing
-// assigned) is a normal empty state, not an error — same convention as
-// getTodayRide above. Returning 400 here made every client call for an
-// unplanned week fail, which surfaced as a false "API error" banner on
-// the home screen and made it impossible to render "no schedule yet"
-// as a normal UI state instead of an error.
+// ✅ UPDATED: Saturday to Friday week
 const getWeeklySchedule = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -443,11 +528,13 @@ const getWeeklySchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    // ✅ Saturday as week start
     const weekStart = req.query.weekStart
-      ? mondayOf(new Date(req.query.weekStart))
-      : mondayOf();
+      ? saturdayOf(new Date(req.query.weekStart))
+      : saturdayOf();
     const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6); // Friday
+    weekEnd.setUTCHours(23, 59, 59, 999);
 
     const [schedule, attendances] = await Promise.all([
       prisma.weeklySchedule.findUnique({
@@ -458,15 +545,10 @@ const getWeeklySchedule = async (req, res, next) => {
           vehicle: { select: { id: true, vehicleNumber: true } },
         },
       }),
-      // The schedule's own day fields (PICKUP/DROP/BOTH/OFF) only describe
-      // the plan, not what actually happened — pull real Attendance rows
-      // for the week so the client can show a day as genuinely completed
-      // (PRESENT/LATE), missed (NO_SHOW), or absent, instead of just
-      // echoing back the static plan forever, even for days long past.
       prisma.attendance.findMany({
         where: {
           employeeId: employee.id,
-          rideDate: { gte: weekStart, lte: endOfDay(weekEnd) },
+          rideDate: { gte: weekStart, lte: weekEnd },
         },
         select: { rideDate: true, status: true },
       }),
@@ -477,17 +559,15 @@ const getWeeklySchedule = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // weekStart is always a Monday (see mondayOf), so the offset in days
-    // from weekStart maps directly onto this fixed field order — no need
-    // to look at the actual weekday of rideDate.
+    // ✅ Saturday to Friday order
     const WEEK_FIELD_ORDER = [
+      "saturday",
+      "sunday",
       "monday",
       "tuesday",
       "wednesday",
       "thursday",
       "friday",
-      "saturday",
-      "sunday",
     ];
     const MS_PER_DAY = 24 * 60 * 60 * 1000;
     const attendanceByDay = {};
@@ -507,10 +587,80 @@ const getWeeklySchedule = async (req, res, next) => {
   }
 };
 
-// This-week snapshot for the home screen: rides completed/remaining and
-// attendance rate. "Completed" is driven by the ride's own Ride.status
-// (only true once the driver ends the ride), not by this employee's
-// Attendance row alone — attendance PRESENT/LATE just confirms pickup.
+// ✅ NEW: Get all weekly schedules (multiple weeks)
+const getAllWeeklySchedules = async (req, res, next) => {
+  try {
+    const employee = await getEmployeeFromReq(req);
+    if (!employee) {
+      const errorResponse = badRequestResponse("Employee profile not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const schedules = await prisma.weeklySchedule.findMany({
+      where: { employeeId: employee.id },
+      orderBy: { weekStart: "desc" },
+      include: {
+        route: { select: { id: true, routeName: true } },
+        driver: { select: { id: true, name: true, phone: true } },
+        vehicle: { select: { id: true, vehicleNumber: true } },
+      },
+    });
+
+    if (schedules.length === 0) {
+      const response = okResponse([], "No schedules found.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const firstWeekStart = schedules[schedules.length - 1].weekStart;
+    const lastWeekEnd = new Date(schedules[0].weekStart);
+    lastWeekEnd.setUTCDate(lastWeekEnd.getUTCDate() + 6);
+    lastWeekEnd.setUTCHours(23, 59, 59, 999);
+
+    const attendances = await prisma.attendance.findMany({
+      where: {
+        employeeId: employee.id,
+        rideDate: { gte: firstWeekStart, lte: lastWeekEnd },
+      },
+      select: { rideDate: true, status: true },
+    });
+
+    const WEEK_FIELD_ORDER = [
+      "saturday",
+      "sunday",
+      "monday",
+      "tuesday",
+      "wednesday",
+      "thursday",
+      "friday",
+    ];
+    const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+    const schedulesWithAttendance = schedules.map((schedule) => {
+      const attendanceByDay = {};
+      for (const a of attendances) {
+        const offset = Math.round(
+          (startOfDay(a.rideDate).getTime() - schedule.weekStart.getTime()) / MS_PER_DAY
+        );
+        if (offset >= 0 && offset < 7) {
+          const key = WEEK_FIELD_ORDER[offset];
+          if (key) attendanceByDay[key] = a.status;
+        }
+      }
+      return { ...schedule, attendanceByDay };
+    });
+
+    const response = okResponse(
+      schedulesWithAttendance,
+      "All weekly schedules retrieved successfully.",
+    );
+    console.log('schedulesWithAttendance', schedulesWithAttendance)
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ✅ UPDATED: Saturday to Friday week summary
 const getWeekSummary = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -519,10 +669,11 @@ const getWeekSummary = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const weekStart = mondayOf();
+    // ✅ Saturday as week start
+    const weekStart = saturdayOf();
     const weekEnd = new Date(weekStart);
-    weekEnd.setDate(weekEnd.getDate() + 6);
-    weekEnd.setHours(23, 59, 59, 999);
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6); // Friday
+    weekEnd.setUTCHours(23, 59, 59, 999);
 
     const attendances = await prisma.attendance.findMany({
       where: {
@@ -531,8 +682,6 @@ const getWeekSummary = async (req, res, next) => {
       },
       select: {
         status: true,
-        // Need the linked ride's own status to tell "employee scanned in"
-        // apart from "ride is actually finished" — see `completed` below.
         ride: { select: { status: true } },
       },
     });
@@ -542,14 +691,6 @@ const getWeekSummary = async (req, res, next) => {
       ["PRESENT", "LATE"].includes(a.status),
     ).length;
 
-    // A ride only counts as "completed" once the driver has actually
-    // ended it (Ride.status === "COMPLETED"). Attendance being
-    // PRESENT/LATE only means this employee's QR scan was recorded at
-    // pickup — the ride can still be STARTED/ARRIVED for a while after
-    // that, so it must not be counted as completed yet. (Attendance
-    // rows created before Trips/rideId linking existed may have no
-    // `ride` at all; those can't be confirmed completed, so they're
-    // excluded here same as an in-progress ride would be.)
     const completed = attendances.filter(
       (a) => ["PRESENT", "LATE"].includes(a.status) && a.ride?.status === "COMPLETED",
     ).length;
@@ -557,13 +698,13 @@ const getWeekSummary = async (req, res, next) => {
     const schedule = await prisma.weeklySchedule.findUnique({
       where: { employeeId_weekStart: { employeeId: employee.id, weekStart } },
       select: {
+        saturday: true,
+        sunday: true,
         monday: true,
         tuesday: true,
         wednesday: true,
         thursday: true,
         friday: true,
-        saturday: true,
-        sunday: true,
       },
     });
 
@@ -588,17 +729,6 @@ const getWeekSummary = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Attendance (self-scan)
-// ---------------------------------------------------------------------------
-
-// POST /employees/me/attendance/scan — employee scans the DRIVER's QR code
-// (shown on the driver's own /scan screen) with their camera. This is a
-// stronger disambiguation than markMyAttendance below: instead of inferring
-// "which ride" from the employee's own schedule for today (which still
-// needs a fallback if they're somehow a passenger on more than one active
-// ride), the scanned code identifies the exact driver standing in front of
-// them, and from there their exact active ride — there's no guessing.
 const markAttendanceByQr = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -613,9 +743,6 @@ const markAttendanceByQr = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Resolve the scanned code to a driver. User.qrCode is the same token
-    // rendered on GET /drivers/me/qr-code (driver_controller.js), so this
-    // is the driver's badge, not the employee's own.
     const scannedUser = await prisma.user.findUnique({
       where: { qrCode },
       include: { driver: { select: { id: true, name: true } } },
@@ -628,14 +755,13 @@ const markAttendanceByQr = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // A driver can only ever have ONE ride STARTED/ARRIVED at a time
-    // (enforced in driver_controller.js's applyRideStatusTransition), so
-    // this is guaranteed to resolve to at most one ride.
     const ride = await prisma.ride.findFirst({
       where: {
         driverId: scannedUser.driver.id,
         status: { in: ["STARTED", "ARRIVED"] },
+        rideDate: { gte: startOfDay(), lte: endOfDay() },
       },
+      orderBy: { rideDate: "desc" },
       select: { id: true, rideDate: true, pickupTime: true, route: { select: { routeName: true } } },
     });
 
@@ -666,6 +792,13 @@ const markAttendanceByQr = async (req, res, next) => {
       create: { employeeId: employee.id, rideId: ride.id, rideDate, status, arrivalTime: now },
     });
 
+    notifyUser(scannedUser.id, {
+      title: "Passenger checked in",
+      body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+      data: { rideId: ride.id, type: "ATTENDANCE_MARKED", status },
+      event: "attendance-updated",
+    }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
+
     const response = okResponse(
       { ...attendance, routeName: ride.route?.routeName, driverName: scannedUser.driver.name },
       status === "LATE"
@@ -692,13 +825,6 @@ const markMyAttendance = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Only match against a ride that's actually STARTED/ARRIVED right now.
-    // A driver can only ever have one active ride at a time (enforced in
-    // driver_controller.js's applyRideStatusTransition), so filtering on
-    // that status is what guarantees at most one candidate here — matching
-    // on "any ride today" (the old behavior) was the root cause of
-    // attendance silently landing on the wrong ride when an employee
-    // happened to be listed on more than one trip for the day.
     const ridePassengers = await prisma.ridePassenger.findMany({
       where: {
         employeeId: employee.id,
@@ -707,7 +833,15 @@ const markMyAttendance = async (req, res, next) => {
           status: { in: ["STARTED", "ARRIVED"] },
         },
       },
-      select: { rideId: true },
+      select: {
+        rideId: true,
+        ride: {
+          select: {
+            driver: { select: { userId: true } },
+            route: { select: { routeName: true } },
+          },
+        },
+      },
     });
 
     if (ridePassengers.length === 0) {
@@ -718,10 +852,6 @@ const markMyAttendance = async (req, res, next) => {
     }
 
     if (ridePassengers.length > 1) {
-      // Should be effectively impossible given the one-active-ride-per-driver
-      // rule, but if two different drivers somehow have active rides that
-      // both list this employee, don't guess — surface it as a scheduling
-      // conflict instead of silently picking one.
       const errorResponse = badRequestResponse(
         "You're listed on more than one active ride right now — this is a scheduling conflict. Please contact dispatch before marking attendance.",
       );
@@ -729,7 +859,6 @@ const markMyAttendance = async (req, res, next) => {
     }
 
     const ridePassenger = ridePassengers[0];
-
     const rideDate = startOfDay();
 
     const attendance = await prisma.attendance.upsert({
@@ -746,16 +875,23 @@ const markMyAttendance = async (req, res, next) => {
       },
     });
 
+    const driverUserId = ridePassenger.ride?.driver?.userId;
+    if (driverUserId) {
+      const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
+      notifyUser(driverUserId, {
+        title: "Passenger checked in",
+        body: `${employee.name} checked in for ${routeName}${status === "LATE" ? " (late)" : ""}.`,
+        data: { rideId: ridePassenger.rideId, type: "ATTENDANCE_MARKED", status },
+        event: "attendance-updated",
+      }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
+    }
+
     const response = okResponse(attendance, "Attendance marked successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
   }
 };
-
-// ---------------------------------------------------------------------------
-// Complaints
-// ---------------------------------------------------------------------------
 
 const createComplaint = async (req, res, next) => {
   try {
@@ -772,16 +908,7 @@ const createComplaint = async (req, res, next) => {
       const errorResponse = badRequestResponse("Title is required.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
-    if (!description || !description.trim()) {
-      const errorResponse = badRequestResponse("Description is required.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
 
-    // Driver/vehicle complaints are only useful if we know *which* driver
-    // or vehicle — and the only source of truth for that is the selected
-    // ride (Complaint has no other way to point at a specific driver).
-    // Without this, these categories would save with a title/description
-    // but no driverId/vehicleId, same as the bug that was happening before.
     if (["DRIVER_BEHAVIOUR", "VEHICLE_CONDITION"].includes(resolvedCategory) && !rideId) {
       const errorResponse = badRequestResponse(
         resolvedCategory === "DRIVER_BEHAVIOUR"
@@ -795,11 +922,6 @@ const createComplaint = async (req, res, next) => {
     let vehicleId;
 
     if (rideId) {
-      // Also pulls the ride's driverId/vehicleId so the complaint can be
-      // attached to them directly. Derived server-side from the validated
-      // ride record rather than trusted from the client — the client has
-      // no reliable way to know these IDs, and shouldn't be able to set
-      // them directly on a Complaint anyway.
       const ridePassenger = await prisma.ridePassenger.findUnique({
         where: { rideId_employeeId: { rideId, employeeId: employee.id } },
         include: { ride: { select: { driverId: true, vehicleId: true } } },
@@ -818,11 +940,19 @@ const createComplaint = async (req, res, next) => {
       employeeId: employee.id,
       category: resolvedCategory,
       title: title.trim(),
-      description: description.trim(),
+      description: description?.trim() || null,
       ...(rideId && { rideId }),
       ...(driverId && { driverId }),
       ...(vehicleId && { vehicleId }),
     });
+
+    const complaint = response?.data;
+    notifyRoles(STAFF_ROLES, {
+      title: "New complaint filed",
+      body: `${employee.name} filed a complaint: ${title.trim()}`,
+      data: { complaintId: complaint?.id, type: "COMPLAINT_CREATED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[employee_controller] notifyRoles failed:", err));
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -838,26 +968,34 @@ const getMyComplaints = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { skip = 0, take = 10, status } = req.query;
+    const { skip, take } = parsePagination(req.query);
+    const { status } = req.query;
 
-    const options = {
-      where: {
-        employeeId: employee.id,
-        ...(status && { status }),
-      },
-  
-      orderBy: { createdAt: "desc" },
+    const where = {
+      employeeId: employee.id,
+      ...(status && { status }),
     };
 
-    const response = await getRecords(prisma.complaint, options);
+    const [complaints, total] = await Promise.all([
+      prisma.complaint.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.complaint.count({ where }),
+    ]);
+
+    const response = okResponse(
+      { data: complaints, total, skip, take },
+      "Complaints retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
   }
 };
 
-// Recent rides an employee can tie a complaint to (used by the "Related
-// Ride" dropdown on the complaint screen).
 const getRecentRides = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -866,11 +1004,11 @@ const getRecentRides = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { take = 5 } = req.query;
+    const take = Math.min(parseInt(req.query.take) || 5, 20);
 
     const ridePassengers = await prisma.ridePassenger.findMany({
       where: { employeeId: employee.id },
-      take: parseInt(take),
+      take,
       orderBy: { ride: { rideDate: "desc" } },
       include: {
         ride: {
@@ -902,10 +1040,6 @@ const getRecentRides = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Notifications
-// ---------------------------------------------------------------------------
-
 const getNotifications = async (req, res, next) => {
   try {
     const userId = req.user?.userId;
@@ -914,31 +1048,57 @@ const getNotifications = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { limit = 10, skip = 0, status } = req.query;
+    const { skip, take } = parsePagination(req.query);
+    const { status } = req.query;
 
-    const notifications = await prisma.notification.findMany({
-      where: {
-        userId,
-        ...(status && { status }),
-      },
-      take: parseInt(limit),
-      skip: parseInt(skip),
-      orderBy: { createdAt: "desc" },
-    });
+    const where = {
+      userId,
+      ...(status && { status }),
+    };
 
-    const total = await prisma.notification.count({
-      where: {
-        userId,
-        ...(status && { status }),
-      },
-    });
+    const [notifications, total] = await Promise.all([
+      prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.notification.count({ where }),
+    ]);
 
     const response = okResponse(
-      { data:notifications ?? [], total, limit: parseInt(limit), skip: parseInt(skip) },
+      { data: notifications, total, skip, take },
       "Notifications retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
+    next(error);
+  }
+};
+
+const markAllNotificationsAsRead = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      const errorResponse = badRequestResponse("User not authenticated.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const { count } = await prisma.notification.updateMany({
+      where: { 
+        userId, 
+        status: 'UNREAD' 
+      },
+      data: { status: 'READ' },
+    });
+
+    const response = okResponse(
+      { markedCount: count }, 
+      `${count} notification(s) marked as read.`
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };
@@ -949,6 +1109,8 @@ module.exports = {
   getTodayRide,
   confirmTodayRide,
   getWeeklySchedule,
+  getAllWeeklySchedules, // ✅ NEW
+  markAllNotificationsAsRead,
   getWeekSummary,
   markMyAttendance,
   markAttendanceByQr,
@@ -956,4 +1118,10 @@ module.exports = {
   getMyComplaints,
   getRecentRides,
   getNotifications,
+  acceptRide,
+  rejectRide,
+  getRideDetails,
+  getMyRides,
+  markNotificationAsRead,
+  deleteNotification,
 };

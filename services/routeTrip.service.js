@@ -149,6 +149,19 @@ const findExistingTripForDriverThisWeek = async (
 // findOrCreateRouteAndTrip - UPDATED WITH CAPACITY AWARENESS
 // ============================================================
 
+const OFFICE_LOCATION_VALUES = ["IBT_1", "IBT_2", "IBT_3", "SKY_TOWER"];
+
+// Route.officeLocation is an enum, not free text, so whatever the caller
+// passes as `location` (e.g. "IBT 1", "ibt-2", "Sky Tower") has to be
+// normalized before it can be written to the column. Previously `location`
+// was only ever spliced into the route *name* string — never mapped onto
+// this field, so newly-created routes always had officeLocation: null even
+// when a location was supplied.
+const normalizeOfficeLocation = (value) => {
+  if (!value) return null;
+  const key = String(value).trim().toUpperCase().replace(/[\s-]+/g, "_");
+  return OFFICE_LOCATION_VALUES.includes(key) ? key : null;
+};
 
 const findOrCreateRouteAndTrip = async (
   areaRecord,
@@ -164,6 +177,11 @@ const findOrCreateRouteAndTrip = async (
   vendorName,
   location, // <-- ADD THIS
   vehicleEntity, // <-- ADD THIS
+  subAreaId,
+  serviceType,
+  pickupStartTime,
+  officeArrivalTime,
+  dropTime,
 ) => {
   const requestedDriverId = driverId;
 
@@ -228,18 +246,33 @@ const findOrCreateRouteAndTrip = async (
 
     const baseCode = slugify(baseName) || `ROUTE-${Date.now()}`;
 
+    const normalizedOfficeLocation = normalizeOfficeLocation(location);
+    if (location && !normalizedOfficeLocation) {
+      console.warn(
+        `[routeTrip] location "${location}" did not match a known OfficeLocation ` +
+          `(${OFFICE_LOCATION_VALUES.join(", ")}) — leaving officeLocation unset on new route.`,
+      );
+    }
+
+    const routeCreateData = {
+      routeName: baseName,
+      shiftTiming: shiftTiming || undefined,
+      areaId: areaRecord?.id,
+      subAreaId: subAreaId || undefined,
+      officeLocation: normalizedOfficeLocation || undefined,
+      serviceType: serviceType || undefined,
+      pickupStartTime: pickupStartTime || undefined,
+      officeArrivalTime: officeArrivalTime || undefined,
+      dropTime: dropTime || undefined,
+    };
+
     const MAX_ROUTE_CODE_ATTEMPTS = 5;
     let lastRouteCreateError;
     for (let attempt = 1; attempt <= MAX_ROUTE_CODE_ATTEMPTS; attempt += 1) {
       const routeCode = await generateUniqueRouteCode(baseCode);
       try {
         route = await prisma.route.create({
-          data: {
-            routeName: baseName,
-            routeCode,
-            shiftTiming: shiftTiming || undefined,
-            areaId: areaRecord?.id,
-          },
+          data: { ...routeCreateData, routeCode },
           include: { area: true },
         });
         lastRouteCreateError = undefined;
@@ -255,12 +288,7 @@ const findOrCreateRouteAndTrip = async (
         .toString(36)
         .slice(2, 6)}`;
       route = await prisma.route.create({
-        data: {
-          routeName: baseName,
-          routeCode: guaranteedCode,
-          shiftTiming: shiftTiming || undefined,
-          areaId: areaRecord?.id,
-        },
+        data: { ...routeCreateData, routeCode: guaranteedCode },
         include: { area: true },
       });
     }
@@ -269,7 +297,8 @@ const findOrCreateRouteAndTrip = async (
     console.log(
       `[weeklySchedule] Created new route: "${route.routeCode}" ` +
         `for area "${areaRecord?.name || "unknown"}" shift "${shiftTiming}"` +
-        ` location "${location}" vehicleEntity "${vehicleEntity}"`,
+        ` location "${location}" (officeLocation: ${normalizedOfficeLocation ?? "unset"})` +
+        ` vehicleEntity "${vehicleEntity}"`,
     );
   }
 

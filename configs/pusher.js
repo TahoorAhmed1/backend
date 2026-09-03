@@ -1,12 +1,13 @@
 const Pusher = require("pusher");
 
 const pusher = new Pusher({
-    appId: "1981649",
-    key: "5a8f542f7e4c1f452d53",
-    secret: "5dce5d15134bd5f8586d",
-    cluster: "ap2",
-    useTLS: true
+  appId: "2190497",
+  key: "65e6d6039348fb7e77e4",
+  secret: "e5c9f7a48f846d11d6d4",
+  cluster: "ap2",
+  useTLS: true
 });
+
 
 
 module.exports = { pusher };

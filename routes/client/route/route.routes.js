@@ -35,6 +35,5 @@ router.post("/:routeId/trips", addTripToRoute);
 router.patch("/trips/:tripId", updateTripAssignment);
 
 
-router.post("/trips/:tripId/assign", assignEmployeeToTrip);
-
+      
 module.exports = router;

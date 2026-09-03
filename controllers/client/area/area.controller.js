@@ -6,10 +6,10 @@ const {
   updateRecord,
   deleteRecord,
 } = require("../../../utils/crudHelper");
-const { 
-  badRequestResponse, 
-  okResponse, 
-  createSuccessResponse 
+const {
+  badRequestResponse,
+  okResponse,
+  createSuccessResponse,
 } = require("../../../constants/responses");
 
 const createArea = async (req, res, next) => {
@@ -42,13 +42,10 @@ const createArea = async (req, res, next) => {
       },
     });
 
-    const response = createSuccessResponse(
-      area,
-      "Area created successfully."
-    );
+    const response = createSuccessResponse(area, "Area created successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -62,6 +59,8 @@ const getAllAreas = async (req, res, next) => {
       city,
       sortBy = "createdAt",
       sortOrder = "desc",
+      // For dropdown/select usage - return all matching areas without pagination
+      all = false,
     } = req.query;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -69,57 +68,115 @@ const getAllAreas = async (req, res, next) => {
 
     const where = {};
 
-    // Filters
-    if (city) where.city = city;
-
-    // Search functionality
+    // Search functionality - search across name and city
     if (search) {
       where.OR = [
         { name: { contains: search, mode: "insensitive" } },
         { city: { contains: search, mode: "insensitive" } },
+        // Optionally search by area ID if search term looks like an ID
+        ...(search.length === 24 || search.length === 36
+          ? [{ id: search }]
+          : []),
       ];
     }
+
+    // City filter
+    if (city) {
+      where.city = { equals: city, mode: "insensitive" };
+    }
+
+    // For dropdown/select (all=true), only return id and name
+    if (all) {
+      const [areas, total] = await Promise.all([
+        prisma.area.findMany({
+          where,
+          take: 100, // Limit to 100 for dropdown
+          select: {
+            id: true,
+            name: true,
+            city: true, // add this
+            subAreas: {
+              select: {
+                id: true,
+                name: true,
+                blocks: { select: { id: true, name: true } },
+              },
+            },
+          },
+          orderBy: { [sortBy]: sortOrder },
+        }),
+        prisma.area.count({ where }),
+      ]);
+
+      const response = okResponse(areas, "Areas retrieved successfully.");
+      return res.status(response.status.code).json(response);
+    }
+
+    // Full response with pagination, counts, and nested data
+    const selectFields = {
+      id: true,
+      name: true,
+      city: true,
+      createdAt: true,
+      updatedAt: true,
+      _count: {
+        select: {
+          subAreas: true,
+          employees: true,
+          routes: true,
+          rides: true,
+        },
+      },
+      subAreas: {
+        select: {
+          id: true,
+          name: true,
+          _count: {
+            select: { blocks: true },
+          },
+          blocks: {
+            select: {
+              id: true,
+              name: true,
+              _count: {
+                select: { employees: true },
+              },
+            },
+          },
+        },
+      },
+    };
 
     const [areas, total] = await Promise.all([
       prisma.area.findMany({
         where,
         skip,
         take,
-        include: {
-          subAreas: {
-            select: {
-              id: true,
-              name: true,
-              _count: {
-                select: { blocks: true },
-              },
-            },
-          },
-          _count: {
-            select: {
-              subAreas: true,
-              employees: true,
-              routes: true,
-              rides: true,
-            },
-          },
-        },
+        select: selectFields,
         orderBy: { [sortBy]: sortOrder },
       }),
       prisma.area.count({ where }),
     ]);
 
-    // Map areas to include counts
     const areasWithCounts = areas.map((area) => ({
-      ...area,
+      id: area.id,
+      name: area.name,
+      city: area.city,
+      createdAt: area.createdAt,
+      updatedAt: area.updatedAt,
       subAreaCount: area._count.subAreas,
       employeeCount: area._count.employees,
       routeCount: area._count.routes,
       rideCount: area._count.rides,
       subAreas: area.subAreas.map((subArea) => ({
-        ...subArea,
+        id: subArea.id,
+        name: subArea.name,
         blockCount: subArea._count.blocks,
-        _count: undefined,
+        blocks: subArea.blocks.map((block) => ({
+          id: block.id,
+          name: block.name,
+          employeeCount: block._count.employees,
+        })),
       })),
       _count: undefined,
     }));
@@ -135,13 +192,17 @@ const getAllAreas = async (req, res, next) => {
           hasNextPage: parseInt(page) < Math.ceil(total / take),
           hasPrevPage: parseInt(page) > 1,
         },
+        filters: {
+          search: search || null,
+          city: city || null,
+        },
       },
-      "Areas retrieved successfully."
+      "Areas retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -173,17 +234,17 @@ const getAreaById = async (req, res, next) => {
           },
         },
         employees: {
-          select: { 
-            id: true, 
-            name: true, 
+          select: {
+            id: true,
+            name: true,
             employeeCode: true,
             designation: true,
           },
         },
         routes: {
-          select: { 
-            id: true, 
-            routeName: true, 
+          select: {
+            id: true,
+            routeName: true,
             routeCode: true,
             status: true,
           },
@@ -191,8 +252,8 @@ const getAreaById = async (req, res, next) => {
         rides: {
           take: 10,
           orderBy: { rideDate: "desc" },
-          select: { 
-            id: true, 
+          select: {
+            id: true,
             rideDate: true,
             status: true,
           },
@@ -233,14 +294,11 @@ const getAreaById = async (req, res, next) => {
       _count: undefined,
     };
 
-    const response = okResponse(
-      areaWithCounts,
-      "Area retrieved successfully."
-    );
+    const response = okResponse(areaWithCounts, "Area retrieved successfully.");
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -296,13 +354,10 @@ const updateArea = async (req, res, next) => {
       _count: undefined,
     };
 
-    const response = okResponse(
-      areaWithCounts,
-      "Area updated successfully."
-    );
+    const response = okResponse(areaWithCounts, "Area updated successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -332,14 +387,16 @@ const deleteArea = async (req, res, next) => {
 
     // Check for dependent records
     const blocking = [];
-    if (area._count.subAreas > 0) blocking.push(`${area._count.subAreas} sub-area(s)`);
-    if (area._count.employees > 0) blocking.push(`${area._count.employees} employee(s)`);
+    if (area._count.subAreas > 0)
+      blocking.push(`${area._count.subAreas} sub-area(s)`);
+    if (area._count.employees > 0)
+      blocking.push(`${area._count.employees} employee(s)`);
     if (area._count.routes > 0) blocking.push(`${area._count.routes} route(s)`);
     if (area._count.rides > 0) blocking.push(`${area._count.rides} ride(s)`);
 
     if (blocking.length > 0) {
       const errorResponse = badRequestResponse(
-        `Cannot delete area: referenced by ${blocking.join(", ")}. Remove related records first.`
+        `Cannot delete area: referenced by ${blocking.join(", ")}. Remove related records first.`,
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -350,11 +407,11 @@ const deleteArea = async (req, res, next) => {
 
     const response = okResponse(
       { id: deletedArea.id, name: deletedArea.name },
-      "Area deleted successfully."
+      "Area deleted successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -399,11 +456,11 @@ const getAreaStats = async (req, res, next) => {
 
     const response = okResponse(
       stats,
-      "Area statistics retrieved successfully."
+      "Area statistics retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };

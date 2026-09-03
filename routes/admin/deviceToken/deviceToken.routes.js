@@ -2,10 +2,8 @@ const express = require("express");
 const router = express.Router();
 
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
-const {
-  registerDeviceToken,
-  unregisterDeviceToken,
-} = require("../../../controllers/admin/deviceToken/deviceToken.controller");
+const { registerDeviceToken, unregisterDeviceToken } = require("../../../controllers/admin/deviceToken/deviceToken.controller");
+
 
 router.post("/", verifyUserByToken, registerDeviceToken);
 router.delete("/", verifyUserByToken, unregisterDeviceToken);

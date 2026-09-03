@@ -3,7 +3,6 @@ const path = require("path");
 const http = require("http");
 const app = require("./app");
 const { logger } = require("./configs/logger");
-const { Server } = require("socket.io");
 
 const envFile =
   process.env.NODE_ENV == "development"
@@ -20,22 +19,6 @@ const port = process.env.PORT;
 
 const server = http.createServer(app);
 
-const io = new Server(server, {
-  cors: {
-    origin: ["https://tradematch-frontend.vercel.app", "http://localhost:3000", "http://localhost:3001"],
-    credentials: true,
-  },
-});
-
-app.set("io", io);
-
-io.on("connection", (socket) => {
-  logger.info(`Client connected: ${socket.id}`);
-
-  socket.on("disconnect", () => {
-    logger.info(`Client disconnected: ${socket.id}`);
-  });
-});
 
 server.listen(port, () => {
   logger.info(`listening on http://localhost:${port} 

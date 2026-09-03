@@ -512,8 +512,7 @@ const processBulkUploadJob = async (
         raw,
         driverEntries,
         driverNamedButUnmatched,
-        location: get("location"), // <-- ADD THIS
-        vehicleEntity: get("vehicleEntity"),
+        location: get("location"),
         assigned: false,
         assignedTrip: null,
         assignedRoute: null,
@@ -799,8 +798,17 @@ const processBulkUploadJob = async (
           allowCreate: true,
         },
         firstEmp.vendorName,
-        firstEmp.location, // <-- ADD THIS
-        firstEmp.vehicleEntity, // <-- ADD THIS
+        firstEmp.location,
+        firstEmp.vehicleEntity,
+        // Forward what the sheet actually gave us for this row so a newly
+        // created route isn't left with officeLocation/serviceType/timing
+        // all null. Falls back to the employee's own subArea if the sheet
+        // didn't have a subArea column.
+        firstEmp.employee.subAreaId,
+        firstEmp.serviceType,
+        firstEmp.pickupDate,
+        firstEmp.officeArrivalDate,
+        firstEmp.dropDate,
       );
 
       const trip = routeResult.trip;

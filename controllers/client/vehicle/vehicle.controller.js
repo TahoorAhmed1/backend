@@ -134,6 +134,8 @@ const getAllVehicles = async (req, res, next) => {
       search,
       sortBy = "createdAt",
       sortOrder = "desc",
+      // Add this parameter to filter unassigned vehicles
+      unassignedOnly = false,
     } = req.query;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -145,6 +147,11 @@ const getAllVehicles = async (req, res, next) => {
     if (status) where.status = status;
     if (vendorId) where.vendorId = vendorId;
     if (type) where.type = type;
+
+    // Filter unassigned vehicles (no driver assigned)
+    if (unassignedOnly === 'true') {
+      where.driverId = null;
+    }
 
     // Search functionality
     if (search) {

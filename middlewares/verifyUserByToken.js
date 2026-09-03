@@ -6,6 +6,7 @@ const {
 
 const verifyUserByToken = (req, res, next) => {
   const { authorization: token } = req.headers;
+  console.log('token', token)
   if (!token) {
     const response = badRequestResponse("Token not provided.");
     return res.status(response.status.code).json(response);
@@ -19,7 +20,7 @@ const verifyUserByToken = (req, res, next) => {
   }
 
   req.user = decodedData;
-
+console.log('first', decodedData)
   next();
 };
 

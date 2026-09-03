@@ -8,6 +8,10 @@ const { shiftTimesOverlap } = require("../../../utils/shiftTime");
 const {
   syncPendingRidesForWeekBestEffort,
 } = require("../../../lib/rideplaing");
+const {
+  notifyDriverById,
+  notifyAdmins,
+} = require("../../../services/notification.service");
 
 // ---------- helpers ----------
 
@@ -271,6 +275,27 @@ const createRoute = async (req, res, next) => {
       return { route, trip };
     });
 
+    // ---- Notify the assigned driver and admins/dispatchers ----
+    notifyDriverById(driverId, {
+      title: "New route assigned",
+      body: `You've been assigned to route "${result.route.routeName}"${shiftTiming ? ` (${shiftTiming} shift)` : ""}.`,
+      data: {
+        type: "ROUTE_DRIVER_ASSIGNED",
+        routeId: result.route.id,
+        tripId: result.trip.id,
+      },
+    }).catch((err) =>
+      console.error("[createRoute] Failed to notify driver:", err),
+    );
+
+    notifyAdmins({
+      title: "New route created",
+      body: `Route "${result.route.routeName}" was created and assigned to driver ${driver.name}.`,
+      data: { type: "ROUTE_CREATED", routeId: result.route.id },
+    }).catch((err) =>
+      console.error("[createRoute] Failed to notify admins:", err),
+    );
+
     const response = createSuccessResponse(
       {
         route: result.route,
@@ -349,6 +374,23 @@ const addTripToRoute = async (req, res, next) => {
     });
 
     await syncRouteFromTrips(routeId);
+
+    // ---- Notify the assigned driver and admins/dispatchers ----
+    notifyDriverById(driverId, {
+      title: "New trip assigned",
+      body: `You've been assigned to Trip ${tripNumber} on route "${route.routeName}"${effectiveShift ? ` (${effectiveShift} shift)` : ""}.`,
+      data: { type: "TRIP_DRIVER_ASSIGNED", tripId: trip.id, routeId },
+    }).catch((err) =>
+      console.error("[addTripToRoute] Failed to notify driver:", err),
+    );
+
+    notifyAdmins({
+      title: "New trip opened",
+      body: `Trip ${tripNumber} opened on route "${route.routeName}" with driver ${driver.name}.`,
+      data: { type: "TRIP_CREATED", tripId: trip.id, routeId },
+    }).catch((err) =>
+      console.error("[addTripToRoute] Failed to notify admins:", err),
+    );
 
     const response = createSuccessResponse(
       { trip, capacity: driver.vehicle.capacity },
@@ -439,6 +481,60 @@ const updateTripAssignment = async (req, res, next) => {
 
     await syncRouteFromTrips(trip.routeId);
 
+    // ---- Notify old/new driver and admins/dispatchers of the change ----
+    const driverChanged = trip.driverId !== nextDriverId;
+    if (driverChanged) {
+      const routeLabel =
+        trip.route?.routeName || trip.route?.routeCode || "a route";
+      const tripLabel = `Trip ${trip.tripNumber}`;
+
+      if (trip.driverId) {
+        notifyDriverById(trip.driverId, {
+          title: "Removed from trip",
+          body: `You've been unassigned from ${tripLabel} on ${routeLabel}.`,
+          data: {
+            type: "TRIP_DRIVER_REMOVED",
+            tripId: trip.id,
+            routeId: trip.routeId,
+          },
+        }).catch((err) =>
+          console.error(
+            "[updateTripAssignment] Failed to notify previous driver:",
+            err,
+          ),
+        );
+      }
+
+      if (nextDriverId) {
+        notifyDriverById(nextDriverId, {
+          title: "New trip assigned",
+          body: `You've been assigned to ${tripLabel} on ${routeLabel}${effectiveShift ? ` (${effectiveShift} shift)` : ""}.`,
+          data: {
+            type: "TRIP_DRIVER_ASSIGNED",
+            tripId: trip.id,
+            routeId: trip.routeId,
+          },
+        }).catch((err) =>
+          console.error(
+            "[updateTripAssignment] Failed to notify new driver:",
+            err,
+          ),
+        );
+      }
+
+      notifyAdmins({
+        title: "Trip driver changed",
+        body: `${tripLabel} on ${routeLabel}: driver changed from ${trip.driver?.name || "Unassigned"} to ${updatedTrip.driver?.name || "Unassigned"}.`,
+        data: {
+          type: "TRIP_DRIVER_CHANGED",
+          tripId: trip.id,
+          routeId: trip.routeId,
+        },
+      }).catch((err) =>
+        console.error("[updateTripAssignment] Failed to notify admins:", err),
+      );
+    }
+
     // Re-sync any already-generated PENDING rides so they pick up the new
     // driver/vehicle too — not just the weeklySchedule template rows above.
     // A trip can have active schedules across multiple weeks, so re-sync
@@ -471,122 +567,12 @@ const updateTripAssignment = async (req, res, next) => {
   }
 };
 
-// ---------- Employee assignment with capacity validation ----------
-
-const assignEmployeeToTrip = async (req, res, next) => {
-  try {
-    const tripId = req.params.tripId || req.body.tripId;
-    const { employeeId, weekStart, ...scheduleFields } = req.body;
-    if (!tripId || !employeeId || !weekStart) {
-      const response = badRequestResponse(
-        "tripId, employeeId, and weekStart are required.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    const trip = await loadTripFull(tripId);
-    if (!trip) {
-      const response = badRequestResponse("Trip not found.");
-      return res.status(response.status.code).json(response);
-    }
-    if (!trip.vehicle) {
-      const response = badRequestResponse(
-        "This trip has no vehicle assigned — cannot validate capacity.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    const weekStartDate = toDateOnly(weekStart);
-    const capacity = trip.vehicle.capacity;
-    const occupancy = await countTripOccupancy(tripId, weekStartDate, employeeId);
-    const remaining = capacity - occupancy;
-
-    if (remaining <= 0) {
-      const siblingTrips = await prisma.trip.findMany({
-        where: {
-          routeId: trip.routeId,
-          status: "ACTIVE",
-          id: { not: trip.id },
-        },
-        include: { vehicle: true },
-        orderBy: { tripNumber: "asc" },
-      });
-      const tripsWithRoom = [];
-      for (const sibling of siblingTrips) {
-        const siblingOccupancy = await countTripOccupancy(
-          sibling.id,
-          weekStartDate,
-          employeeId,
-        );
-        const siblingRemaining = (sibling.vehicle?.capacity || 0) - siblingOccupancy;
-        if (siblingRemaining > 0) {
-          tripsWithRoom.push({
-            tripId: sibling.id,
-            tripNumber: sibling.tripNumber,
-            remaining: siblingRemaining,
-          });
-        }
-      }
-
-      const response = badRequestResponse(
-        `Trip ${trip.tripNumber} on route "${trip.route.routeName}" is at capacity (${capacity}/${capacity}).`,
-      );
-      response.data = {
-        routeId: trip.routeId,
-        routeName: trip.route.routeName,
-        fullTripId: trip.id,
-        fullTripNumber: trip.tripNumber,
-        capacity,
-        tripsWithRoom,
-        overflowOptions: ["ADD_TRIP_TO_ROUTE", "CREATE_NEW_ROUTE"],
-      };
-      return res.status(response.status.code).json(response);
-    }
-
-    const existing = await prisma.weeklySchedule.findUnique({
-      where: { employeeId_weekStart: { employeeId, weekStart: weekStartDate } },
-    });
-
-    const data = {
-      ...scheduleFields,
-      weekStart: weekStartDate,
-      employeeId,
-      routeId: trip.routeId,
-      tripId: trip.id,
-      driverId: trip.driverId,
-      vehicleId: trip.vehicleId,
-      shiftTiming: scheduleFields.shiftTiming || effectiveTripShift(trip, trip.route),
-      status: scheduleFields.status || "ACTIVE",
-    };
-
-    let schedule;
-    if (existing) {
-      if (existing.isLocked) {
-        const response = badRequestResponse(
-          "This employee's schedule for this week is locked.",
-        );
-        return res.status(response.status.code).json(response);
-      }
-      schedule = await prisma.weeklySchedule.update({
-        where: { id: existing.id },
-        data,
-      });
-    } else {
-      schedule = await prisma.weeklySchedule.create({ data });
-    }
-
-    const response = createSuccessResponse(
-      { schedule, remainingSeats: remaining - 1, capacity },
-      "Employee assigned to trip.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    console.log('error', error);
-    next(error);
-  }
-};
-
 // ---------- Eligible employees for a trip's "Assign employee" picker ----------
+// NOTE: Manual employee-to-trip assignment (assignEmployeeToTrip) has moved to
+// weeklySchedule_controller.js, since it writes/updates a WeeklySchedule row
+// and must trigger syncPendingRidesForWeekBestEffort like every other
+// schedule mutation in that file. This picker endpoint stays here since it's
+// a read-only helper for the route/trip UI.
 // Two things narrow the list down from "every employee in the company":
 //   1. Relevance — only employees in the route's area, on the route/trip's
 //      shift. Someone from a different area/shift is never a real candidate
@@ -1288,7 +1274,6 @@ module.exports = {
   createRoute,
   addTripToRoute,
   updateTripAssignment,
-  assignEmployeeToTrip,
   getEligibleEmployeesForTrip,
   getAllRoutes,
   getRouteById,

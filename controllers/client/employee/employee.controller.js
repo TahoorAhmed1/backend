@@ -6,6 +6,7 @@ const {
   createSuccessResponse,
 } = require("../../../constants/responses");
 const { hashPassword } = require("../../../services/auth.service");
+const { info } = require("winston");
 
 const EMAIL_DOMAIN = "ibex.com";
 const DEFAULT_PASSWORD = "12345678";
@@ -476,8 +477,7 @@ const getEmployeeSchedule = async (req, res, next) => {
     const [schedules, total] = await Promise.all([
       prisma.weeklySchedule.findMany({
         where: { employeeId: id },
-        skip,
-        take: parseInt(limit),
+    
         include: {
           route: {
             select: { id: true, routeName: true, routeCode: true },
@@ -493,7 +493,6 @@ const getEmployeeSchedule = async (req, res, next) => {
       }),
       prisma.weeklySchedule.count({ where: { employeeId: id } }),
     ]);
-
     const response = okResponse(
       {
         employee,

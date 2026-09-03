@@ -3,6 +3,8 @@ const cors = require("cors");
 const compression = require("compression");
 const { reqLogger } = require("./configs/logger");
 const errorHandler = require("./middlewares/errorHandler.middleware");
+const verifyUserByToken = require("./middlewares/verifyUserByToken");
+const { pusher } = require("./configs/pusher");
 
 const app = express();
 
@@ -37,6 +39,18 @@ app.use(reqLogger);
 app.use("/api", require("./routes/auth"));
 app.use("/api/client", require("./routes/client"));
 app.use("/api/mobile", require("./routes/admin"));
+
+app.post("/pusher/auth", verifyUserByToken, (req, res) => {
+  const { socket_id, channel_name } = req.body;
+  const userId = req.user.userId;
+
+  if (channel_name !== `private-user-${userId}`) {
+    return res.status(403).send("Forbidden");
+  }
+
+  const authResponse = pusher.authorizeChannel(socket_id, channel_name);
+  return res.send(authResponse);
+});
 
 app.use(errorHandler);
 

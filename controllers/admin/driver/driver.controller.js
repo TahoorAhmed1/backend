@@ -2,7 +2,6 @@ const { prisma } = require("../../../lib/prisma");
 const QRCode = require("qrcode");
 const {
   createRecord,
-  getRecords,
   getRecordById,
   updateRecord,
 } = require("../../../utils/crudHelper");
@@ -10,43 +9,39 @@ const {
   badRequestResponse,
   okResponse,
 } = require("../../../constants/responses");
+const { notifyUser, notifyUsers, notifyRoles } = require("../../../services/notification.service");
 
-// ---------------------------------------------------------------------------
-// Helper: resolve the logged-in driver from the authenticated user.
-// Assumes an auth middleware has already run and attached `req.user`
-// (the User row) to the request — adjust this if your auth middleware
-// exposes the driver differently (e.g. req.user.driverId).
-// ---------------------------------------------------------------------------
+// Roles that should be told about complaints, license submissions,
+// account deactivations, etc. — anything without one obvious recipient.
+const STAFF_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
+
 const getDriverFromReq = async (req) => {
-  // req.user is the decoded JWT payload set by verifyUserByToken: { userId, role }
   const userId = req.user?.userId;
   if (!userId) return null;
-
   return prisma.driver.findUnique({ where: { userId } });
 };
 
-// UTC-safe day boundaries — Prisma/Postgres store DateTime in UTC, so
-// building these off the server's local time (Date#setHours) can shift
-// the window by hours and miss rows that are actually there.
 const startOfDay = (date = new Date()) => {
   const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+  return new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0),
+  );
 };
 
 const endOfDay = (date = new Date()) => {
   const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
+  return new Date(
+    Date.UTC(
+      d.getUTCFullYear(),
+      d.getUTCMonth(),
+      d.getUTCDate(),
+      23,
+      59,
+      59,
+      999,
+    ),
+  );
 };
-
-// Note: the Monday-of-week / weekday-key helpers that used to live here
-// were only needed for the WeeklySchedule fallback logic in getTodayRide
-// and startTodayRide. That logic now lives in services/ridePlanning.js,
-// which runs when dispatch assigns the schedule rather than when the
-// driver opens the app — see that file for the equivalent helpers.
-
-// ---------------------------------------------------------------------------
-// Profile
-// ---------------------------------------------------------------------------
 
 const getMyProfile = async (req, res, next) => {
   try {
@@ -91,14 +86,19 @@ const updateMyProfile = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Drivers can only self-edit their name/phone. Everything else
-    // (license, CNIC, vendor, shift, vehicle) is managed by dispatch.
     const { name, phone } = req.body;
 
     const response = await updateRecord(prisma.driver, driver.id, {
-      ...(name && { name }),
-      ...(phone && { phone }),
+      ...(name !== undefined && { name }),
+      ...(phone !== undefined && { phone }),
     });
+
+    notifyRoles(STAFF_ROLES, {
+      title: "Driver profile updated",
+      body: `${name ?? driver.name} updated their profile.`,
+      data: { driverId: driver.id, type: "DRIVER_PROFILE_UPDATED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -106,21 +106,6 @@ const updateMyProfile = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// QR code (attendance badge)
-// ---------------------------------------------------------------------------
-
-// GET /drivers/me/qr-code — regenerates the badge image on the fly from
-// User.qrCode (the stored token), rather than serving whatever PNG the
-// seed script wrote to disk at seed time. The token in the DB is the
-// source of truth; the image is just a rendering of it, so this stays
-// correct even if the server that seeded the data isn't the one serving
-// this request, or the seed-time files never made it to this machine.
-//
-// ?format=png (default) -> raw image, good for <img src="/drivers/me/qr-code">
-// ?format=base64         -> JSON { qrCode: "data:image/png;base64,..." },
-//                            good if the mobile app wants to cache it
-//                            itself or embed it inline in other JSON.
 const getMyQrCode = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -130,7 +115,9 @@ const getMyQrCode = async (req, res, next) => {
     }
 
     if (!driver.userId) {
-      const errorResponse = badRequestResponse("No login is linked to this driver yet.");
+      const errorResponse = badRequestResponse(
+        "No login is linked to this driver yet.",
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -140,7 +127,9 @@ const getMyQrCode = async (req, res, next) => {
     });
 
     if (!user?.qrCode) {
-      const errorResponse = badRequestResponse("No QR code has been generated for this driver yet.");
+      const errorResponse = badRequestResponse(
+        "No QR code has been generated for this driver yet.",
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -150,7 +139,10 @@ const getMyQrCode = async (req, res, next) => {
         margin: 2,
         errorCorrectionLevel: "M",
       });
-      const response = okResponse({ qrCode: dataUrl }, "QR code retrieved successfully.");
+      const response = okResponse(
+        { qrCode: dataUrl },
+        "QR code retrieved successfully.",
+      );
       return res.status(response.status.code).json(response);
     }
 
@@ -166,10 +158,6 @@ const getMyQrCode = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Rides
-// ---------------------------------------------------------------------------
-
 const getTodayRide = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -178,18 +166,6 @@ const getTodayRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // The Ride is now provisioned as PENDING the moment dispatch assigns
-    // the WeeklySchedule (see services/ridePlanning.js), so there is no
-    // more "fall back to WeeklySchedule" branch here — if nothing comes
-    // back, dispatch simply hasn't assigned this driver a route today.
-    //
-    // IMPORTANT: findFirst() used to live here, which silently discarded
-    // every ride but one whenever a driver had more than one route/trip
-    // assigned for today (a real case — e.g. a morning run and an evening
-    // run, or several distinct routes on the same day). Ride identity is
-    // per (driver, trip, day) in ridePlanning.js, not per (driver, day), so
-    // nothing elsewhere assumes a driver has at most one ride today.
-    // findMany() here so the app can show all of them.
     const rides = await prisma.ride.findMany({
       where: {
         driverId: driver.id,
@@ -197,7 +173,12 @@ const getTodayRide = async (req, res, next) => {
       },
       include: {
         route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
+          select: {
+            id: true,
+            routeName: true,
+            routeCode: true,
+            officeLocation: true,
+          },
         },
         vehicle: {
           select: { id: true, vehicleNumber: true, make: true, model: true },
@@ -207,12 +188,12 @@ const getTodayRide = async (req, res, next) => {
       orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
     });
 
-    // No rides is a normal, everyday state now (day off, or dispatch hasn't
-    // assigned a route yet) rather than an edge case — return an empty list
-    // as a successful response, not an error, so the app can render its
-    // empty state instead of an error banner.
     const response = okResponse(
-      rides.map((ride) => ({ ...ride, passengerCount: ride.passengers?.length, source: "RIDE" })),
+      rides.map((ride) => ({
+        ...ride,
+        passengerCount: ride.passengers?.length,
+        source: "RIDE",
+      })),
       rides.length
         ? "Today's rides retrieved successfully."
         : "No ride scheduled for today.",
@@ -231,23 +212,36 @@ const getMyRides = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { skip = 0, take = 10, status } = req.query;
+    const skip = parseInt(req.query.skip) || 0;
+    const take = parseInt(req.query.take) || 10;
+    const { status } = req.query;
 
     const options = {
       where: {
         driverId: driver.id,
         ...(status && { status }),
       },
-  
       include: {
         route: { select: { id: true, routeName: true } },
         vehicle: { select: { id: true, vehicleNumber: true } },
         passengers: { select: { id: true } },
+
+        _count: { select: { passengers: true } },
       },
       orderBy: { rideDate: "desc" },
+      skip,
+      take,
     };
 
-    const response = await getRecords(prisma.ride, options);
+    const [rides, total] = await Promise.all([
+      prisma.ride.findMany(options),
+      prisma.ride.count({ where: options.where }),
+    ]);
+
+    const response = okResponse(
+      { data: rides, total, skip, take },
+      "Rides retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -262,14 +256,18 @@ const RIDE_STATUS_TRANSITIONS = {
   CANCELLED: [],
 };
 
-// Ride statuses that count as "currently active" for a driver — i.e. the
-// driver is out on this ride and it isn't done yet.
 const ACTIVE_RIDE_STATUSES = ["STARTED", "ARRIVED"];
 
-// Shared by updateRideStatus and the start/complete/cancel convenience
-// endpoints below, so the transition rules only live in one place.
-const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData = {} }) => {
-  const ride = await prisma.ride.findUnique({ where: { id: rideId } });
+const applyRideStatusTransition = async ({
+  driver,
+  rideId,
+  nextStatus,
+  extraData = {},
+}) => {
+  const ride = await prisma.ride.findUnique({
+    where: { id: rideId },
+    include: { route: { select: { routeName: true } } },
+  });
   if (!ride || ride.driverId !== driver.id) {
     return { error: badRequestResponse("Ride not found.") };
   }
@@ -283,13 +281,6 @@ const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData
     };
   }
 
-  // A driver can have several rides queued up today (see getTodayRide), but
-  // can only ever be physically out on ONE of them at a time. Without this
-  // check a driver could hit "Start" on two PENDING rides back to back and
-  // the app would then have two STARTED rides with no way to tell which one
-  // a QR scan belongs to — that's the root cause of the "which ride is this
-  // attendance for" confusion. Block starting a new ride until the current
-  // one is finished (COMPLETED) or called off (CANCELLED).
   if (nextStatus === "STARTED") {
     const otherActiveRide = await prisma.ride.findFirst({
       where: {
@@ -308,11 +299,76 @@ const applyRideStatusTransition = async ({ driver, rideId, nextStatus, extraData
     }
   }
 
-  const response = await updateRecord(prisma.ride, rideId, {
-    status: nextStatus,
-    ...extraData,
+  const driverStatus =
+    nextStatus === "STARTED" || nextStatus === "ARRIVED"
+      ? "ON_RIDE"
+      : "AVAILABLE";
+
+  const [updatedRide, updatedDriver] = await prisma.$transaction([
+    prisma.ride.update({
+      where: { id: rideId },
+      data: {
+        status: nextStatus,
+        ...extraData,
+      },
+    }),
+    prisma.driver.update({
+      where: { id: driver.id },
+      data: { status: driverStatus },
+    }),
+  ]);
+
+  notifyPassengersOfRideStatus({ ride, nextStatus }).catch((err) =>
+    console.error("[driver_controller] notifyPassengersOfRideStatus failed:", err),
+  );
+
+  return {
+    response: okResponse(
+      { ...updatedRide, driverStatus: updatedDriver.status },
+      `Ride status updated to ${nextStatus}`,
+    ),
+  };
+};
+
+const RIDE_STATUS_NOTIFICATIONS = {
+  STARTED: {
+    title: "Ride started",
+    body: (routeName) => `Your driver is on the way for ${routeName}.`,
+  },
+  ARRIVED: {
+    title: "Driver has arrived",
+    body: (routeName) => `Your driver has arrived for ${routeName}.`,
+  },
+  COMPLETED: {
+    title: "Ride completed",
+    body: (routeName) => `Your ride on ${routeName} has been completed.`,
+  },
+  CANCELLED: {
+    title: "Ride cancelled",
+    body: (routeName) => `Your ride on ${routeName} has been cancelled.`,
+  },
+};
+
+// Fire-and-forget: notify every passenger on the ride in real-time (Pusher)
+// and via push (Expo) whenever the driver moves the ride to a new status.
+const notifyPassengersOfRideStatus = async ({ ride, nextStatus }) => {
+  const notification = RIDE_STATUS_NOTIFICATIONS[nextStatus];
+  if (!notification) return;
+
+  const passengers = await prisma.ridePassenger.findMany({
+    where: { rideId: ride.id },
+    select: { employee: { select: { userId: true } } },
   });
-  return { response };
+  const userIds = passengers.map((p) => p.employee?.userId).filter(Boolean);
+  if (userIds.length === 0) return;
+
+  const routeName = ride.route?.routeName ?? "your route";
+  await notifyUsers(userIds, {
+    title: notification.title,
+    body: notification.body(routeName),
+    data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
+    event: "ride-status-updated",
+  });
 };
 
 const updateRideStatus = async (req, res, next) => {
@@ -344,9 +400,6 @@ const updateRideStatus = async (req, res, next) => {
   }
 };
 
-// Convenience wrappers around updateRideStatus so the mobile app can call a
-// single-purpose endpoint (POST /rides/:id/start|complete|cancel) instead of
-// building the PATCH payload itself. Same transition rules apply.
 const startRide = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -368,14 +421,6 @@ const startRide = async (req, res, next) => {
   }
 };
 
-// POST /rides/today/start — convenience endpoint so the mobile app doesn't
-// need to know today's ride id up front. This NO LONGER creates a Ride:
-// the Ride is provisioned as PENDING by dispatch when the WeeklySchedule
-// is assigned (see services/ridePlanning.js). The driver's only action is
-// the normal PENDING -> STARTED transition on that existing row. If no
-// Ride exists yet, that means dispatch hasn't assigned this driver a
-// route today — the app should show that state rather than the driver
-// being able to conjure a ride into existence.
 const startTodayRide = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -391,9 +436,16 @@ const startTodayRide = async (req, res, next) => {
       },
       include: {
         route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
+          select: {
+            id: true,
+            routeName: true,
+            routeCode: true,
+            officeLocation: true,
+          },
         },
-        vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
+        vehicle: {
+          select: { id: true, vehicleNumber: true, make: true, model: true },
+        },
         passengers: { select: { id: true } },
       },
       orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
@@ -406,13 +458,6 @@ const startTodayRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // This endpoint only knows how to act on ONE ride, but a driver can
-    // have several today (see getTodayRide above — this used to be a
-    // findFirst() that quietly grabbed whichever row Postgres returned
-    // first, which meant "start today's ride" could start the WRONG ride
-    // for a driver with multiple routes). Rather than guess, require the
-    // caller to disambiguate via the normal per-ride /rides/:id/start
-    // endpoint whenever there's more than one candidate.
     if (todaysRides.length > 1) {
       const errorResponse = badRequestResponse(
         "You have multiple rides today — start the specific ride from your ride list instead.",
@@ -424,7 +469,11 @@ const startTodayRide = async (req, res, next) => {
 
     if (existingRide.status !== "PENDING") {
       const response = okResponse(
-        { ...existingRide, passengerCount: existingRide.passengers.length, source: "RIDE" },
+        {
+          ...existingRide,
+          passengerCount: existingRide.passengers.length,
+          source: "RIDE",
+        },
         existingRide.status === "STARTED"
           ? "Today's ride is already in progress."
           : "Today's ride is no longer pending.",
@@ -455,14 +504,6 @@ const completeRide = async (req, res, next) => {
 
     const rideId = req.params.id;
 
-    // Pull the ride's passenger list alongside whatever attendance rows
-    // already exist for it, so we can tell PENDING (no row yet) apart from
-    // a resolved outcome. This is a completeness check, not a timer — the
-    // "5 minute buffer" the driver gets before giving up on a no-show is a
-    // real-world habit, not something the backend clocks; once the driver
-    // marks the straggler ABSENT/NO_SHOW (via markAttendance or
-    // updateStopStatus) they show up here as resolved and stop blocking
-    // completion.
     const ride = await prisma.ride.findUnique({
       where: { id: rideId },
       include: {
@@ -477,7 +518,9 @@ const completeRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const resolvedEmployeeIds = new Set(ride.attendances.map((a) => a.employeeId));
+    const resolvedEmployeeIds = new Set(
+      ride.attendances.map((a) => a.employeeId),
+    );
     const pendingPassengers = ride.passengers.filter(
       (p) => !resolvedEmployeeIds.has(p.employee.id),
     );
@@ -513,7 +556,9 @@ const cancelRide = async (req, res, next) => {
 
     const { reason } = req.body;
     if (!reason || !String(reason).trim()) {
-      const errorResponse = badRequestResponse("A cancellation reason is required.");
+      const errorResponse = badRequestResponse(
+        "A cancellation reason is required.",
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -524,8 +569,6 @@ const cancelRide = async (req, res, next) => {
     });
     if (error) return res.status(error.status.code).json(error);
 
-    // Ride has no dedicated cancelReason column — log it so dispatch has a
-    // record of why, without requiring a schema change.
     await prisma.auditLog.create({
       data: {
         userId: req.user?.userId ?? null,
@@ -542,8 +585,6 @@ const cancelRide = async (req, res, next) => {
   }
 };
 
-// GET /rides/:id — full detail view for a single ride (used by ride detail
-// screens / deep links, as opposed to the "today" shortcut).
 const getRideDetails = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -558,7 +599,12 @@ const getRideDetails = async (req, res, next) => {
       where: { id },
       include: {
         route: {
-          select: { id: true, routeName: true, routeCode: true, officeLocation: true },
+          select: {
+            id: true,
+            routeName: true,
+            routeCode: true,
+            officeLocation: true,
+          },
         },
         vehicle: {
           select: { id: true, vehicleNumber: true, make: true, model: true },
@@ -583,8 +629,6 @@ const getRideDetails = async (req, res, next) => {
   }
 };
 
-// Stops = passengers already on this ride, plus a quick area breakdown so
-// the driver app can group "not yet picked up" passengers by area.
 const getRideStops = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -646,16 +690,7 @@ const getRideStops = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Attendance (QR scan)
-// ---------------------------------------------------------------------------
-
 const ATTENDANCE_STATUSES = ["PRESENT", "LATE", "ABSENT", "NO_SHOW"];
-
-// Pickup times are free-text ("6:00 PM", "8:00AM", etc. — see the same
-// tolerant parsing on the home.tsx shift-grouping logic). Grace period
-// before a scan counts as LATE instead of PRESENT when no explicit status
-// is given by the caller.
 const LATE_GRACE_MINUTES = 10;
 
 function parsePickupTimeToMinutes(raw) {
@@ -666,24 +701,22 @@ function parsePickupTimeToMinutes(raw) {
   let hour = parseInt(match[1], 10);
   const minute = match[2] ? parseInt(match[2], 10) : 0;
   const meridiem = match[3];
-  if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59) return null;
+  if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59)
+    return null;
   if (meridiem === "PM" && hour !== 12) hour += 12;
   if (meridiem === "AM" && hour === 12) hour = 0;
   return hour * 60 + minute;
 }
 
-// Same NOTE as employee_controller.js: compares against server local wall
-// clock since pickupTime strings are operational/local times, not UTC.
 function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
   const scheduledMinutes = parsePickupTimeToMinutes(pickupTime);
   if (scheduledMinutes === null) return "PRESENT";
   const scannedMinutes = scannedAt.getHours() * 60 + scannedAt.getMinutes();
-  return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES ? "LATE" : "PRESENT";
+  return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES
+    ? "LATE"
+    : "PRESENT";
 }
 
-// Shared by markAttendance (QR scan), updateStopStatus, and updateAttendance
-// — all three end up doing the same upsert against Attendance, just
-// resolving the target employee a different way.
 const upsertAttendanceForEmployee = async ({ ride, employeeId, status }) => {
   const passenger = await prisma.ridePassenger.findUnique({
     where: { rideId_employeeId: { rideId: ride.id, employeeId } },
@@ -704,10 +737,25 @@ const upsertAttendanceForEmployee = async ({ ride, employeeId, status }) => {
       status,
       arrivalTime: new Date(),
     },
-    include: { employee: { select: { id: true, name: true } } },
+    include: { employee: { select: { id: true, name: true, userId: true } } },
   });
 
   return { attendance };
+};
+
+// Fire-and-forget: let the employee know their attendance status changed,
+// in real-time (Pusher) and via push (Expo).
+const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
+  const employeeUserId = attendance?.employee?.userId;
+  if (!employeeUserId) return;
+
+  const status = attendance.status;
+  notifyUser(employeeUserId, {
+    title: ["ABSENT", "NO_SHOW"].includes(status) ? "Marked absent" : "Attendance marked",
+    body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
+    data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
+    event: "attendance-updated",
+  }).catch((err) => console.error("[driver_controller] notifyUser failed:", err));
 };
 
 const markAttendance = async (req, res, next) => {
@@ -732,13 +780,6 @@ const markAttendance = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // A QR scan only makes sense against the ride the driver is physically
-    // running right now. Requiring STARTED/ARRIVED (rather than accepting
-    // any of today's rides) is what makes "which ride is this attendance
-    // for" unambiguous end to end: since applyRideStatusTransition only
-    // ever lets ONE ride be STARTED/ARRIVED per driver at a time, this
-    // check guarantees there is exactly one valid target ride whenever a
-    // scan is allowed to succeed.
     if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
       const errorResponse = badRequestResponse(
         ride.status === "PENDING"
@@ -748,9 +789,6 @@ const markAttendance = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Only auto-compute PRESENT/LATE from the scan time when the caller
-    // didn't explicitly ask for something else — a driver correcting a
-    // no-show or absence still needs to be able to say so directly.
     const status = explicitStatus ?? computeArrivalStatus(ride.pickupTime);
 
     let resolvedEmployeeId = employeeId;
@@ -776,6 +814,8 @@ const markAttendance = async (req, res, next) => {
     });
     if (error) return res.status(error.status.code).json(error);
 
+    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
+
     const response = okResponse(attendance, "Attendance marked successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -783,13 +823,6 @@ const markAttendance = async (req, res, next) => {
   }
 };
 
-// GET /drivers/me/active-ride — returns the single ride (if any) this
-// driver currently has STARTED/ARRIVED, so the mobile app's "Scan QR" CTA
-// always knows exactly which ride to attach the scan to instead of asking
-// the driver to pick from a list or guessing. Returns { data: null } when
-// nothing is active (e.g. driver hasn't started a ride yet, or already
-// completed all of today's rides) rather than erroring, since "no active
-// ride" is a normal, expected state, not a failure.
 const getActiveRide = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -802,10 +835,21 @@ const getActiveRide = async (req, res, next) => {
       where: {
         driverId: driver.id,
         status: { in: ACTIVE_RIDE_STATUSES },
+        rideDate: { gte: startOfDay(), lte: endOfDay() },
       },
+      orderBy: { rideDate: "desc" },
       include: {
-        route: { select: { id: true, routeName: true, routeCode: true, officeLocation: true } },
-        vehicle: { select: { id: true, vehicleNumber: true, make: true, model: true } },
+        route: {
+          select: {
+            id: true,
+            routeName: true,
+            routeCode: true,
+            officeLocation: true,
+          },
+        },
+        vehicle: {
+          select: { id: true, vehicleNumber: true, make: true, model: true },
+        },
         passengers: { select: { id: true } },
       },
     });
@@ -814,7 +858,9 @@ const getActiveRide = async (req, res, next) => {
       activeRide
         ? { ...activeRide, passengerCount: activeRide.passengers.length }
         : null,
-      activeRide ? "Active ride retrieved successfully." : "No active ride right now.",
+      activeRide
+        ? "Active ride retrieved successfully."
+        : "No active ride right now.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -822,8 +868,6 @@ const getActiveRide = async (req, res, next) => {
   }
 };
 
-// PATCH /rides/:id/stops/:employeeId — mark a specific stop's outcome
-// (e.g. from the route-stops list) without going through a QR scan.
 const updateStopStatus = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -846,8 +890,6 @@ const updateStopStatus = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    // Same reasoning as markAttendance: a stop outcome only makes sense
-    // once the ride is actually underway.
     if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
       const errorResponse = badRequestResponse(
         ride.status === "PENDING"
@@ -864,15 +906,18 @@ const updateStopStatus = async (req, res, next) => {
     });
     if (error) return res.status(error.status.code).json(error);
 
-    const response = okResponse(attendance, "Stop status updated successfully.");
+    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
+
+    const response = okResponse(
+      attendance,
+      "Stop status updated successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
   }
 };
 
-// PATCH /rides/:id/attendance/:employeeId — direct correction of a single
-// passenger's attendance record (e.g. driver fixes a mis-scan).
 const updateAttendance = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -901,6 +946,8 @@ const updateAttendance = async (req, res, next) => {
       status,
     });
     if (error) return res.status(error.status.code).json(error);
+
+    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
 
     const response = okResponse(attendance, "Attendance updated successfully.");
     return res.status(response.status.code).json(response);
@@ -941,10 +988,6 @@ const getRideAttendance = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Complaints
-// ---------------------------------------------------------------------------
-
 const createComplaint = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -969,6 +1012,14 @@ const createComplaint = async (req, res, next) => {
       ...(vehicleId && { vehicleId }),
     });
 
+    const complaint = response?.data;
+    notifyRoles(STAFF_ROLES, {
+      title: "New complaint filed",
+      body: `${driver.name} filed a complaint: ${title.trim()}`,
+      data: { complaintId: complaint?.id, type: "COMPLAINT_CREATED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -983,18 +1034,29 @@ const getMyComplaints = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { skip = 0, take = 10, status } = req.query;
+    const skip = parseInt(req.query.skip) || 0;
+    const take = parseInt(req.query.take) || 10;
+    const { status } = req.query;
 
-    const options = {
-      where: {
-        driverId: driver.id,
-        ...(status && { status }),
-      },
-  
-      orderBy: { createdAt: "desc" },
+    const where = {
+      driverId: driver.id,
+      ...(status && { status }),
     };
 
-    const response = await getRecords(prisma.complaint, options);
+    const [complaints, total] = await Promise.all([
+      prisma.complaint.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take,
+      }),
+      prisma.complaint.count({ where }),
+    ]);
+
+    const response = okResponse(
+      { data: complaints, total, skip, take },
+      "Complaints retrieved successfully.",
+    );
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1024,9 +1086,6 @@ const getComplaintDetails = async (req, res, next) => {
   }
 };
 
-// Drivers can amend their own complaint's wording while it's still open,
-// or withdraw it (OPEN -> DISMISSED). Moving a complaint to IN_PROGRESS /
-// RESOLVED is a dispatch/admin decision and stays out of scope here.
 const updateComplaint = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -1058,10 +1117,22 @@ const updateComplaint = async (req, res, next) => {
     }
 
     const response = await updateRecord(prisma.complaint, req.params.id, {
-      ...(title && { title: title.trim() }),
-      ...(description !== undefined && { description: description?.trim() || null }),
+      ...(title !== undefined && { title: title.trim() }),
+      ...(description !== undefined && {
+        description: description?.trim() || null,
+      }),
       ...(status && { status }),
     });
+
+    if (status === "DISMISSED") {
+      notifyRoles(STAFF_ROLES, {
+        title: "Complaint withdrawn",
+        body: `${driver.name} withdrew their complaint: ${complaint.title}`,
+        data: { complaintId: complaint.id, type: "COMPLAINT_DISMISSED" },
+        event: "notification-created",
+      }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }
+
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
@@ -1092,16 +1163,19 @@ const deleteComplaint = async (req, res, next) => {
 
     await prisma.complaint.delete({ where: { id: req.params.id } });
 
+    notifyRoles(STAFF_ROLES, {
+      title: "Complaint deleted",
+      body: `${driver.name} deleted their complaint: ${complaint.title}`,
+      data: { complaintId: complaint.id, type: "COMPLAINT_DELETED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+
     const response = okResponse(null, "Complaint deleted successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
   }
 };
-
-// ---------------------------------------------------------------------------
-// Notifications
-// ---------------------------------------------------------------------------
 
 const getNotifications = async (req, res, next) => {
   try {
@@ -1111,20 +1185,24 @@ const getNotifications = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { limit = 10, skip = 0, status } = req.query;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = parseInt(req.query.skip) || 0;
+    const { status } = req.query;
+
+    const where = { userId, ...(status && { status }) };
 
     const [notifications, total] = await Promise.all([
       prisma.notification.findMany({
-        where: { userId, ...(status && { status }) },
-        take: parseInt(limit),
-        skip: parseInt(skip),
+        where,
         orderBy: { createdAt: "desc" },
+        skip,
+        take: limit,
       }),
-      prisma.notification.count({ where: { userId, ...(status && { status }) } }),
+      prisma.notification.count({ where }),
     ]);
 
     const response = okResponse(
-      { data:notifications, total, limit: parseInt(limit), skip: parseInt(skip) },
+      { data: notifications, total, limit, skip },
       "Notifications retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
@@ -1186,14 +1264,32 @@ const deleteNotification = async (req, res, next) => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Account
-// ---------------------------------------------------------------------------
+const markAllNotificationsAsRead = async (req, res, next) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      const errorResponse = badRequestResponse("User not authenticated.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
 
-// Soft delete only — Driver rows are referenced by ride/complaint history,
-// so a hard delete would either cascade-destroy that history or fail on the
-// FK. Marking the driver INACTIVE and deactivating the linked login
-// preserves records while blocking further use of the account.
+    const { count } = await prisma.notification.updateMany({
+      where: { 
+        userId, 
+        status: 'UNREAD' 
+      },
+      data: { status: 'READ' },
+    });
+
+    const response = okResponse(
+      { markedCount: count }, 
+      `${count} notification(s) marked as read.`
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log('error', error)
+    next(error);
+  }
+};
 const deleteAccount = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -1217,6 +1313,13 @@ const deleteAccount = async (req, res, next) => {
         : []),
     ]);
 
+    notifyRoles(STAFF_ROLES, {
+      title: "Driver account deactivated",
+      body: `${driver.name} deactivated their account.`,
+      data: { driverId: driver.id, type: "DRIVER_ACCOUNT_DEACTIVATED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+
     const response = okResponse(null, "Account deactivated successfully.");
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1224,10 +1327,6 @@ const deleteAccount = async (req, res, next) => {
   }
 };
 
-// There's no document/license-file table in the schema yet, so this
-// endpoint records the submission (and updates the license number if a new
-// one was provided) rather than storing an actual uploaded file. Wire this
-// up to real file storage once a Document model exists.
 const verifyLicense = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -1255,6 +1354,13 @@ const verifyLicense = async (req, res, next) => {
       },
     });
 
+    notifyRoles(STAFF_ROLES, {
+      title: "License verification submitted",
+      body: `${driver.name} submitted a license for verification.`,
+      data: { driverId: driver.id, type: "DRIVER_LICENSE_SUBMITTED" },
+      event: "notification-created",
+    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+
     const response = okResponse(
       { driverId: driver.id, status: "PENDING_REVIEW" },
       "License submitted for verification.",
@@ -1264,10 +1370,6 @@ const verifyLicense = async (req, res, next) => {
     next(error);
   }
 };
-
-// ---------------------------------------------------------------------------
-// Dashboard
-// ---------------------------------------------------------------------------
 
 const getDashboardSummary = async (req, res, next) => {
   try {
@@ -1313,9 +1415,6 @@ const getDashboardSummary = async (req, res, next) => {
   }
 };
 
-// GET /dashboard/stats — same idea as the summary above but over an
-// arbitrary date range (defaults to the last 30 days) and broken out by
-// every ride status so the app can chart trends rather than just "today".
 const getDriverStats = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -1326,8 +1425,23 @@ const getDriverStats = async (req, res, next) => {
 
     const { startDate, endDate } = req.query;
 
-    const rangeEnd = endDate ? endOfDay(new Date(endDate)) : endOfDay();
-    const rangeStart = startDate ? startOfDay(new Date(startDate)) : startOfDay(new Date(rangeEnd.getTime() - 30 * 24 * 60 * 60 * 1000));
+    let rangeEnd = endOfDay();
+    if (endDate) {
+      const parsedEnd = new Date(endDate);
+      if (!isNaN(parsedEnd.getTime())) {
+        rangeEnd = endOfDay(parsedEnd);
+      }
+    }
+
+    let rangeStart = startOfDay(
+      new Date(rangeEnd.getTime() - 30 * 24 * 60 * 60 * 1000),
+    );
+    if (startDate) {
+      const parsedStart = new Date(startDate);
+      if (!isNaN(parsedStart.getTime())) {
+        rangeStart = startOfDay(parsedStart);
+      }
+    }
 
     const rides = await prisma.ride.findMany({
       where: {
@@ -1394,4 +1508,5 @@ module.exports = {
   deleteNotification,
   getDashboardSummary,
   getDriverStats,
+  markAllNotificationsAsRead
 };

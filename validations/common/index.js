@@ -269,6 +269,7 @@ const driverCreateSchema = Joi.object({
     licenseNumber: Joi.string().optional().allow(null, ""),
     cnic: Joi.string().optional().allow(null, ""),
     vendorId: Joi.string().uuid().optional().allow(null, ""),
+    vehicleId: Joi.string().uuid().optional().allow(null, ""),
     shiftType: Joi.string()
       .optional()
       .default("TWELVE_HOUR")

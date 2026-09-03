@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
-const QR_DIR = path.join(__dirname, "..", "..", "qrcodes", "drivers");
+const QR_DIR = path.join(__dirname, "..", "..","..", "qrcodes", "drivers");
 const DRIVER_EMAIL_DOMAIN = "ibex.com";
 const DEFAULT_DRIVER_PASSWORD = "12345678";
 
@@ -25,6 +25,7 @@ const createDriver = async (req, res, next) => {
       licenseNumber,
       cnic,
       vendorId,
+      vehicleId,
       shiftType,
       shiftLabel,
       status,
@@ -70,6 +71,9 @@ const createDriver = async (req, res, next) => {
           licenseNumber,
           cnic,
           vendorId,
+          vehicle:{
+            connect: vehicleId ? { id: vehicleId } : undefined,
+          },
           shiftType: shiftType || "TWELVE_HOUR",
           shiftLabel,
           status: status || "AVAILABLE",
@@ -79,14 +83,14 @@ const createDriver = async (req, res, next) => {
 
       // Generate QR token
       const qrToken = crypto.randomBytes(32).toString("hex");
-      
+
       // Create user account with QR code
-      const email = cnic 
+      const email = cnic
         ? `${cnic.replace(/[^0-9]/g, "")}@${DRIVER_EMAIL_DOMAIN}`
         : `${newDriver.id}@${DRIVER_EMAIL_DOMAIN}`;
-      
+
       const hashedPassword = await hashPassword(DEFAULT_DRIVER_PASSWORD);
-      
+
       const user = await tx.user.create({
         data: {
           email,
@@ -119,12 +123,14 @@ const createDriver = async (req, res, next) => {
     // Generate QR code image after transaction succeeds
     let qrImagePath = null;
     let qrImageUrl = null;
-    
+
     try {
-      const safeName = driver.driver.name.replace(/\s+/g, "").replace(/[\\/:*?"<>|]/g, "");
+      const safeName = driver.driver.name
+        .replace(/\s+/g, "")
+        .replace(/[\\/:*?"<>|]/g, "");
       const qrFileName = `${safeName}-${driver.driver.id}.png`;
       qrImagePath = path.join(QR_DIR, qrFileName);
-      
+
       // Generate QR code with structured data
       const qrData = JSON.stringify({
         type: "DRIVER_AUTH",
@@ -133,13 +139,13 @@ const createDriver = async (req, res, next) => {
         driverId: driver.driver.id,
         version: 1,
       });
-      
+
       await QRCode.toFile(qrImagePath, qrData, {
         width: 400,
         margin: 2,
         errorCorrectionLevel: "H",
       });
-      
+
       qrImageUrl = `/qrcodes/drivers/${qrFileName}`;
     } catch (qrError) {
       console.error("QR code generation failed:", qrError);
@@ -159,7 +165,7 @@ const createDriver = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -174,25 +180,32 @@ const getAllDrivers = async (req, res, next) => {
       vendorId,
       sortBy = "createdAt",
       sortOrder = "desc",
+      // New parameters
+      unassignedOnly = false,
+      all = false, // For dropdown - return all matching drivers without pagination
     } = req.query;
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const take = parseInt(limit);
+    // For dropdown (all=true), use a smaller limit
+    const take = all ? Math.min(parseInt(limit) || 100, 100) : parseInt(limit);
+    const skip = all ? 0 : (parseInt(page) - 1) * take;
 
     const where = {};
 
-    // Filters
     if (status) where.status = status;
     if (vendorId) where.vendorId = vendorId;
 
-    // Search functionality
-    if (search) {
+    if (unassignedOnly === "true") {
+      where.vehicle = null;
+    }
+
+    if (search && String(search).trim().length >= 2) {
+      const searchTerm = String(search).trim();
       where.OR = [
-        { name: { contains: search, mode: "insensitive" } },
-        { phone: { contains: search, mode: "insensitive" } },
-        { cnic: { contains: search, mode: "insensitive" } },
-        { licenseNumber: { contains: search, mode: "insensitive" } },
-        { shiftLabel: { contains: search, mode: "insensitive" } },
+        { name: { contains: searchTerm, mode: "insensitive" } },
+        { phone: { contains: searchTerm, mode: "insensitive" } },
+        { cnic: { contains: searchTerm, mode: "insensitive" } },
+        { licenseNumber: { contains: searchTerm, mode: "insensitive" } },
+        { shiftLabel: { contains: searchTerm, mode: "insensitive" } },
       ];
     }
 
@@ -204,14 +217,14 @@ const getAllDrivers = async (req, res, next) => {
         include: {
           vendor: { select: { id: true, name: true } },
           vehicle: { select: { id: true, vehicleNumber: true, type: true } },
-          user: { 
-            select: { 
-              id: true, 
-              email: true, 
-              role: true, 
+          user: {
+            select: {
+              id: true,
+              email: true,
+              role: true,
               isActive: true,
               qrCode: true,
-            } 
+            },
           },
           _count: {
             select: {
@@ -233,9 +246,29 @@ const getAllDrivers = async (req, res, next) => {
       complaintCount: driver._count.complaints,
       scheduleCount: driver._count.weeklySchedules,
       hasQRCode: Boolean(driver.user?.qrCode),
+      assignedVehicle: driver.vehicle
+        ? {
+            id: driver.vehicle.id,
+            vehicleNumber: driver.vehicle.vehicleNumber,
+            type: driver.vehicle.type,
+          }
+        : null,
       _count: undefined,
     }));
 
+    // For dropdown (all=true), return simplified response
+    if (all) {
+      const response = okResponse(
+        {
+          drivers: driversWithCounts,
+          total,
+        },
+        "Drivers retrieved successfully.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    // Full response with pagination
     const response = okResponse(
       {
         drivers: driversWithCounts,
@@ -247,17 +280,22 @@ const getAllDrivers = async (req, res, next) => {
           hasNextPage: parseInt(page) < Math.ceil(total / take),
           hasPrevPage: parseInt(page) > 1,
         },
+        filters: {
+          search: search || null,
+          status: status || null,
+          vendorId: vendorId || null,
+          unassignedOnly: unassignedOnly === "true",
+        },
       },
       "Drivers retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
-
 const getDriverById = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -317,7 +355,7 @@ const getDriverById = async (req, res, next) => {
       complaintCount: driver._count.complaints,
       scheduleCount: driver._count.weeklySchedules,
       hasQRCode: Boolean(driver.user?.qrCode),
-      qrImageUrl: driver.user?.qrCode 
+      qrImageUrl: driver.user?.qrCode
         ? `/qrcodes/drivers/${driver.name.replace(/\s+/g, "")}-${driver.id}.png`
         : null,
       _count: undefined,
@@ -330,7 +368,7 @@ const getDriverById = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -364,7 +402,10 @@ const updateDriver = async (req, res, next) => {
     }
 
     // Check license number uniqueness
-    if (updateData.licenseNumber && updateData.licenseNumber !== driver.licenseNumber) {
+    if (
+      updateData.licenseNumber &&
+      updateData.licenseNumber !== driver.licenseNumber
+    ) {
       const existingLicense = await prisma.driver.findUnique({
         where: { licenseNumber: updateData.licenseNumber },
       });
@@ -385,7 +426,9 @@ const updateDriver = async (req, res, next) => {
         });
 
         if (vehicleId) {
-          const targetVehicle = await tx.vehicle.findUnique({ where: { id: vehicleId } });
+          const targetVehicle = await tx.vehicle.findUnique({
+            where: { id: vehicleId },
+          });
           if (!targetVehicle) {
             const err = new Error("Vehicle not found.");
             err.isBadRequest = true;
@@ -393,7 +436,9 @@ const updateDriver = async (req, res, next) => {
           }
 
           if (targetVehicle.driverId && targetVehicle.driverId !== id) {
-            const err = new Error("Vehicle is already assigned to another driver.");
+            const err = new Error(
+              "Vehicle is already assigned to another driver.",
+            );
             err.isBadRequest = true;
             throw err;
           }
@@ -418,19 +463,21 @@ const updateDriver = async (req, res, next) => {
       // Update user account
       if (driver.userId) {
         const userUpdateData = {};
-        
+
         if (updateData.name) userUpdateData.name = updateData.name;
-        
+
         // Reset password if requested
         if (resetPassword) {
-          userUpdateData.passwordHash = await hashPassword(DEFAULT_DRIVER_PASSWORD);
+          userUpdateData.passwordHash = await hashPassword(
+            DEFAULT_DRIVER_PASSWORD,
+          );
         }
-        
+
         // Regenerate QR code if requested
         if (regenerateQR) {
           userUpdateData.qrCode = crypto.randomBytes(32).toString("hex");
         }
-        
+
         if (Object.keys(userUpdateData).length > 0) {
           await tx.user.update({
             where: { id: driver.userId },
@@ -445,9 +492,11 @@ const updateDriver = async (req, res, next) => {
     // Regenerate QR image if requested
     if (regenerateQR && result.user?.qrCode) {
       try {
-        const safeName = result.name.replace(/\s+/g, "").replace(/[\\/:*?"<>|]/g, "");
+        const safeName = result.name
+          .replace(/\s+/g, "")
+          .replace(/[\\/:*?"<>|]/g, "");
         const qrPath = path.join(QR_DIR, `${safeName}-${result.id}.png`);
-        
+
         const qrData = JSON.stringify({
           type: "DRIVER_AUTH",
           token: result.user.qrCode,
@@ -455,7 +504,7 @@ const updateDriver = async (req, res, next) => {
           driverId: result.id,
           version: 1,
         });
-        
+
         await QRCode.toFile(qrPath, qrData, {
           width: 400,
           margin: 2,
@@ -473,7 +522,7 @@ const updateDriver = async (req, res, next) => {
       const errorResponse = badRequestResponse(error.message);
       return res.status(errorResponse.status.code).json(errorResponse);
     }
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -505,14 +554,18 @@ const deleteDriver = async (req, res, next) => {
 
     // Check for dependent records
     const blocking = [];
-    if (driver._count.rides > 0) blocking.push(`${driver._count.rides} ride(s)`);
-    if (driver._count.trips > 0) blocking.push(`${driver._count.trips} trip(s)`);
-    if (driver._count.complaints > 0) blocking.push(`${driver._count.complaints} complaint(s)`);
-    if (driver._count.weeklySchedules > 0) blocking.push(`${driver._count.weeklySchedules} schedule(s)`);
+    if (driver._count.rides > 0)
+      blocking.push(`${driver._count.rides} ride(s)`);
+    if (driver._count.trips > 0)
+      blocking.push(`${driver._count.trips} trip(s)`);
+    if (driver._count.complaints > 0)
+      blocking.push(`${driver._count.complaints} complaint(s)`);
+    if (driver._count.weeklySchedules > 0)
+      blocking.push(`${driver._count.weeklySchedules} schedule(s)`);
 
     if (blocking.length > 0) {
       const errorResponse = badRequestResponse(
-        `Cannot delete driver: referenced by ${blocking.join(", ")}. Remove related records first.`
+        `Cannot delete driver: referenced by ${blocking.join(", ")}. Remove related records first.`,
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -532,25 +585,27 @@ const deleteDriver = async (req, res, next) => {
         await tx.deviceToken.deleteMany({
           where: { userId: driver.userId },
         });
-        
+
         // Delete notifications
         await tx.notification.deleteMany({
           where: { userId: driver.userId },
         });
-        
+
         // Delete user
         await tx.user.delete({ where: { id: driver.userId } });
       }
 
       // Delete driver
       await tx.driver.delete({ where: { id } });
-      
+
       return driver;
     });
 
     // Delete QR code image file if exists
     try {
-      const safeName = result.name.replace(/\s+/g, "").replace(/[\\/:*?"<>|]/g, "");
+      const safeName = result.name
+        .replace(/\s+/g, "")
+        .replace(/[\\/:*?"<>|]/g, "");
       const qrPath = path.join(QR_DIR, `${safeName}-${result.id}.png`);
       if (fs.existsSync(qrPath)) {
         fs.unlinkSync(qrPath);
@@ -561,11 +616,11 @@ const deleteDriver = async (req, res, next) => {
 
     const response = okResponse(
       { id: result.id, name: result.name },
-      "Driver and associated user deleted successfully."
+      "Driver and associated user deleted successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -573,20 +628,14 @@ const deleteDriver = async (req, res, next) => {
 const getDriverRides = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const {
-      page = 1,
-      limit = 10,
-      status,
-      fromDate,
-      toDate,
-    } = req.query;
+    const { page = 1, limit = 10, status, fromDate, toDate } = req.query;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const take = parseInt(limit);
 
     const where = { driverId: id };
     if (status) where.status = status;
-    
+
     if (fromDate || toDate) {
       where.rideDate = {};
       if (fromDate) where.rideDate.gte = new Date(fromDate);
@@ -634,7 +683,7 @@ const getDriverRides = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -683,7 +732,7 @@ const getDriverComplaints = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };
@@ -722,7 +771,7 @@ const updateDriverStatus = async (req, res, next) => {
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error);
+    console.log("error", error);
     next(error);
   }
 };

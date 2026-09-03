@@ -27,6 +27,5 @@ router.use("/complaints", require("./complaint/complaint.routes"));
 
 router.use("/schedules", require("./schedule/weeklySchedule.routes"));
 router.use("/dashboard", require("./dashboard/dashboard.routes"));
-router.use("/device-tokens", require("./deviceToken/deviceToken.routes"));
 
 module.exports = router;
