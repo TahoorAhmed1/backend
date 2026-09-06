@@ -23,14 +23,9 @@ const ADMIN_NOTIFY_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
  * Pusher/Expo failures do not prevent the DB notification
  * from being created or returned.
  */
-const notifyUser = async (
+const sendNotificationToUser = async (
   userId,
-  {
-    title,
-    body,
-    data = {},
-    event = "notification-created",
-  }
+  { title, body, data = {}, event = "notification-created" },
 ) => {
   if (!userId) {
     return null;
@@ -105,12 +100,53 @@ const notifyUser = async (
   return notification;
 };
 
+const getStaffUserIds = async (excludedIds = []) => {
+  const users = await prisma.user.findMany({
+    where: {
+      role: { in: ADMIN_NOTIFY_ROLES },
+      isActive: true,
+      ...(excludedIds.length > 0 && { id: { notIn: excludedIds } }),
+    },
+    select: { id: true },
+  });
+
+  return users.map(({ id }) => id);
+};
+
+/**
+ * Send an event to its normal recipient and copy it to the staff audience.
+ * The internal flag prevents notifyRoles from broadcasting the same event
+ * back through this helper a second time.
+ */
+const notifyUser = async (
+  userId,
+  payload,
+  { notifyAdmins = true } = {},
+) => {
+  const notification = await sendNotificationToUser(userId, payload);
+
+  if (!notifyAdmins) {
+    return notification;
+  }
+
+  const staffUserIds = await getStaffUserIds([userId]);
+
+  await Promise.all(
+    staffUserIds.map((staffUserId) =>
+      sendNotificationToUser(staffUserId, payload),
+    ),
+  );
+
+  return notification;
+};
+
 /**
  * Notify multiple users.
  */
 const notifyUsers = async (
   userIds = [],
-  payload
+  payload,
+  { notifyAdmins = true } = {},
 ) => {
   const uniqueIds = [
     ...new Set(userIds.filter(Boolean)),
@@ -124,11 +160,24 @@ const notifyUsers = async (
     `[notificationService] Sending notification to ${uniqueIds.length} user(s)`
   );
 
-  return Promise.all(
+  const notifications = await Promise.all(
     uniqueIds.map((id) =>
-      notifyUser(id, payload)
+      notifyUser(id, payload, { notifyAdmins: false })
     )
   );
+
+  if (!notifyAdmins) {
+    return notifications;
+  }
+
+  const staffUserIds = await getStaffUserIds(uniqueIds);
+  const staffNotifications = await Promise.all(
+    staffUserIds.map((staffUserId) =>
+      sendNotificationToUser(staffUserId, payload),
+    ),
+  );
+
+  return [...notifications, ...staffNotifications];
 };
 
 /**
@@ -160,7 +209,7 @@ const notifyRoles = async (roles = [], payload) => {
     )}) resolved to ${userIds.length} user(s)`
   );
 
-  return notifyUsers(userIds, payload);
+  return notifyUsers(userIds, payload, { notifyAdmins: false });
 };
 
 /**

@@ -20,7 +20,6 @@ const verifyUserByToken = (req, res, next) => {
   }
 
   req.user = decodedData;
-console.log('first', decodedData)
   next();
 };
 

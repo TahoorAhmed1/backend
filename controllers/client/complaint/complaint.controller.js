@@ -1,11 +1,5 @@
 const { prisma } = require("../../../lib/prisma");
-const {
-  createRecord,
-  getRecords,
-  getRecordById,
-  updateRecord,
-  deleteRecord,
-} = require("../../../utils/crudHelper");
+
 const { 
   badRequestResponse, 
   okResponse, 
@@ -188,6 +182,7 @@ const getAllComplaints = async (req, res, next) => {
       prisma.complaint.count({ where }),
     ]);
 
+    console.log('JSON', JSON.stringify(complaints));
     const response = okResponse(
       {
         complaints,
