@@ -5,57 +5,26 @@ const { prisma } = require("../lib/prisma");
 const { DAY_KEYS, computePickupTime, parseSheetTimeToDate } = require("../utils/dateTimeHelpers");
 const { HEADER_ALIASES, parseOffDays, deriveServiceType, normalizeEntity, normalizeAreaName, parseDriverEntries } = require("../utils/xlsxParsing");
 const { findOrCreateNormalizedArea } = require("./areaLookup.service");
-const { findDriver, findEmployee } = require("./driverVehicleMatch.service");
+const { findDriver, findEmployee, findVendor } = require("./driverVehicleMatch.service");
 const { resolveConflictFreeAssignment, findOrCreateVehicleForDriver } = require("./autoAssignment.service");
 const { findOrCreateRouteAndTrip } = require("./routeTrip.service");
 const { normalizeShift } = require("../utils/shiftTime");
 
-const bulkUploadJobs = new Map();
-const BULK_UPLOAD_JOB_TTL_MS = 30 * 60 * 1000;
-
-const MIN_BATCH_SIZE = 10;
-const MAX_BATCH_SIZE = 1000;
-const DEFAULT_BATCH_SIZE = 100;
-
-const createBulkUploadJob = (totalRows, batchSize, weekStartDate) => {
-  const cutoff = Date.now() - BULK_UPLOAD_JOB_TTL_MS;
-  for (const [id, job] of bulkUploadJobs) {
-    if (job.status !== "processing" && job.startedAt < cutoff) {
-      bulkUploadJobs.delete(id);
-    }
+// Job creation/status is now handled by bulkUpload.producer.js, which writes
+// to the BulkUploadJob table instead of this in-memory Map. That table
+// survives process restarts and is visible across every instance, which
+// fixes the two most likely causes of jobs silently disappearing on AWS.
+//
+// This function just persists progress as the job runs, so a status-polling
+// endpoint reading BulkUploadJob sees live numbers instead of only a final
+// result at the very end.
+const updateJobProgress = async (jobId, patch) => {
+  try {
+    await prisma.bulkUploadJob.update({ where: { id: jobId }, data: patch });
+  } catch (error) {
+    // Don't let a progress-write hiccup abort the actual upload job.
+    console.error(`[weeklySchedule][job ${jobId}] progress update failed:`, error.message);
   }
-
-  const weekKey = weekStartDate.toISOString();
-  const conflicting = Array.from(bulkUploadJobs.values()).find(
-    (job) => job.status === "processing" && job.weekKey === weekKey,
-  );
-  if (conflicting) {
-    return { conflict: true, existingJobId: conflicting.jobId };
-  }
-
-  const jobId = `bulkupload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  bulkUploadJobs.set(jobId, {
-    jobId,
-    weekKey,
-    status: "processing",
-    totalRows,
-    processedRows: 0,
-    batchSize,
-    totalBatches: totalRows ? Math.ceil(totalRows / batchSize) : 0,
-    batchesCompleted: 0,
-    startedAt: Date.now(),
-    partialResult: null,
-    result: null,
-    error: null,
-  });
-  return { conflict: false, jobId };
-};
-
-
-const updateBulkUploadJob = (jobId, patch) => {
-  const job = bulkUploadJobs.get(jobId);
-  if (!job) return;
-  Object.assign(job, patch);
 };
 
 
@@ -89,6 +58,8 @@ const processBulkUploadJob = async (
 
   const pendingWrites = [];
   const employeeWriteLocks = new Map();
+  let processedRowCount = 0;
+  let batchesCompletedCount = 0;
 
   const skipRow = async (sheetName, rowNum, employeeCode, reason, rawData) => {
     console.error(
@@ -143,6 +114,12 @@ const processBulkUploadJob = async (
   const flushPendingWrites = async () => {
     if (!pendingWrites.length) return;
     const batch = pendingWrites.splice(0, pendingWrites.length);
+    processedRowCount += batch.length;
+    // Fire-and-forget: don't block row processing on a progress write.
+    updateJobProgress(jobId, {
+      processedRows: processedRowCount,
+      batchesCompleted: batchesCompletedCount += 1,
+    });
     try {
       const saved = await prisma.$transaction(
         batch.map((item) =>
@@ -307,7 +284,7 @@ const processBulkUploadJob = async (
       const raw = dataRows[i];
       const code =
         empCodeCol !== undefined ? String(raw[empCodeCol] ?? "").trim() : "";
-      if (code && /^\d+$/.test(code)) {
+      if (code) {
         allEmployeeCodes.add(code);
         allEmployeeData.push({
           sheetName,
@@ -319,6 +296,11 @@ const processBulkUploadJob = async (
       }
     }
   }
+
+  await updateJobProgress(jobId, {
+    totalRows: allEmployeeData.length,
+    totalBatches: batchSize ? Math.ceil(allEmployeeData.length / batchSize) : 0,
+  });
 
   console.log(
     `[weeklySchedule][job ${jobId}] Loading ${allEmployeeCodes.size} employees...`,
@@ -405,6 +387,7 @@ const processBulkUploadJob = async (
       const vehicleType = get("vehicleType");
       const shiftTiming = get("shiftTiming");
       const driverEntries = parseDriverEntries(get("drivers"));
+      const vendorRecord = vendorName ? await findVendor(vendorName, caches.vendor) : null;
 
       let driverId = null;
       let driverRecord = null;
@@ -490,6 +473,12 @@ const processBulkUploadJob = async (
       const vehicleEntity = normalizeEntity(get("vehicleEntity"));
       const campaign = get("campaign") || get("batch");
 
+      const resolvedVendorId =
+        driverRecord?.vendorId ||
+        driverRecord?.vendor?.id ||
+        vendorRecord?.id ||
+        null;
+
       const employeeData = {
         employee,
         employeeCode,
@@ -520,7 +509,7 @@ const processBulkUploadJob = async (
           weekStart: weekStartDate,
           employeeId: employee.id,
           driverId,
-          vendorId: null,
+          vendorId: resolvedVendorId,
           vehicleId,
           vehicleEntity: vehicleEntity || undefined,
           serviceType,
@@ -640,6 +629,14 @@ const processBulkUploadJob = async (
             },
           });
 
+          if (assignment.autoAssignedDriver) {
+            results.driversAutoAssigned = (results.driversAutoAssigned || 0) + 1;
+          }
+          if (assignment.autoAssignedVehicle) {
+            results.vehiclesAutoAssigned =
+              (results.vehiclesAutoAssigned || 0) + 1;
+          }
+
           emp.driverId = assignment.driverId;
           emp.vehicleId = assignment.vehicleId;
           emp.scheduleData.routeId = trip.routeId;
@@ -732,6 +729,14 @@ const processBulkUploadJob = async (
               skipAutoAssignDriver: emp.driverNamedButUnmatched,
             },
           });
+
+          if (assignment.autoAssignedDriver) {
+            results.driversAutoAssigned = (results.driversAutoAssigned || 0) + 1;
+          }
+          if (assignment.autoAssignedVehicle) {
+            results.vehiclesAutoAssigned =
+              (results.vehiclesAutoAssigned || 0) + 1;
+          }
 
           emp.driverId = assignment.driverId;
           emp.vehicleId = assignment.vehicleId;
@@ -885,6 +890,14 @@ const processBulkUploadJob = async (
           },
         });
 
+        if (assignment.autoAssignedDriver) {
+          results.driversAutoAssigned = (results.driversAutoAssigned || 0) + 1;
+        }
+        if (assignment.autoAssignedVehicle) {
+          results.vehiclesAutoAssigned =
+            (results.vehiclesAutoAssigned || 0) + 1;
+        }
+
         emp.driverId = assignment.driverId;
         emp.vehicleId = assignment.vehicleId;
         emp.scheduleData.routeId = trip.routeId;
@@ -962,12 +975,5 @@ const processBulkUploadJob = async (
 
 
 module.exports = {
-  bulkUploadJobs,
-  BULK_UPLOAD_JOB_TTL_MS,
-  MIN_BATCH_SIZE,
-  MAX_BATCH_SIZE,
-  DEFAULT_BATCH_SIZE,
-  createBulkUploadJob,
-  updateBulkUploadJob,
   processBulkUploadJob,
 };

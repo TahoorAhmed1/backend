@@ -47,15 +47,17 @@ const {
 const {
   optimizeWeekAssignments,
 } = require("../../../services/routeOptimization.service");
+const fs = require("fs/promises");
+const os = require("os");
+const path = require("path");
 const {
-  bulkUploadJobs,
-  createBulkUploadJob,
-  updateBulkUploadJob,
-  processBulkUploadJob,
+  enqueueBulkUpload,
+  enqueuePendingRideResync,
+  getBulkUploadJobStatus,
   MIN_BATCH_SIZE,
   MAX_BATCH_SIZE,
   DEFAULT_BATCH_SIZE,
-} = require("../../../services/bulkUpload.service");
+} = require("../../../services/bulkupload.producer");
 const {
   notifyEmployeeById,
   notifyDriverById,
@@ -339,15 +341,13 @@ const resyncPendingRides = async (req, res, next) => {
       const response = badRequestResponse("weekStart is required.");
       return res.status(response.status.code).json(response);
     }
-    const results = await syncPendingRidesForWeek(toDateOnly(weekStart));
-    const created = results.filter((r) => r.rideId && !r.skipped).length;
-    const cancelled = results.filter((r) => r.cancelled).length;
-    const skipped = results.filter((r) => r.skipped).length;
+    const weekStartDate = toDateOnly(weekStart);
+    const { jobId } = await enqueuePendingRideResync(weekStartDate);
     const response = okResponse(
-      { results, created, cancelled, skipped },
-      `Synced PENDING rides for the week: ${created} created/refreshed, ${cancelled} cancelled, ${skipped} skipped.`,
+      { jobId, weekStart: weekStartDate },
+      "PENDING ride resync has been queued.",
     );
-    return res.status(response.status.code).json(response);
+    return res.status(202).json(response);
   } catch (error) {
     next(error);
   }
@@ -3566,7 +3566,7 @@ const getDriverOptions = async (req, res, next) => {
 const getBulkUploadStatus = async (req, res, next) => {
   try {
     const { jobId } = req.params;
-    const job = bulkUploadJobs.get(jobId);
+    const job = await getBulkUploadJobStatus(jobId);
     if (!job) {
       const response = badRequestResponse("Unknown or expired upload job id.");
       return res.status(response.status.code).json(response);
@@ -3574,21 +3574,21 @@ const getBulkUploadStatus = async (req, res, next) => {
 
     const percent = job.totalRows
       ? Math.min(100, Math.round((job.processedRows / job.totalRows) * 100))
-      : job.status === "done"
+      : job.status === "completed"
         ? 100
         : 0;
 
     const response = okResponse(
       {
         jobId,
-        status: job.status,
+        status: job.status, // "processing" | "completed" | "failed"
         totalRows: job.totalRows,
         processedRows: job.processedRows,
         batchSize: job.batchSize,
         totalBatches: job.totalBatches,
         batchesCompleted: job.batchesCompleted,
         percent,
-        result: job.status === "done" ? job.result : job.partialResult,
+        result: job.status === "completed" ? job.result : null,
         error: job.status === "failed" ? job.error : null,
       },
       "Bulk upload job status.",
@@ -3751,8 +3751,24 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
       }).length;
     }
 
-    const jobResult = createBulkUploadJob(totalRows, batchSize, weekStartDate);
+    // req.file only has a buffer (memory storage) - persist it to disk so
+    // we can hand the queue job a small file path instead of the file
+    // itself. The worker reads it back and deletes it when done.
+    const tempFilePath = path.join(
+      os.tmpdir(),
+      `bulk-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xlsx`,
+    );
+    await fs.writeFile(tempFilePath, req.file.buffer);
+
+    let jobResult;
+    try {
+      jobResult = await enqueueBulkUpload(tempFilePath, weekStartDate, batchSize);
+    } catch (enqueueError) {
+      await fs.unlink(tempFilePath).catch(() => {});
+      throw enqueueError;
+    }
     if (jobResult.conflict) {
+      await fs.unlink(tempFilePath).catch(() => {});
       const response = {
         status: { code: 409, status: false },
         message: `A bulk upload for the week of ${weekStart} is already running.`,
@@ -3762,23 +3778,7 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
     }
     const jobId = jobResult.jobId;
 
-    console.log(
-      `[weeklySchedule][job ${jobId}] launching background processing...`,
-    );
-    processBulkUploadJob(jobId, workbook, weekStartDate, batchSize)
-      .then((results) => {
-        console.log(`[weeklySchedule][job ${jobId}] resolved OK.`);
-        updateBulkUploadJob(jobId, { status: "done", result: results });
-      })
-      .catch((error) => {
-        console.error(
-          `[weeklySchedule][job ${jobId}] FAILED (uncaught at top level): ${error.message}\n${error.stack}`,
-        );
-        updateBulkUploadJob(jobId, {
-          status: "failed",
-          error: error.message || "Bulk upload failed unexpectedly.",
-        });
-      });
+    console.log(`[weeklySchedule][job ${jobId}] queued for processing.`);
 
     const response = okResponse(
       {

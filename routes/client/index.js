@@ -25,6 +25,8 @@ router.use("/attendance", require("./attendance/attendance.routes"));
 
 router.use("/complaints", require("./complaint/complaint.routes"));
 
+router.use("/notifications", require("./notification/notification.routes"));
+
 router.use("/schedules", require("./schedule/weeklySchedule.routes"));
 router.use("/dashboard", require("./dashboard/dashboard.routes"));
 

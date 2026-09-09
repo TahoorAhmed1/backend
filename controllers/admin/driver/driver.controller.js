@@ -105,7 +105,9 @@ const updateMyProfile = async (req, res, next) => {
       body: `${name ?? driver.name} updated their profile.`,
       data: { driverId: driver.id, type: "DRIVER_PROFILE_UPDATED" },
       event: "notification-created",
-    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -194,6 +196,7 @@ const getTodayRide = async (req, res, next) => {
       },
       orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
     });
+    console.log('rides', rides)
 
     const response = okResponse(
       rides.map((ride) => ({
@@ -326,7 +329,10 @@ const applyRideStatusTransition = async ({
   ]);
 
   notifyPassengersOfRideStatus({ ride, nextStatus }).catch((err) =>
-    console.error("[driver_controller] notifyPassengersOfRideStatus failed:", err),
+    console.error(
+      "[driver_controller] notifyPassengersOfRideStatus failed:",
+      err,
+    ),
   );
 
   return {
@@ -420,10 +426,12 @@ const startRide = async (req, res, next) => {
       rideId: req.params.id,
       nextStatus: "STARTED",
     });
+    console.log('error', error)
     if (error) return res.status(error.status.code).json(error);
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log("error", error);
     next(error);
   }
 };
@@ -497,6 +505,7 @@ const startTodayRide = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log("error", error);
     next(error);
   }
 };
@@ -758,11 +767,15 @@ const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
 
   const status = attendance.status;
   notifyUser(employeeUserId, {
-    title: ["ABSENT", "NO_SHOW"].includes(status) ? "Marked absent" : "Attendance marked",
+    title: ["ABSENT", "NO_SHOW"].includes(status)
+      ? "Marked absent"
+      : "Attendance marked",
     body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
     data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
     event: "attendance-updated",
-  }).catch((err) => console.error("[driver_controller] notifyUser failed:", err));
+  }).catch((err) =>
+    console.error("[driver_controller] notifyUser failed:", err),
+  );
 };
 
 const markAttendance = async (req, res, next) => {
@@ -1025,7 +1038,9 @@ const createComplaint = async (req, res, next) => {
       body: `${driver.name} filed a complaint: ${title.trim()}`,
       data: { complaintId: complaint?.id, type: "COMPLAINT_CREATED" },
       event: "notification-created",
-    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1137,7 +1152,9 @@ const updateComplaint = async (req, res, next) => {
         body: `${driver.name} withdrew their complaint: ${complaint.title}`,
         data: { complaintId: complaint.id, type: "COMPLAINT_DISMISSED" },
         event: "notification-created",
-      }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+      }).catch((err) =>
+        console.error("[driver_controller] notifyRoles failed:", err),
+      );
     }
 
     return res.status(response.status.code).json(response);
@@ -1175,7 +1192,9 @@ const deleteComplaint = async (req, res, next) => {
       body: `${driver.name} deleted their complaint: ${complaint.title}`,
       data: { complaintId: complaint.id, type: "COMPLAINT_DELETED" },
       event: "notification-created",
-    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     const response = okResponse(null, "Complaint deleted successfully.");
     return res.status(response.status.code).json(response);
@@ -1281,21 +1300,21 @@ const markAllNotificationsAsRead = async (req, res, next) => {
     }
 
     const { count } = await prisma.notification.updateMany({
-      where: { 
-        userId, 
-        status: 'UNREAD' 
+      where: {
+        userId,
+        status: "UNREAD",
       },
-      data: { status: 'READ' },
+      data: { status: "READ" },
     });
 
     // ✅ NO Pusher events - just return success
     const response = okResponse(
-      { markedCount: count }, 
-      `${count} notification(s) marked as read.`
+      { markedCount: count },
+      `${count} notification(s) marked as read.`,
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error)
+    console.log("error", error);
     next(error);
   }
 };
@@ -1328,7 +1347,9 @@ const deleteAccount = async (req, res, next) => {
       body: `${driver.name} deactivated their account.`,
       data: { driverId: driver.id, type: "DRIVER_ACCOUNT_DEACTIVATED" },
       event: "notification-created",
-    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     const response = okResponse(null, "Account deactivated successfully.");
     return res.status(response.status.code).json(response);
@@ -1369,7 +1390,9 @@ const verifyLicense = async (req, res, next) => {
       body: `${driver.name} submitted a license for verification.`,
       data: { driverId: driver.id, type: "DRIVER_LICENSE_SUBMITTED" },
       event: "notification-created",
-    }).catch((err) => console.error("[driver_controller] notifyRoles failed:", err));
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     const response = okResponse(
       { driverId: driver.id, status: "PENDING_REVIEW" },
@@ -1518,5 +1541,5 @@ module.exports = {
   deleteNotification,
   getDashboardSummary,
   getDriverStats,
-  markAllNotificationsAsRead
+  markAllNotificationsAsRead,
 };

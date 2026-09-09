@@ -5,35 +5,33 @@ const { reqLogger } = require("./configs/logger");
 const errorHandler = require("./middlewares/errorHandler.middleware");
 const verifyUserByToken = require("./middlewares/verifyUserByToken");
 const { pusher } = require("./configs/pusher");
+const helmet = require("helmet");
+const zlib = require("zlib");
 
 const app = express();
 
-app.use(compression());
-
+app.use(helmet());
 app.use(
-  cors({
-    origin: "*",
-    credentials: true,
-  }),
+  compression({
+    threshold: 0,
+    level: zlib.constants.Z_BEST_SPEED,
+  })
 );
+app.use(cors({ origin: "*" }));
+app.set("json spaces", 0);
+app.set("etag", "strong");
+app.disable("x-powered-by");
 
-app.use(
-  express.json({
-    limit: "50mb",
-    extended: true,
-    parameterLimit: 5000,
-  }),
-);
 
-app.use(
-  express.urlencoded({
-    limit: "50mb",
-    extended: true,
-    parameterLimit: 5000,
-  }),
-);
 
-app.use(reqLogger);
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: false }));
+
+
+if (process.env.NODE_ENV !== "production") {
+  const reqLogger = require("./configs/requestLogger");
+  app.use(reqLogger);
+}
 
 app.use("/api", require("./routes/auth"));
 app.use("/api/client", require("./routes/client"));

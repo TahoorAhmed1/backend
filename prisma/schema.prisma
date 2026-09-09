@@ -559,6 +559,28 @@ model ScheduleException {
   @@index([weekStart])
 }
 
+model BulkUploadJob {
+  id               String    @id @default(cuid())
+  weekStart        DateTime
+  status           String    @default("processing") // processing | completed | failed
+  filePath         String
+  totalRows        Int       @default(0)
+  processedRows    Int       @default(0)
+  batchSize        Int       @default(100)
+  totalBatches     Int       @default(0)
+  batchesCompleted Int       @default(0)
+  result           Json?
+  error            String?
+  startedAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  
+  @@index([weekStart, status])
+}
+
+
 model Notification {
   id        String             @id @default(uuid())
   userId    String

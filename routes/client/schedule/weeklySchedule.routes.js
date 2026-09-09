@@ -46,6 +46,7 @@ router.post(
 router.post("/optimize", optimizeRouteAssignments);
 router.get("/schedule-table/grouped-by-area", getScheduleTableGroupedByArea);
 router.get("/weekly-schedule/bulk-upload-status/:jobId", getBulkUploadStatus);
+router.post("/resync-pending-rides", resyncPendingRides);
 router.post("/rides/create", resyncPendingRides);
 router.get("/driver-options", getDriverOptions);
 router.get("/:id", getWeeklyScheduleById);
