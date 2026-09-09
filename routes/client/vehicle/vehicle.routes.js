@@ -15,6 +15,10 @@ const {
   updateVehicleStatus,
   getVehicleComplaints,
 } = require("../../../controllers/client/vehicle/vehicle.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(vehicleCreateSchema), createVehicle);
 

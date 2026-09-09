@@ -69,6 +69,61 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
   return { conflict: false, jobId: job.id };
 };
 
+const enqueueUpdateSchedule = async (
+  filePath,
+  weekStartDate,
+  batchSize = DEFAULT_BATCH_SIZE,
+  employeeCodeFilter = [],
+) => {
+  const clampedBatchSize = Math.min(
+    MAX_BATCH_SIZE,
+    Math.max(MIN_BATCH_SIZE, batchSize || DEFAULT_BATCH_SIZE),
+  );
+
+  const conflicting = await prisma.bulkUploadJob.findFirst({
+    where: { weekStart: weekStartDate, status: "processing" },
+  });
+  if (conflicting) {
+    return { conflict: true, existingJobId: conflicting.id };
+  }
+
+  const job = await prisma.bulkUploadJob.create({
+    data: {
+      weekStart: weekStartDate,
+      filePath,
+      batchSize: clampedBatchSize,
+      status: "processing",
+    },
+  });
+
+  try {
+    await bulkUploadQueue.add(
+      "process",
+      {
+        jobId: job.id,
+        filePath,
+        weekStartDate: weekStartDate.toISOString(),
+        batchSize: clampedBatchSize,
+        action: "UPDATE_SCHEDULE",
+        employeeCodeFilter,
+      },
+      { jobId: job.id },
+    );
+  } catch (error) {
+    await prisma.bulkUploadJob.update({
+      where: { id: job.id },
+      data: {
+        status: "failed",
+        error: `Failed to enqueue: ${error.message}`,
+        completedAt: new Date(),
+      },
+    });
+    throw error;
+  }
+
+  return { conflict: false, jobId: job.id };
+};
+
 /**
  * For your status-polling endpoint (e.g. GET /bulk-upload/:jobId).
  */
@@ -93,6 +148,7 @@ module.exports = {
   MAX_BATCH_SIZE,
   DEFAULT_BATCH_SIZE,
   enqueueBulkUpload,
+  enqueueUpdateSchedule,
   enqueuePendingRideResync,
   getBulkUploadJobStatus,
 };

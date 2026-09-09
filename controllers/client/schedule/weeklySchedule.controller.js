@@ -23,12 +23,14 @@ const {
   toShiftTimeDate,
   toIsoOrNull,
   computePickupTime,
+  parseSheetTimeToDate,
   DAY_KEYS,
 } = require("../../../utils/dateTimeHelpers");
 const {
   normalizeEntity,
   normalizeVehicleType,
   HEADER_ALIASES,
+  scheduleDataChanged,
 } = require("../../../utils/xlsxParsing");
 const { tryAcquireWeekAreaLock } = require("../../../utils/locking");
 
@@ -52,12 +54,14 @@ const os = require("os");
 const path = require("path");
 const {
   enqueueBulkUpload,
+  enqueueUpdateSchedule,
   enqueuePendingRideResync,
   getBulkUploadJobStatus,
   MIN_BATCH_SIZE,
   MAX_BATCH_SIZE,
   DEFAULT_BATCH_SIZE,
 } = require("../../../services/bulkupload.producer");
+const { processBulkUploadJob } = require("../../../services/bulkUpload.service");
 const {
   notifyEmployeeById,
   notifyDriverById,
@@ -3693,6 +3697,83 @@ const validateBulkUploadFile = async (req, res, next) => {
   }
 };
 
+const updateSchedule = async (req, res, next) => {
+  try {
+    console.log("[updateSchedule] received updateSchedule request", {
+      hasFile: Boolean(req.file),
+      weekStart: req.body?.weekStart,
+      fileSize: req.file?.buffer?.length || 0,
+    });
+
+    if (!req.file) {
+      const response = badRequestResponse(
+        "No file uploaded. Attach an .xlsx file under the 'file' field.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const { weekStart } = req.body;
+    if (!weekStart) {
+      const response = badRequestResponse(
+        "weekStart (the Monday this schedule applies to) is required.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const weekStartDate = toDateOnly(weekStart);
+
+    const tempFilePath = path.join(
+      os.tmpdir(),
+      `update-schedule-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xlsx`,
+    );
+    await fs.writeFile(tempFilePath, req.file.buffer);
+
+    let jobResult;
+    try {
+      jobResult = await enqueueUpdateSchedule(
+        tempFilePath,
+        weekStartDate,
+        DEFAULT_BATCH_SIZE,
+      );
+    } catch (enqueueError) {
+      console.error("[updateSchedule] enqueue failed", {
+        error: enqueueError?.message,
+      });
+      await fs.unlink(tempFilePath).catch(() => {});
+      throw enqueueError;
+    }
+
+    if (jobResult.conflict) {
+      await fs.unlink(tempFilePath).catch(() => {});
+      const response = {
+        status: { code: 409, status: false },
+        message: `A schedule update for the week of ${weekStart} is already running.`,
+        data: { existingJobId: jobResult.existingJobId },
+      };
+      return res.status(response.status.code).json(response);
+    }
+
+    const response = okResponse(
+      {
+        action: "UPDATE_SCHEDULE",
+        weekStart: weekStartDate.toISOString().slice(0, 10),
+        matchedEmployees: 0,
+        changedEmployees: 0,
+        processedEmployees: 0,
+        jobId: jobResult.jobId,
+        status: "queued",
+        message: "Queued matched employee schedule comparison and update scan.",
+      },
+      "Matched employees are being checked in the background queue.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.error("[updateSchedule] Error:", error);
+    next(error);
+  }
+};
+
 const bulkUploadWeeklySchedule = async (req, res, next) => {
   try {
     if (!req.file) {
@@ -4172,6 +4253,7 @@ module.exports = {
   getScheduleStats,
   getScheduleTableStats,
   getScheduleTableGroupedByArea,
+  updateSchedule,
   bulkUploadWeeklySchedule,
   validateBulkUploadFile,
   getBulkUploadStatus,

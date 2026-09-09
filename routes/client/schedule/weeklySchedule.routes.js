@@ -14,6 +14,7 @@ const {
   getScheduleTableStats,
   getScheduleTableGroupedByArea,
   bulkUploadWeeklySchedule,
+  updateSchedule,
   reassignMismatchedShiftEmployees,
   optimizeRouteAssignments,
   getBulkUploadStatus,
@@ -63,11 +64,13 @@ router.delete("/:id/single", deleteSingleEmployeeSchedule);
 
 router.delete("/:id", deleteWeeklySchedule);
 router.post(
+
   "/weekly-schedule/validate-upload",
   upload.single("file"),
   validateBulkUploadFile,
 );
 
 router.post("/bulk-upload", upload.single("file"), bulkUploadWeeklySchedule);
+router.post("/update-schedule", upload.single("file"), updateSchedule);
 
 module.exports = router;

@@ -15,6 +15,10 @@ const {
   updateRideStatus,
   getRidePassengers,
 } = require("../../../controllers/client/ride/ride.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(rideCreateSchema), createRide);
 

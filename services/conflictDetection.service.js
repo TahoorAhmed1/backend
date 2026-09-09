@@ -3,6 +3,7 @@
 const { prisma } = require("../lib/prisma");
 const { parseShiftRange, shiftTimesOverlap } = require("../utils/shiftTime");
 const { filterRoster } = require("../utils/roster");
+const { hasMinimumRest } = require("../utils/driverHours");
 
 const findDriverConflict = async (
   driverId,

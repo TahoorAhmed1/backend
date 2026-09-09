@@ -14,6 +14,10 @@ const {
   deleteArea,
   getAreaStats,
 } = require("../../../controllers/client/area/area.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(areaCreateSchema), createArea);
 

@@ -13,6 +13,10 @@ const {
   updateBlock,
   deleteBlock,
 } = require("../../../controllers/client/block/block.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(blockCreateSchema), createBlock);
 router.get("/", getAllBlocks);

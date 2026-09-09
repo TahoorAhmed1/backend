@@ -15,6 +15,10 @@ const {
   deleteAttendance,
   getAttendanceSummary,
 } = require("../../../controllers/client/attendance/attendance.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(attendanceCreateSchema), createAttendance);
 

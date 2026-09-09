@@ -3,7 +3,7 @@
 const XLSX = require("xlsx");
 const { prisma } = require("../lib/prisma");
 const { DAY_KEYS, computePickupTime, parseSheetTimeToDate } = require("../utils/dateTimeHelpers");
-const { HEADER_ALIASES, parseOffDays, deriveServiceType, normalizeEntity, normalizeAreaName, parseDriverEntries } = require("../utils/xlsxParsing");
+const { HEADER_ALIASES, parseOffDays, deriveServiceType, normalizeEntity, normalizeAreaName, parseDriverEntries, scheduleDataChanged } = require("../utils/xlsxParsing");
 const { findOrCreateNormalizedArea } = require("./areaLookup.service");
 const { findDriver, findEmployee, findVendor } = require("./driverVehicleMatch.service");
 const { resolveConflictFreeAssignment, findOrCreateVehicleForDriver } = require("./autoAssignment.service");
@@ -27,12 +27,212 @@ const updateJobProgress = async (jobId, patch) => {
   }
 };
 
+const processUpdateScheduleJob = async (
+  jobId,
+  workbook,
+  weekStartDate,
+  batchSize = 100,
+) => {
+  console.log(
+    `[weeklySchedule][job ${jobId}] START updateSchedule compare weekStart=${weekStartDate} batchSize=${batchSize}`,
+  );
+
+  const sheetName = workbook.SheetNames[0] || "Sheet1";
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    raw: false,
+    defval: "",
+  });
+
+  const headerRowIndex = rows.findIndex((r) =>
+    r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
+  );
+
+  if (headerRowIndex === -1) {
+    console.log(`[weeklySchedule][job ${jobId}] updateSchedule skipped: no Employee ID header`);
+    return {
+      action: "UPDATE_SCHEDULE",
+      matchedEmployees: 0,
+      changedEmployees: 0,
+      processedEmployees: 0,
+      created: 0,
+      updated: 0,
+      routesCreated: 0,
+      tripsCreated: 0,
+      tripsReused: 0,
+      message: "No Employee ID header found in uploaded workbook.",
+    };
+  }
+
+  const colIndex = {};
+  rows[headerRowIndex].forEach((cell, i) => {
+    const key = HEADER_ALIASES[String(cell).trim().toLowerCase()];
+    if (key) colIndex[key] = i;
+  });
+
+  const employeeCodeCol = colIndex.employeeCode;
+  const changedEmployeeCodes = new Set();
+  const matchedEmployeeCodes = new Set();
+
+  for (let i = headerRowIndex + 1; i < rows.length; i++) {
+    const raw = rows[i];
+    const employeeCode =
+      employeeCodeCol !== undefined
+        ? String(raw[employeeCodeCol] ?? "").trim()
+        : "";
+
+    if (!employeeCode) continue;
+
+    console.log(`[weeklySchedule][job ${jobId}] updateSchedule scanning employeeCode`, {
+      employeeCode,
+      rowNumber: i + 2,
+    });
+
+    const employee = await prisma.employee.findUnique({
+      where: { employeeCode },
+      select: { id: true, employeeCode: true },
+    });
+
+    if (!employee) {
+      console.log(`[weeklySchedule][job ${jobId}] updateSchedule ignored unmatched employeeCode`, {
+        employeeCode,
+      });
+      continue;
+    }
+
+    matchedEmployeeCodes.add(employeeCode);
+
+    const existingSchedule = await prisma.weeklySchedule.findUnique({
+      where: {
+        employeeId_weekStart: {
+          employeeId: employee.id,
+          weekStart: weekStartDate,
+        },
+      },
+    });
+
+    if (!existingSchedule) {
+      console.log(`[weeklySchedule][job ${jobId}] updateSchedule no schedule; changed employee`, {
+        employeeCode,
+      });
+      changedEmployeeCodes.add(employeeCode);
+      continue;
+    }
+
+    const comparable = {
+      shiftTiming: existingSchedule.shiftTiming,
+      driverId: existingSchedule.driverId,
+      routeId: existingSchedule.routeId,
+      pickupTime: existingSchedule.pickupTime,
+      officeArrivalTime: existingSchedule.officeArrivalTime,
+      dropTime: existingSchedule.dropTime,
+      offDay: existingSchedule.offDay,
+      monday: existingSchedule.monday,
+      tuesday: existingSchedule.tuesday,
+      wednesday: existingSchedule.wednesday,
+      thursday: existingSchedule.thursday,
+      friday: existingSchedule.friday,
+      saturday: existingSchedule.saturday,
+      sunday: existingSchedule.sunday,
+    };
+
+    const sheetArrival = parseSheetTimeToDate(
+      String(raw[colIndex.officeArrivalTime] ?? "").trim(),
+    );
+    const sheetDrop = parseSheetTimeToDate(
+      String(raw[colIndex.dropTime] ?? "").trim(),
+    );
+
+    const incoming = {
+      shiftTiming: String(raw[colIndex.shiftTiming] ?? "").trim(),
+      driverId: String(raw[colIndex.drivers] ?? "").trim() || null,
+      routeId: String(raw[colIndex.route] ?? "").trim() || null,
+      pickupTime: sheetArrival ? computePickupTime(sheetArrival) : null,
+      officeArrivalTime: sheetArrival,
+      dropTime: sheetDrop,
+      offDay: String(raw[colIndex.offDay] ?? "").trim(),
+      monday: "BOTH",
+      tuesday: "BOTH",
+      wednesday: "BOTH",
+      thursday: "BOTH",
+      friday: "BOTH",
+      saturday: "OFF",
+      sunday: "OFF",
+    };
+
+    const hasChanged = scheduleDataChanged(comparable, incoming);
+    console.log(`[weeklySchedule][job ${jobId}] updateSchedule compare result`, {
+      employeeCode,
+      existingShift: comparable.shiftTiming,
+      incomingShift: incoming.shiftTiming,
+      hasChanged,
+    });
+
+    if (hasChanged) {
+      console.log(`[weeklySchedule][job ${jobId}] updateSchedule changed employee queued`, {
+        employeeCode,
+      });
+      changedEmployeeCodes.add(employeeCode);
+    } else {
+      console.log(`[weeklySchedule][job ${jobId}] updateSchedule no-change employee ignored`, {
+        employeeCode,
+      });
+    }
+  }
+
+  const changedCodes = Array.from(changedEmployeeCodes);
+  console.log(`[weeklySchedule][job ${jobId}] updateSchedule diff summary`, {
+    matchedEmployees: matchedEmployeeCodes.size,
+    changedEmployees: changedCodes.length,
+    changedCodes,
+  });
+
+  if (!changedCodes.length) {
+    return {
+      action: "UPDATE_SCHEDULE",
+      weekStart: weekStartDate.toISOString().slice(0, 10),
+      matchedEmployees: matchedEmployeeCodes.size,
+      changedEmployees: 0,
+      processedEmployees: 0,
+      created: 0,
+      updated: 0,
+      routesCreated: 0,
+      tripsCreated: 0,
+      tripsReused: 0,
+      message: "No matched employees had schedule changes in the uploaded sheet.",
+    };
+  }
+
+  console.log(`[weeklySchedule][job ${jobId}] updateSchedule reparsing changed subset`, {
+    changedEmployees: changedCodes.length,
+  });
+
+  const results = await processBulkUploadJob(
+    jobId,
+    workbook,
+    weekStartDate,
+    batchSize,
+    changedCodes,
+  );
+
+  return {
+    action: "UPDATE_SCHEDULE",
+    weekStart: weekStartDate.toISOString().slice(0, 10),
+    matchedEmployees: matchedEmployeeCodes.size,
+    changedEmployees: changedCodes.length,
+    processedEmployees: changedCodes.length,
+    ...results,
+    message: `Updated ${changedCodes.length} matched employee schedule(s) from the uploaded sheet.`,
+  };
+};
 
 const processBulkUploadJob = async (
   jobId,
   workbook,
   weekStartDate,
   batchSize = 100,
+  employeeCodeFilter = null,
 ) => {
   console.log(
     `[weeklySchedule][job ${jobId}] START weekStart=${weekStartDate} batchSize=${batchSize}`,
@@ -249,7 +449,7 @@ const processBulkUploadJob = async (
   console.log(`[weeklySchedule][job ${jobId}] Parsing sheets...`);
 
   const allEmployeeCodes = new Set();
-  const allEmployeeData = [];
+  let allEmployeeData = [];
 
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
@@ -295,6 +495,20 @@ const processBulkUploadJob = async (
         });
       }
     }
+  }
+
+  if (employeeCodeFilter && employeeCodeFilter.length) {
+    const beforeCount = allEmployeeData.length;
+    const codeSet = new Set(employeeCodeFilter);
+    console.log(
+      `[bulkUpload.service] employeeCodeFilter active: ${employeeCodeFilter.length} employee codes supplied; before=${beforeCount}`,
+    );
+    allEmployeeData = allEmployeeData.filter((row) => codeSet.has(row.employeeCode));
+    console.log(
+      `[bulkUpload.service] employeeCodeFilter applied: rowsAfter=${allEmployeeData.length} matchedCodes=${Array.from(codeSet)}`,
+    );
+    allEmployeeCodes.clear();
+    for (const row of allEmployeeData) allEmployeeCodes.add(row.employeeCode);
   }
 
   await updateJobProgress(jobId, {
@@ -976,4 +1190,5 @@ const processBulkUploadJob = async (
 
 module.exports = {
   processBulkUploadJob,
+  processUpdateScheduleJob,
 };

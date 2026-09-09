@@ -94,6 +94,40 @@ const normalizeMatch = (str) => {
     .replace(/\s+/g, " ");
 };
 
+const normalizeDateValue = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string') return value.trim();
+  return String(value);
+};
+
+const scheduleDataChanged = (existing = {}, incoming = {}) => {
+  const keyFields = [
+    'shiftTiming',
+    'driverId',
+    'routeId',
+    'pickupTime',
+    'officeArrivalTime',
+    'dropTime',
+    'offDay',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday',
+  ];
+
+  for (const key of keyFields) {
+    const a = normalizeDateValue(existing[key]);
+    const b = normalizeDateValue(incoming[key]);
+    if (a !== b) return true;
+  }
+
+  return false;
+};
+
 // ============================================================
 // VEHICLE TYPE NORMALIZATION
 // ============================================================
@@ -332,6 +366,7 @@ module.exports = {
   parseDriverEntries,
   parseDriverEntry,
   normalizeMatch,
+  scheduleDataChanged,
   VEHICLE_TYPES,
   VEHICLE_TYPE_ALIASES,
   normalizeVehicleType,

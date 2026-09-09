@@ -15,6 +15,10 @@ const {
   getDriverComplaints,
   updateDriverStatus,
 } = require("../../../controllers/client/driver/driver.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(driverCreateSchema), createDriver);
 

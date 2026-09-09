@@ -13,6 +13,10 @@ const {
   updateDepartment,
   deleteDepartment,
 } = require("../../../controllers/client/department/department.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(departmentCreateSchema), createDepartment);
 router.get("/", getAllDepartments);

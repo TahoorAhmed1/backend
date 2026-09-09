@@ -11,6 +11,7 @@ const {
   okResponse,
   createSuccessResponse,
 } = require("../../../constants/responses");
+const { buildRideSearchWhere } = require("../../../utils/rideSearch");
 
 // ============================================================
 // TIME FORMATTING HELPERS
@@ -193,14 +194,40 @@ const getAllRides = async (req, res, next) => {
       if (toDate) where.rideDate.lte = new Date(toDate);
     }
 
-    // Search functionality
-    if (search) {
-      where.OR = [
-        { route: { routeName: { contains: search, mode: "insensitive" } } },
-        { route: { routeCode: { contains: search, mode: "insensitive" } } },
-        { driver: { name: { contains: search, mode: "insensitive" } } },
-        { vehicle: { vehicleNumber: { contains: search, mode: "insensitive" } } },
-      ];
+    const searchTerm = typeof search === "string" ? search.trim() : "";
+    let routeIds = [];
+    let driverIds = [];
+    let vehicleIds = [];
+
+    if (searchTerm) {
+      const [routes, drivers, vehicles] = await Promise.all([
+        prisma.route.findMany({
+          where: {
+            OR: [
+              { routeName: { contains: searchTerm, mode: "insensitive" } },
+              { routeCode: { contains: searchTerm, mode: "insensitive" } },
+            ],
+          },
+          select: { id: true },
+        }),
+        prisma.driver.findMany({
+          where: { name: { contains: searchTerm, mode: "insensitive" } },
+          select: { id: true },
+        }),
+        prisma.vehicle.findMany({
+          where: { vehicleNumber: { contains: searchTerm, mode: "insensitive" } },
+          select: { id: true },
+        }),
+      ]);
+
+      routeIds = routes.map((r) => r.id);
+      driverIds = drivers.map((d) => d.id);
+      vehicleIds = vehicles.map((v) => v.id);
+
+      const searchWhere = buildRideSearchWhere(routeIds, driverIds, vehicleIds);
+      if (searchWhere.OR?.length) {
+        where.OR = searchWhere.OR;
+      }
     }
 
     const [rides, total] = await Promise.all([

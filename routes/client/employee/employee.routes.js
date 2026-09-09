@@ -16,6 +16,10 @@ const {
   getEmployeeAttendance,
   getEmployeeComplaints,
 } = require("../../../controllers/client/employee/employee.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(employeeCreateSchema), createEmployee);
 

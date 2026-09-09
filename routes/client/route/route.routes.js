@@ -1,5 +1,7 @@
 const express = require("express");
 const router = express.Router();
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
 
 const {
   createRoute,
@@ -16,6 +18,8 @@ const {
   getRouteWeeklyView,
   getEligibleEmployeesForTrip,
 } = require("../../../controllers/client/route/route.controller");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", createRoute);
 router.get("/", getAllRoutes);

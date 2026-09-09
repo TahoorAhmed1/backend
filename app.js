@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
-const { reqLogger } = require("./configs/logger");
 const errorHandler = require("./middlewares/errorHandler.middleware");
 const verifyUserByToken = require("./middlewares/verifyUserByToken");
 const { pusher } = require("./configs/pusher");
@@ -15,21 +14,18 @@ app.use(
   compression({
     threshold: 0,
     level: zlib.constants.Z_BEST_SPEED,
-  })
+  }),
 );
 app.use(cors({ origin: "*" }));
 app.set("json spaces", 0);
 app.set("etag", "strong");
 app.disable("x-powered-by");
 
-
-
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: false }));
 
-
 if (process.env.NODE_ENV !== "production") {
-  const reqLogger = require("./configs/requestLogger");
+  const { reqLogger } = require("./configs/logger");
   app.use(reqLogger);
 }
 
@@ -53,6 +49,8 @@ app.post("/pusher/auth", verifyUserByToken, (req, res) => {
     return res.status(500).send("Internal Server Error");
   }
 });
+
+
 
 app.use(errorHandler);
 

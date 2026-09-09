@@ -15,6 +15,10 @@ const {
   getComplaintsByCategory,
   getComplaintStats,
 } = require("../../../controllers/client/complaint/complaint.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(complaintCreateSchema), createComplaint);
 

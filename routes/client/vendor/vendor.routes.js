@@ -15,6 +15,10 @@ const {
   getVendorVehicles,
   getVendorDrivers,
 } = require("../../../controllers/client/vendor/vendor.controller");
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
 router.post("/", validateRequest(vendorCreateSchema), createVendor);
 

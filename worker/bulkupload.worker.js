@@ -8,7 +8,10 @@ const XLSX = require("xlsx");
 const { Worker } = require("bullmq");
 const { prisma } = require("../lib/prisma");
 const { connection, QUEUE_NAME } = require("../lib/queue");
-const { processBulkUploadJob } = require("../services/bulkUpload.service");
+const {
+  processBulkUploadJob,
+  processUpdateScheduleJob,
+} = require("../services/bulkUpload.service");
 const { syncPendingRidesForWeek } = require("../lib/rideplaing");
 
 const startBulkUploadWorker = () => {
@@ -23,19 +26,48 @@ const startBulkUploadWorker = () => {
         return;
       }
 
-      const { jobId, filePath, weekStartDate, batchSize } = job.data;
+      const { jobId, filePath, weekStartDate, batchSize, employeeCodeFilter, action } =
+        job.data;
 
-      console.log(`[bulkUpload.worker] picked up job ${jobId}`);
+      console.log(`[bulkUpload.worker] picked up job ${jobId}`, {
+        action: action || "BULK_UPLOAD",
+        filePath,
+        weekStartDate,
+        batchSize,
+        employeeCodeFilterCount: employeeCodeFilter?.length || 0,
+      });
 
       try {
         const workbook = XLSX.readFile(filePath);
 
-        const results = await processBulkUploadJob(
-          jobId,
-          workbook,
-          new Date(weekStartDate),
-          batchSize,
-        );
+        let results;
+        if (action === "UPDATE_SCHEDULE") {
+          console.log(`[bulkUpload.worker] dispatching UPDATE_SCHEDULE branch`, {
+            jobId,
+            filePath,
+            employeeCodeFilterCount: employeeCodeFilter?.length || 0,
+          });
+
+          results = await processUpdateScheduleJob(
+            jobId,
+            workbook,
+            new Date(weekStartDate),
+            batchSize,
+          );
+        } else {
+          console.log(`[bulkUpload.worker] dispatching BULK_UPLOAD branch`, {
+            jobId,
+            filePath,
+          });
+
+          results = await processBulkUploadJob(
+            jobId,
+            workbook,
+            new Date(weekStartDate),
+            batchSize,
+            employeeCodeFilter,
+          );
+        }
 
         await prisma.bulkUploadJob.update({
           where: { id: jobId },
@@ -48,7 +80,9 @@ const startBulkUploadWorker = () => {
 
         await fs.unlink(filePath).catch(() => {});
 
-        console.log(`[bulkUpload.worker] job ${jobId} completed`);
+        console.log(`[bulkUpload.worker] job ${jobId} completed`, {
+          action: action || "BULK_UPLOAD",
+        });
       } catch (error) {
         console.error(`[bulkUpload.worker] job ${jobId} failed:`, error);
 
@@ -61,8 +95,6 @@ const startBulkUploadWorker = () => {
           },
         });
 
-        // Re-throw so BullMQ records the failure and applies retry/backoff
-        // instead of silently swallowing it.
         throw error;
       }
     },
