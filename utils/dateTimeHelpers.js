@@ -29,6 +29,39 @@ const mondayOfCurrentWeek = () => {
   return new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
 };
 
+/**
+ * Normalize any input date to UTC midnight of the Saturday that begins
+ * the week containing that date.
+ *
+ * The UI enforces "Week must start on a Saturday", and every schedule
+ * write path calls toDateOnly() -> UTC midnight. This helper guarantees
+ * the reassign endpoint compares on exactly the same value, and it
+ * snaps to Saturday even if the caller sends Sun/Mon by accident.
+ *
+ * JS getUTCDay(): 0=Sun, 1=Mon, ..., 6=Sat
+ */
+function toSaturdayUtcMidnight(input) {
+  const d = new Date(input);
+  if (Number.isNaN(d.getTime())) {
+    throw new Error(`Invalid weekStart: ${input}`);
+  }
+
+  // 1) Flatten to UTC midnight of the calendar day as the client sees it.
+  //    Using UTC getters/setters keeps this deterministic regardless of
+  //    the server's TZ.
+  const utcMidnight = new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()),
+  );
+
+  // 2) Snap backwards to the most recent Saturday.
+  //    Sat=6 -> offset 0, Sun=0 -> offset 1, Mon=1 -> offset 2, ...
+  const day = utcMidnight.getUTCDay();
+  const offset = (day + 1) % 7; // Sat->0, Sun->1, Mon->2, ... Fri->6
+  utcMidnight.setUTCDate(utcMidnight.getUTCDate() - offset);
+
+  return utcMidnight;
+}
+
 const DAY_FIELD_KEYS = [
   "monday",
   "tuesday",
@@ -132,6 +165,37 @@ const computePickupTime = (officeArrivalDate) => {
   );
 };
 
+function normalizeTime(value) {
+  if (!value) return null;
+
+  // Date object → HH:mm
+  if (value instanceof Date) {
+    const hh = String(value.getUTCHours()).padStart(2, "0");
+    const mm = String(value.getUTCMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  }
+
+  // String "9:00 PM", "21:00", "9:00pm-6:00am" (shift style) etc.
+  if (typeof value === "string") {
+    // Range ho to sirf start lo
+    const first = value.split("-")[0].trim();
+    const m = first.match(/^(\d{1,2}):?(\d{2})?\s*(am|pm)?$/i);
+    if (!m) return first.toLowerCase();
+
+    let h = parseInt(m[1], 10);
+    const min = m[2] ? parseInt(m[2], 10) : 0;
+    const mer = (m[3] || "").toLowerCase();
+
+    if (mer === "pm" && h < 12) h += 12;
+    if (mer === "am" && h === 12) h = 0;
+
+    return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+  }
+
+  return null;
+}
+
+
 
 module.exports = {
   DAY_KEYS,
@@ -144,5 +208,7 @@ module.exports = {
   parseSheetTimeToDate,
   toShiftTimeDate,
   toIsoOrNull,
+  toSaturdayUtcMidnight,
   computePickupTime,
+  normalizeTime
 };

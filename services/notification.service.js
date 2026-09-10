@@ -32,21 +32,20 @@ const sendNotificationToUser = async (
   }
 
   let notification = null;
-  
+
   try {
-    notification =
-      await prisma.notification.create({
-        data: {
-          userId,
-          title,
-          body,
-          data,
-        },
-      });
+    notification = await prisma.notification.create({
+      data: {
+        userId,
+        title,
+        body,
+        data,
+      },
+    });
   } catch (err) {
     console.error(
       "[notificationService] Failed to persist notification:",
-      err
+      err,
     );
   }
 
@@ -55,35 +54,21 @@ const sendNotificationToUser = async (
     title,
     body,
     data,
-    createdAt:
-      notification?.createdAt ??
-      new Date(),
+    createdAt: notification?.createdAt ?? new Date(),
   };
 
-  const channel =
-    `private-user-${userId}`;
+  const channel = `private-user-${userId}`;
 
   try {
-    await pusher.trigger(
+    await pusher.trigger(channel, event, payload);
+
+    console.log("[Pusher] Notification triggered:", {
       channel,
       event,
-      payload
-    );
-
-    console.log(
-      "[Pusher] Notification triggered:",
-      {
-        channel,
-        event,
-        notificationId:
-          notification?.id,
-      }
-    );
+      notificationId: notification?.id,
+    });
   } catch (err) {
-    console.error(
-      "[notificationService] Pusher failed:",
-      err
-    );
+    console.error("[notificationService] Pusher failed:", err);
   }
 
   sendExpoPush(userId, {
@@ -91,10 +76,7 @@ const sendNotificationToUser = async (
     body,
     data,
   }).catch((err) => {
-    console.error(
-      "[notificationService] Expo push failed:",
-      err
-    );
+    console.error("[notificationService] Expo push failed:", err);
   });
 
   return notification;
@@ -148,22 +130,20 @@ const notifyUsers = async (
   payload,
   { notifyAdmins = true } = {},
 ) => {
-  const uniqueIds = [
-    ...new Set(userIds.filter(Boolean)),
-  ];
+  const uniqueIds = [...new Set(userIds.filter(Boolean))];
 
   if (uniqueIds.length === 0) {
     return [];
   }
 
   console.log(
-    `[notificationService] Sending notification to ${uniqueIds.length} user(s)`
+    `[notificationService] Sending notification to ${uniqueIds.length} user(s)`,
   );
 
   const notifications = await Promise.all(
     uniqueIds.map((id) =>
-      notifyUser(id, payload, { notifyAdmins: false })
-    )
+      notifyUser(id, payload, { notifyAdmins: false }),
+    ),
   );
 
   if (!notifyAdmins) {
@@ -205,8 +185,8 @@ const notifyRoles = async (roles = [], payload) => {
 
   console.log(
     `[notificationService] notifyRoles(${roles.join(
-      ","
-    )}) resolved to ${userIds.length} user(s)`
+      ",",
+    )}) resolved to ${userIds.length} user(s)`,
   );
 
   return notifyUsers(userIds, payload, { notifyAdmins: false });
@@ -215,33 +195,25 @@ const notifyRoles = async (roles = [], payload) => {
 /**
  * Send Expo push notification.
  */
-const sendExpoPush = async (
-  userId,
-  { title, body, data }
-) => {
+const sendExpoPush = async (userId, { title, body, data }) => {
   // ---------------------------------------------------------
   // Find active device tokens
   // ---------------------------------------------------------
-  const tokens =
-    await prisma.deviceToken.findMany({
-      where: {
-        userId,
-        isActive: true,
-      },
+  const tokens = await prisma.deviceToken.findMany({
+    where: {
+      userId,
+      isActive: true,
+    },
 
-      select: {
-        token: true,
-      },
-    });
+    select: {
+      token: true,
+    },
+  });
 
-  console.log(
-    `[Expo] user=${userId}, active tokens=${tokens.length}`
-  );
+  console.log(`[Expo] user=${userId}, active tokens=${tokens.length}`);
 
   if (tokens.length === 0) {
-    console.warn(
-      `[Expo] No active device tokens for user ${userId}`
-    );
+    console.warn(`[Expo] No active device tokens for user ${userId}`);
     return;
   }
 
@@ -253,9 +225,7 @@ const sendExpoPush = async (
       const valid = Expo.isExpoPushToken(token);
 
       if (!valid) {
-        console.warn(
-          `[Expo] Invalid Expo push token: ${token}`
-        );
+        console.warn(`[Expo] Invalid Expo push token: ${token}`);
       }
 
       return valid;
@@ -269,21 +239,18 @@ const sendExpoPush = async (
     }));
 
   if (messages.length === 0) {
-    console.warn(
-      `[Expo] No valid Expo push tokens for user ${userId}`
-    );
+    console.warn(`[Expo] No valid Expo push tokens for user ${userId}`);
     return;
   }
 
   console.log(
-    `[Expo] Sending ${messages.length} push notification(s) to user ${userId}`
+    `[Expo] Sending ${messages.length} push notification(s) to user ${userId}`,
   );
 
   // ---------------------------------------------------------
   // Chunk messages
   // ---------------------------------------------------------
-  const chunks =
-    expo.chunkPushNotifications(messages);
+  const chunks = expo.chunkPushNotifications(messages);
 
   const receiptIds = [];
   const staleTokens = [];
@@ -293,14 +260,11 @@ const sendExpoPush = async (
   // ---------------------------------------------------------
   for (const chunk of chunks) {
     try {
-      const tickets =
-        await expo.sendPushNotificationsAsync(
-          chunk
-        );
+      const tickets = await expo.sendPushNotificationsAsync(chunk);
 
       console.log(
         "[Expo] Push tickets:",
-        JSON.stringify(tickets, null, 2)
+        JSON.stringify(tickets, null, 2),
       );
 
       tickets.forEach((ticket, index) => {
@@ -313,22 +277,16 @@ const sendExpoPush = async (
         if (ticket.status === "error") {
           console.error(
             "[Expo] Push ticket error:",
-            JSON.stringify(ticket, null, 2)
+            JSON.stringify(ticket, null, 2),
           );
 
-          if (
-            ticket.details?.error ===
-            "DeviceNotRegistered"
-          ) {
+          if (ticket.details?.error === "DeviceNotRegistered") {
             staleTokens.push(chunk[index].to);
           }
         }
       });
     } catch (error) {
-      console.error(
-        "[Expo] Failed to send push chunk:",
-        error
-      );
+      console.error("[Expo] Failed to send push chunk:", error);
     }
   }
 
@@ -337,67 +295,54 @@ const sendExpoPush = async (
   // ---------------------------------------------------------
   if (receiptIds.length > 0) {
     console.log(
-      `[Expo] Waiting for ${receiptIds.length} receipt(s)...`
+      `[Expo] Waiting for ${receiptIds.length} receipt(s)...`,
     );
 
     // Give Expo a short amount of time to generate receipts.
-    await new Promise((resolve) =>
-      setTimeout(resolve, 1000)
-    );
+    await new Promise((resolve) => setTimeout(resolve, 1000));
 
     const receiptChunks =
-      expo.chunkPushNotificationReceiptIds(
-        receiptIds
-      );
+      expo.chunkPushNotificationReceiptIds(receiptIds);
 
     for (const receiptChunk of receiptChunks) {
       try {
         const receipts =
-          await expo.getPushNotificationReceiptsAsync(
-            receiptChunk
-          );
+          await expo.getPushNotificationReceiptsAsync(receiptChunk);
 
         console.log(
           "[Expo] Push receipts:",
-          JSON.stringify(receipts, null, 2)
+          JSON.stringify(receipts, null, 2),
         );
 
-        for (const [receiptId, receipt] of Object.entries(
-          receipts
-        )) {
+        for (const [receiptId, receipt] of Object.entries(receipts)) {
           if (receipt.status === "ok") {
             console.log(
-              `[Expo] Push delivered successfully. receipt=${receiptId}`
+              `[Expo] Push delivered successfully. receipt=${receiptId}`,
             );
             continue;
           }
 
           console.error(
             `[Expo] Push delivery failed. receipt=${receiptId}:`,
-            JSON.stringify(receipt, null, 2)
+            JSON.stringify(receipt, null, 2),
           );
 
-          if (
-            receipt.details?.error ===
-            "DeviceNotRegistered"
-          ) {
+          if (receipt.details?.error === "DeviceNotRegistered") {
             console.warn(
-              `[Expo] DeviceNotRegistered for receipt ${receiptId}`
+              `[Expo] DeviceNotRegistered for receipt ${receiptId}`,
             );
           }
         }
       } catch (error) {
         console.error(
           "[Expo] Failed to retrieve push receipts:",
-          error
+          error,
         );
       }
     }
   }
 
-  // ---------------------------------------------------------
-  // Deactivate stale tokens
-  // ---------------------------------------------------------
+
   if (staleTokens.length > 0) {
     await prisma.deviceToken.updateMany({
       where: {
@@ -412,26 +357,15 @@ const sendExpoPush = async (
     });
 
     console.log(
-      `[Expo] Deactivated ${staleTokens.length} stale device token(s)`
+      `[Expo] Deactivated ${staleTokens.length} stale device token(s)`,
     );
   }
 
-  console.log(
-    `[Expo] Push processing completed for user ${userId}`
-  );
+  console.log(`[Expo] Push processing completed for user ${userId}`);
 };
 
-/**
- * Notify a driver by their driverId (not their userId).
- *
- * ASSUMPTION: the Driver model has a `userId` field linking to the User
- * account the driver logs into the mobile app with. If your schema links
- * drivers to their user account differently (e.g. a separate profile
- * table, or the field is named something else), update the `select`
- * below to match — everything else (persistence, Pusher, Expo push)
- * still goes through notifyUser once the userId is resolved.
- */
-const notifyDriverById = async (driverId, payload) => {
+
+const notifyDriverById = async (driverId, payload, options = {}) => {
   if (!driverId) return null;
 
   const driver = await prisma.driver.findUnique({
@@ -441,19 +375,16 @@ const notifyDriverById = async (driverId, payload) => {
 
   if (!driver?.userId) {
     console.warn(
-      `[notificationService] Driver ${driverId} has no linked userId — skipping driver push.`
+      `[notificationService] Driver ${driverId} has no linked userId — skipping driver push.`,
     );
     return null;
   }
 
-  return notifyUser(driver.userId, payload);
+  return notifyUser(driver.userId, payload, options);
 };
 
-/**
- * Notify an employee by their employeeId (not their userId).
- * Same assumption as notifyDriverById above, but for the Employee model.
- */
-const notifyEmployeeById = async (employeeId, payload) => {
+
+const notifyEmployeeById = async (employeeId, payload, options = {}) => {
   if (!employeeId) return null;
 
   const employee = await prisma.employee.findUnique({
@@ -463,18 +394,15 @@ const notifyEmployeeById = async (employeeId, payload) => {
 
   if (!employee?.userId) {
     console.warn(
-      `[notificationService] Employee ${employeeId} has no linked userId — skipping employee push.`
+      `[notificationService] Employee ${employeeId} has no linked userId — skipping employee push.`,
     );
     return null;
   }
 
-  return notifyUser(employee.userId, payload);
+  return notifyUser(employee.userId, payload, options);
 };
 
-/**
- * Convenience wrapper: notify Admin/Manager/Dispatcher staff about a
- * driver/employee assignment change.
- */
+
 const notifyAdmins = (payload) => notifyRoles(ADMIN_NOTIFY_ROLES, payload);
 
 module.exports = {

@@ -2,11 +2,30 @@
 
 const XLSX = require("xlsx");
 const { prisma } = require("../lib/prisma");
-const { DAY_KEYS, computePickupTime, parseSheetTimeToDate } = require("../utils/dateTimeHelpers");
-const { HEADER_ALIASES, parseOffDays, deriveServiceType, normalizeEntity, normalizeAreaName, parseDriverEntries, scheduleDataChanged } = require("../utils/xlsxParsing");
+const {
+  DAY_KEYS,
+  computePickupTime,
+  parseSheetTimeToDate,
+} = require("../utils/dateTimeHelpers");
+const {
+  HEADER_ALIASES,
+  parseOffDays,
+  deriveServiceType,
+  normalizeEntity,
+  normalizeAreaName,
+  parseDriverEntries,
+  scheduleDataChanged,
+} = require("../utils/xlsxParsing");
 const { findOrCreateNormalizedArea } = require("./areaLookup.service");
-const { findDriver, findEmployee, findVendor } = require("./driverVehicleMatch.service");
-const { resolveConflictFreeAssignment, findOrCreateVehicleForDriver } = require("./autoAssignment.service");
+const {
+  findDriver,
+  findEmployee,
+  findVendor,
+} = require("./driverVehicleMatch.service");
+const {
+  resolveConflictFreeAssignment,
+  findOrCreateVehicleForDriver,
+} = require("./autoAssignment.service");
 const { findOrCreateRouteAndTrip } = require("./routeTrip.service");
 const { normalizeShift } = require("../utils/shiftTime");
 
@@ -23,8 +42,26 @@ const updateJobProgress = async (jobId, patch) => {
     await prisma.bulkUploadJob.update({ where: { id: jobId }, data: patch });
   } catch (error) {
     // Don't let a progress-write hiccup abort the actual upload job.
-    console.error(`[weeklySchedule][job ${jobId}] progress update failed:`, error.message);
+    console.error(
+      `[weeklySchedule][job ${jobId}] progress update failed:`,
+      error.message,
+    );
   }
+};
+
+// Resolves a driver NAME from the sheet (e.g. "Nadeem" / "Amir") to the
+// actual Driver.id UUID. Used by processUpdateScheduleJob so the
+// change-detection comparison never mixes a name string with a UUID — that
+// mismatch was why every row was flagged as "changed" on every update run,
+// regardless of whether anything actually changed.
+const resolveDriverIdByName = async (name) => {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return null;
+  const driver = await prisma.driver.findFirst({
+    where: { name: { equals: trimmed, mode: "insensitive" } },
+    select: { id: true },
+  });
+  return driver?.id || null;
 };
 
 const processUpdateScheduleJob = async (
@@ -50,7 +87,9 @@ const processUpdateScheduleJob = async (
   );
 
   if (headerRowIndex === -1) {
-    console.log(`[weeklySchedule][job ${jobId}] updateSchedule skipped: no Employee ID header`);
+    console.log(
+      `[weeklySchedule][job ${jobId}] updateSchedule skipped: no Employee ID header`,
+    );
     return {
       action: "UPDATE_SCHEDULE",
       matchedEmployees: 0,
@@ -84,10 +123,13 @@ const processUpdateScheduleJob = async (
 
     if (!employeeCode) continue;
 
-    console.log(`[weeklySchedule][job ${jobId}] updateSchedule scanning employeeCode`, {
-      employeeCode,
-      rowNumber: i + 2,
-    });
+    console.log(
+      `[weeklySchedule][job ${jobId}] updateSchedule scanning employeeCode`,
+      {
+        employeeCode,
+        rowNumber: i + 2,
+      },
+    );
 
     const employee = await prisma.employee.findUnique({
       where: { employeeCode },
@@ -95,9 +137,12 @@ const processUpdateScheduleJob = async (
     });
 
     if (!employee) {
-      console.log(`[weeklySchedule][job ${jobId}] updateSchedule ignored unmatched employeeCode`, {
-        employeeCode,
-      });
+      console.log(
+        `[weeklySchedule][job ${jobId}] updateSchedule ignored unmatched employeeCode`,
+        {
+          employeeCode,
+        },
+      );
       continue;
     }
 
@@ -113,9 +158,12 @@ const processUpdateScheduleJob = async (
     });
 
     if (!existingSchedule) {
-      console.log(`[weeklySchedule][job ${jobId}] updateSchedule no schedule; changed employee`, {
-        employeeCode,
-      });
+      console.log(
+        `[weeklySchedule][job ${jobId}] updateSchedule no schedule; changed employee`,
+        {
+          employeeCode,
+        },
+      );
       changedEmployeeCodes.add(employeeCode);
       continue;
     }
@@ -144,14 +192,46 @@ const processUpdateScheduleJob = async (
       String(raw[colIndex.dropTime] ?? "").trim(),
     );
 
+    // ---- Sheet driver NAME -> actual Driver.id UUID ----
+    // Previous version compared the raw sheet string (e.g. "Nadeem") against
+    // existingSchedule.driverId (a UUID), so scheduleDataChanged always
+    // returned true and every row got re-processed on every run.
+    //
+    // Blank cell = "leave the driver alone", NOT "clear the driver". This is
+    // the exact bug that moved Dia Adeel off her Amir-driven trip and onto
+    // Nadeem's trip during an update run whose sheet only contained Marium's
+    // row — her own row was never in the workbook, but the comparison still
+    // treated the blank sheet cell as a driver change.
+    const sheetDriverName = String(raw[colIndex.drivers] ?? "").trim();
+    const sheetDriverId = sheetDriverName
+      ? ((await resolveDriverIdByName(sheetDriverName)) ??
+        existingSchedule.driverId)
+      : existingSchedule.driverId;
+
+    // Same "blank means keep" rule for shift timing. If the sheet doesn't
+    // specify a new shift, the existing one stays — otherwise a stray blank
+    // cell would clobber the whole schedule.
+    const sheetShiftTiming = String(raw[colIndex.shiftTiming] ?? "").trim();
+    const effectiveShiftTiming =
+      sheetShiftTiming || existingSchedule.shiftTiming;
+
     const incoming = {
-      shiftTiming: String(raw[colIndex.shiftTiming] ?? "").trim(),
-      driverId: String(raw[colIndex.drivers] ?? "").trim() || null,
-      routeId: String(raw[colIndex.route] ?? "").trim() || null,
-      pickupTime: sheetArrival ? computePickupTime(sheetArrival) : null,
-      officeArrivalTime: sheetArrival,
-      dropTime: sheetDrop,
-      offDay: String(raw[colIndex.offDay] ?? "").trim(),
+      shiftTiming: effectiveShiftTiming,
+      driverId: sheetDriverId,
+      // Sheet's "Route" column is a route CODE (string), while
+      // existingSchedule.routeId is a UUID. There is no safe 1:1 resolution
+      // here without knowing which route the operator meant (multiple rows
+      // can share a code across weeks), so we do NOT use routeId as a
+      // change signal — driverId + shiftTiming + timing columns already
+      // cover every meaningful edit path.
+      routeId: existingSchedule.routeId,
+      pickupTime: sheetArrival
+        ? computePickupTime(sheetArrival)
+        : existingSchedule.pickupTime,
+      officeArrivalTime: sheetArrival || existingSchedule.officeArrivalTime,
+      dropTime: sheetDrop || existingSchedule.dropTime,
+      offDay:
+        String(raw[colIndex.offDay] ?? "").trim() || existingSchedule.offDay,
       monday: "BOTH",
       tuesday: "BOTH",
       wednesday: "BOTH",
@@ -162,33 +242,55 @@ const processUpdateScheduleJob = async (
     };
 
     const hasChanged = scheduleDataChanged(comparable, incoming);
-    console.log(`[weeklySchedule][job ${jobId}] updateSchedule compare result`, {
-      employeeCode,
-      existingShift: comparable.shiftTiming,
-      incomingShift: incoming.shiftTiming,
-      hasChanged,
-    });
+    console.log(
+      `[weeklySchedule][job ${jobId}] updateSchedule compare result`,
+      {
+        employeeCode,
+        existingShift: comparable.shiftTiming,
+        incomingShift: incoming.shiftTiming,
+        existingDriverId: comparable.driverId,
+        incomingDriverId: incoming.driverId,
+        sheetDriverName,
+        hasChanged,
+      },
+    );
 
     if (hasChanged) {
-      console.log(`[weeklySchedule][job ${jobId}] updateSchedule changed employee queued`, {
-        employeeCode,
-      });
+      console.log(
+        `[weeklySchedule][job ${jobId}] updateSchedule changed employee queued`,
+        {
+          employeeCode,
+        },
+      );
       changedEmployeeCodes.add(employeeCode);
     } else {
-      console.log(`[weeklySchedule][job ${jobId}] updateSchedule no-change employee ignored`, {
-        employeeCode,
-      });
+      console.log(
+        `[weeklySchedule][job ${jobId}] updateSchedule no-change employee ignored`,
+        {
+          employeeCode,
+        },
+      );
     }
   }
 
   const changedCodes = Array.from(changedEmployeeCodes);
+
+  // Safety net: only forward codes that actually exist in this workbook's
+  // matched set. Belt-and-braces against any comparison-path bug that leaks
+  // an employee whose row isn't even in the sheet into changedCodes.
+  const matchedSet = new Set(matchedEmployeeCodes);
+  const safeChangedCodes = changedCodes.filter((code) => matchedSet.has(code));
+  const droppedCodes = changedCodes.filter((code) => !matchedSet.has(code));
+
   console.log(`[weeklySchedule][job ${jobId}] updateSchedule diff summary`, {
     matchedEmployees: matchedEmployeeCodes.size,
     changedEmployees: changedCodes.length,
+    safeChangedEmployees: safeChangedCodes.length,
     changedCodes,
+    droppedCodes,
   });
 
-  if (!changedCodes.length) {
+  if (!safeChangedCodes.length) {
     return {
       action: "UPDATE_SCHEDULE",
       weekStart: weekStartDate.toISOString().slice(0, 10),
@@ -200,30 +302,40 @@ const processUpdateScheduleJob = async (
       routesCreated: 0,
       tripsCreated: 0,
       tripsReused: 0,
-      message: "No matched employees had schedule changes in the uploaded sheet.",
+      message:
+        "No matched employees had schedule changes in the uploaded sheet.",
     };
   }
 
-  console.log(`[weeklySchedule][job ${jobId}] updateSchedule reparsing changed subset`, {
-    changedEmployees: changedCodes.length,
-  });
+  console.log(
+    `[weeklySchedule][job ${jobId}] updateSchedule reparsing changed subset`,
+    {
+      changedEmployees: safeChangedCodes.length,
+    },
+  );
 
   const results = await processBulkUploadJob(
     jobId,
     workbook,
     weekStartDate,
     batchSize,
-    changedCodes,
+    safeChangedCodes,
+    // Sheet is authoritative for driver/vehicle/timing on update runs:
+    // cached driver->trip and trip occupancy from the existing week roster
+    // would otherwise keep employees on their OLD trip even when the sheet
+    // specifies a different driver (e.g. Dia stays with Amir even though the
+    // sheet moved Marium to Nadeem).
+    { resetDriversFromSheet: true },
   );
 
   return {
     action: "UPDATE_SCHEDULE",
     weekStart: weekStartDate.toISOString().slice(0, 10),
     matchedEmployees: matchedEmployeeCodes.size,
-    changedEmployees: changedCodes.length,
-    processedEmployees: changedCodes.length,
+    changedEmployees: safeChangedCodes.length,
+    processedEmployees: safeChangedCodes.length,
     ...results,
-    message: `Updated ${changedCodes.length} matched employee schedule(s) from the uploaded sheet.`,
+    message: `Updated ${safeChangedCodes.length} matched employee schedule(s) from the uploaded sheet.`,
   };
 };
 
@@ -233,9 +345,14 @@ const processBulkUploadJob = async (
   weekStartDate,
   batchSize = 100,
   employeeCodeFilter = null,
+  options = {},
 ) => {
+  const resetDriversFromSheet = Boolean(options.resetDriversFromSheet);
+
   console.log(
-    `[weeklySchedule][job ${jobId}] START weekStart=${weekStartDate} batchSize=${batchSize}`,
+    `[weeklySchedule][job ${jobId}] START weekStart=${weekStartDate} batchSize=${batchSize} ` +
+      `filter=${employeeCodeFilter ? employeeCodeFilter.length : "none"} ` +
+      `resetDriversFromSheet=${resetDriversFromSheet}`,
   );
 
   const results = {
@@ -318,7 +435,7 @@ const processBulkUploadJob = async (
     // Fire-and-forget: don't block row processing on a progress write.
     updateJobProgress(jobId, {
       processedRows: processedRowCount,
-      batchesCompleted: batchesCompletedCount += 1,
+      batchesCompleted: (batchesCompletedCount += 1),
     });
     try {
       const saved = await prisma.$transaction(
@@ -411,7 +528,11 @@ const processBulkUploadJob = async (
     await Promise.all([
       prisma.weeklySchedule.findMany({
         where: { weekStart: weekStartDate, status: { not: "CANCELLED" } },
-        include: { route: true, trip: { include: { vehicle: true } } },
+        include: {
+          route: true,
+          trip: { include: { vehicle: true } },
+          employee: { select: { id: true, employeeCode: true } },
+        },
       }),
       prisma.driver.findMany({
         where: { status: "AVAILABLE" },
@@ -427,21 +548,49 @@ const processBulkUploadJob = async (
   for (const d of availableDriversList) {
     caches.driverById.set(d.id, d);
   }
+
+  // Normalize the filter once, into a Set of employee codes we actually
+  // care about, so the cache-population loop below can cheaply decide
+  // whether an existing row belongs to the sheet we're about to process.
+  const employeeCodeFilterSet =
+    employeeCodeFilter && employeeCodeFilter.length
+      ? new Set(employeeCodeFilter)
+      : null;
+
   for (const s of existingWeekRoster) {
     caches.scheduleByEmployeeId.set(s.employeeId, s);
     if (s.driverId && s.tripId) {
-      caches.tripIdByDriver.set(s.driverId, s.tripId);
+      // When the caller asks to reset driver assignments from the sheet
+      // (update-schedule runs), skip seeding tripIdByDriver / tripDriverMap
+      // for employees that are going to be re-processed. Otherwise the
+      // cached mapping wins over the sheet and employees stay on their OLD
+      // driver's trip even when the sheet moved them to a different driver.
+      const isInFilter =
+        !employeeCodeFilterSet ||
+        employeeCodeFilterSet.has(s.employee?.employeeCode);
+      const skipForReset = resetDriversFromSheet && isInFilter;
+
+      if (!skipForReset) {
+        caches.tripIdByDriver.set(s.driverId, s.tripId);
+      }
     }
     if (s.tripId) {
-      caches.tripOccupancy.set(
-        s.tripId,
-        (caches.tripOccupancy.get(s.tripId) || 0) + 1,
-      );
-      if (s.driverId) {
-        caches.tripDriverMap.set(s.tripId, s.driverId);
-      }
-      if (s.routeId) {
-        caches.tripRouteMap.set(s.tripId, s.routeId);
+      const isInFilter =
+        !employeeCodeFilterSet ||
+        employeeCodeFilterSet.has(s.employee?.employeeCode);
+      const skipForReset = resetDriversFromSheet && isInFilter;
+
+      if (!skipForReset) {
+        caches.tripOccupancy.set(
+          s.tripId,
+          (caches.tripOccupancy.get(s.tripId) || 0) + 1,
+        );
+        if (s.driverId) {
+          caches.tripDriverMap.set(s.tripId, s.driverId);
+        }
+        if (s.routeId) {
+          caches.tripRouteMap.set(s.tripId, s.routeId);
+        }
       }
     }
   }
@@ -503,7 +652,9 @@ const processBulkUploadJob = async (
     console.log(
       `[bulkUpload.service] employeeCodeFilter active: ${employeeCodeFilter.length} employee codes supplied; before=${beforeCount}`,
     );
-    allEmployeeData = allEmployeeData.filter((row) => codeSet.has(row.employeeCode));
+    allEmployeeData = allEmployeeData.filter((row) =>
+      codeSet.has(row.employeeCode),
+    );
     console.log(
       `[bulkUpload.service] employeeCodeFilter applied: rowsAfter=${allEmployeeData.length} matchedCodes=${Array.from(codeSet)}`,
     );
@@ -552,15 +703,28 @@ const processBulkUploadJob = async (
       if (!tripsByAreaShift.has(key)) tripsByAreaShift.set(key, []);
       tripsByAreaShift.get(key).push(trip);
 
-      if (!caches.tripOccupancy.has(trip.id)) {
-        caches.tripOccupancy.set(trip.id, 0);
-      }
-      caches.tripCapacity.set(trip.id, trip.vehicle?.capacity || 10);
-      if (trip.driverId) {
-        caches.tripDriverMap.set(trip.id, trip.driverId);
-      }
-      if (trip.routeId) {
-        caches.tripRouteMap.set(trip.id, trip.routeId);
+      // When resetDriversFromSheet is on, do NOT seed occupancy/capacity
+      // from pre-fetched trips either — those trips may be the very ones
+      // the sheet is trying to move employees off of, and counting their
+      // existing occupancy would prevent them from being reconsidered as
+      // the target.
+      if (!resetDriversFromSheet) {
+        if (!caches.tripOccupancy.has(trip.id)) {
+          caches.tripOccupancy.set(trip.id, 0);
+        }
+        caches.tripCapacity.set(trip.id, trip.vehicle?.capacity || 10);
+        if (trip.driverId) {
+          caches.tripDriverMap.set(trip.id, trip.driverId);
+        }
+        if (trip.routeId) {
+          caches.tripRouteMap.set(trip.id, trip.routeId);
+        }
+      } else {
+        // Still record capacity for newly-encountered trips so later
+        // assignment math has something to work with.
+        if (!caches.tripCapacity.has(trip.id)) {
+          caches.tripCapacity.set(trip.id, trip.vehicle?.capacity || 10);
+        }
       }
     }
   }
@@ -601,7 +765,9 @@ const processBulkUploadJob = async (
       const vehicleType = get("vehicleType");
       const shiftTiming = get("shiftTiming");
       const driverEntries = parseDriverEntries(get("drivers"));
-      const vendorRecord = vendorName ? await findVendor(vendorName, caches.vendor) : null;
+      const vendorRecord = vendorName
+        ? await findVendor(vendorName, caches.vendor)
+        : null;
 
       let driverId = null;
       let driverRecord = null;
@@ -633,6 +799,22 @@ const processBulkUploadJob = async (
             }
           }
           break;
+        }
+      }
+
+      // Blank driver in the sheet = keep the employee on whatever driver they
+      // already have this week. Without this fallback, an update run whose
+      // sheet omits the driver for one employee would silently move them onto
+      // whichever trip the batch pipeline happened to find first (that's how
+      // Dia ended up on Nadeem's trip). Falls through to no-driver only when
+      // there genuinely is no existing schedule to preserve.
+      if (!driverId) {
+        const existingSchedule = caches.scheduleByEmployeeId.get(employee.id);
+        if (existingSchedule?.driverId) {
+          driverId = existingSchedule.driverId;
+          vehicleId = vehicleId || existingSchedule.vehicleId || null;
+          driverRecord =
+            caches.driverById.get(existingSchedule.driverId) || null;
         }
       }
 
@@ -844,7 +1026,8 @@ const processBulkUploadJob = async (
           });
 
           if (assignment.autoAssignedDriver) {
-            results.driversAutoAssigned = (results.driversAutoAssigned || 0) + 1;
+            results.driversAutoAssigned =
+              (results.driversAutoAssigned || 0) + 1;
           }
           if (assignment.autoAssignedVehicle) {
             results.vehiclesAutoAssigned =
@@ -896,7 +1079,14 @@ const processBulkUploadJob = async (
     }
 
     // ---------- PHASE 2: Assign remaining (overflow) to any other trip ----------
-    if (unassigned.length > 0 && otherTrips.length > 0) {
+    //
+    // Only ever used when the employee has NO sheet-specified driver
+    // (driverId === null). Employees whose sheet row explicitly names a
+    // driver must NOT be merged onto a different driver's trip — if their
+    // driver has no trip yet, Phase 3 creates one. This is the guard that
+    // stops an update-run from collapsing two drivers' passengers onto one
+    // vehicle.
+    if (unassigned.length > 0 && otherTrips.length > 0 && !driverId) {
       const sortedOther = sortByOccupancy(otherTrips);
       for (const trip of sortedOther) {
         const capacity = caches.tripCapacity.get(trip.id) || 10;
@@ -945,7 +1135,8 @@ const processBulkUploadJob = async (
           });
 
           if (assignment.autoAssignedDriver) {
-            results.driversAutoAssigned = (results.driversAutoAssigned || 0) + 1;
+            results.driversAutoAssigned =
+              (results.driversAutoAssigned || 0) + 1;
           }
           if (assignment.autoAssignedVehicle) {
             results.vehiclesAutoAssigned =
@@ -1186,7 +1377,6 @@ const processBulkUploadJob = async (
 
   return results;
 };
-
 
 module.exports = {
   processBulkUploadJob,
