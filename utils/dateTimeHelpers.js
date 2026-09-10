@@ -20,23 +20,24 @@ const toDateOnly = (d) => {
 
 const formatDateOnly = (d) => new Date(d).toISOString().slice(0, 10);
 
-const mondayOfCurrentWeek = () => {
+const saturdayOfCurrentWeek = () => {
   const now = new Date();
   const utcToday = new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
   );
-  const daysSinceMonday = (utcToday.getUTCDay() + 6) % 7;
-  return new Date(utcToday.getTime() - daysSinceMonday * 24 * 60 * 60 * 1000);
+  const daysSinceSaturday = (utcToday.getUTCDay() + 1) % 7;
+  return new Date(
+    utcToday.getTime() - daysSinceSaturday * 24 * 60 * 60 * 1000,
+  );
 };
 
 /**
  * Normalize any input date to UTC midnight of the Saturday that begins
  * the week containing that date.
  *
- * The UI enforces "Week must start on a Saturday", and every schedule
- * write path calls toDateOnly() -> UTC midnight. This helper guarantees
- * the reassign endpoint compares on exactly the same value, and it
- * snaps to Saturday even if the caller sends Sun/Mon by accident.
+ * Schedule week-start values use UTC midnight, and this helper guarantees
+ * the reassign endpoint compares on exactly the same Saturday value even if
+ * the caller sends another day from that week.
  *
  * JS getUTCDay(): 0=Sun, 1=Mon, ..., 6=Sat
  */
@@ -56,7 +57,7 @@ function toSaturdayUtcMidnight(input) {
   // 2) Snap backwards to the most recent Saturday.
   //    Sat=6 -> offset 0, Sun=0 -> offset 1, Mon=1 -> offset 2, ...
   const day = utcMidnight.getUTCDay();
-  const offset = (day + 1) % 7; // Sat->0, Sun->1, Mon->2, ... Fri->6
+  const offset = (day + 1) % 7;
   utcMidnight.setUTCDate(utcMidnight.getUTCDate() - offset);
 
   return utcMidnight;
@@ -202,7 +203,7 @@ module.exports = {
   DAY_FIELD_KEYS,
   toDateOnly,
   formatDateOnly,
-  mondayOfCurrentWeek,
+  saturdayOfCurrentWeek,
   parseSheetTimeOfDay,
   timeOfDayToUtcDate,
   parseSheetTimeToDate,

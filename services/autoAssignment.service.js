@@ -12,6 +12,7 @@ const { checkDriverWorkingHours, hasMinimumRest } = require("../utils/driverHour
 const { normalizeVehicleType } = require("../utils/xlsxParsing");
 const { findVendor } = require("./driverVehicleMatch.service");
 const routeTripService = require("./routeTrip.service");
+const { selectAvailableTrip } = require("../utils/tripSelection");
 
 const findBestAvailableDriver = async (
   weekStartDate,
@@ -623,40 +624,32 @@ const findOrCreateTripOnRouteWithCapacity = async (
     const driverTrips = trips.filter((t) => t.driverId === requestedDriverId);
 
     if (driverTrips.length > 0) {
-      for (const candidateTrip of driverTrips) {
-        const capacity =
-          candidateTrip.vehicle?.capacity ?? routeTripService.guessMaxCapacity(vehicleType);
-        const occupancy =
-          caches?.tripOccupancy?.get(candidateTrip.id) ||
+      trip = selectAvailableTrip(
+        driverTrips,
+        (candidateTrip) =>
+          caches?.tripOccupancy?.get(candidateTrip.id) ??
           caches?.weekRoster?.filter((r) => r.tripId === candidateTrip.id)
-            .length ||
-          0;
-
-        if (occupancy < capacity) {
-          trip = candidateTrip;
-          break;
-        }
-      }
+            .length ??
+          0,
+        (candidateTrip) =>
+          candidateTrip.vehicle?.capacity ??
+          routeTripService.guessMaxCapacity(vehicleType),
+      );
     }
   }
 
   if (!trip && !requestedDriverId && trips && trips.length > 0) {
-    const sortedTrips = [...trips].sort((a, b) => {
-      const aOcc = caches?.tripOccupancy?.get(a.id) || 0;
-      const bOcc = caches?.tripOccupancy?.get(b.id) || 0;
-      return bOcc - aOcc;
-    });
-
-    for (const candidate of sortedTrips) {
-      const capacity =
-        candidate.vehicle?.capacity ?? routeTripService.guessMaxCapacity(vehicleType);
-      const occupancy = caches?.tripOccupancy?.get(candidate.id) || 0;
-
-      if (occupancy < capacity) {
-        trip = candidate;
-        break;
-      }
-    }
+    trip = selectAvailableTrip(
+      trips,
+      (candidateTrip) =>
+        caches?.tripOccupancy?.get(candidateTrip.id) ??
+        caches?.weekRoster?.filter((r) => r.tripId === candidateTrip.id)
+          .length ??
+        0,
+      (candidateTrip) =>
+        candidateTrip.vehicle?.capacity ??
+        routeTripService.guessMaxCapacity(vehicleType),
+    );
   }
 
   if (!trip) {

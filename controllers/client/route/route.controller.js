@@ -15,21 +15,24 @@ const {
 
 // ---------- helpers ----------
 
-const toDateOnly = (d) => {
-  const date = new Date(d);
-  return new Date(
+const toSaturdayUtcMidnight = (input) => {
+  const date = new Date(input);
+  const utcMidnight = new Date(
     Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
   );
+  const daysSinceSaturday = (utcMidnight.getUTCDay() + 1) % 7;
+  utcMidnight.setUTCDate(utcMidnight.getUTCDate() - daysSinceSaturday);
+  return utcMidnight;
 };
 
-const currentWeekMonday = () => {
+const currentWeekSaturday = () => {
   const now = new Date();
   const d = new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
   );
   const day = d.getUTCDay();
-  const diff = day === 0 ? -6 : 1 - day;
-  d.setUTCDate(d.getUTCDate() + diff);
+  const diff = (day + 1) % 7;
+  d.setUTCDate(d.getUTCDate() - diff);
   return d;
 };
 
@@ -601,8 +604,8 @@ const getEligibleEmployeesForTrip = async (req, res, next) => {
     }
 
     const weekStartDate = weekStart
-      ? toDateOnly(weekStart)
-      : currentWeekMonday();
+      ? toSaturdayUtcMidnight(weekStart)
+      : currentWeekSaturday();
     const effectiveShift = effectiveTripShift(trip, trip.route);
 
     const employeeWhere = {
@@ -690,7 +693,7 @@ const getAllRoutes = async (req, res, next) => {
       ];
     }
 
-    let occupancyWeekStart = currentWeekMonday();
+    let occupancyWeekStart = currentWeekSaturday();
 
     const [routes, total] = await Promise.all([
       prisma.route.findMany({
@@ -1260,7 +1263,9 @@ const getRouteWeeklyView = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    let weekStartDate = weekStart ? toDateOnly(weekStart) : currentWeekMonday();
+    let weekStartDate = weekStart
+      ? toSaturdayUtcMidnight(weekStart)
+      : currentWeekSaturday();
     let resolvedAutomatically = false;
 
     if (!weekStart) {

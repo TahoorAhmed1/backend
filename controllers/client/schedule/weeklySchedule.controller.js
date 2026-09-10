@@ -18,7 +18,7 @@ const {
 const {
   toDateOnly,
   formatDateOnly,
-  mondayOfCurrentWeek,
+  saturdayOfCurrentWeek,
   toShiftTimeDate,
   toIsoOrNull,
   computePickupTime,
@@ -71,6 +71,7 @@ const FK_CHECKS = [
   { field: "tripId", model: "trip", label: "Trip" },
   { field: "driverId", model: "driver", label: "Driver" },
   { field: "vehicleId", model: "vehicle", label: "Vehicle" },
+  { field: "vendorId", model: "vendor", label: "Vendor" },
 ];
 
 const validateWeeklyScheduleForeignKeys = async (data) => {
@@ -123,17 +124,84 @@ const deleteScheduleAndOrphanedRides = async (schedule) => {
   return { weekStartDate, employeeId };
 };
 
+const finalizeOrphanedTripResources = async (tx, { driverId, vehicleId, routeId }) => {
+  if (driverId) {
+    const otherDriverTrips = await tx.trip.count({
+      where: { driverId, status: "ACTIVE" },
+    });
+    if (otherDriverTrips === 0) {
+      await tx.driver.update({
+        where: { id: driverId },
+        data: { status: "AVAILABLE" },
+      });
+    }
+  }
+
+  if (vehicleId) {
+    const otherVehicleTrips = await tx.trip.count({
+      where: { vehicleId, status: "ACTIVE" },
+    });
+    if (otherVehicleTrips === 0) {
+      await tx.vehicle.update({
+        where: { id: vehicleId },
+        data: { status: "ACTIVE" },
+      });
+    }
+  }
+
+  if (routeId) {
+    const [remainingTrips, remainingSchedules] = await Promise.all([
+      tx.trip.count({ where: { routeId, status: "ACTIVE" } }),
+      tx.weeklySchedule.count({
+        where: { routeId, status: { not: "CANCELLED" } },
+      }),
+    ]);
+    if (remainingTrips === 0 && remainingSchedules === 0) {
+      await tx.route.delete({ where: { id: routeId } });
+    }
+  }
+};
+
+const deleteTripIfOrphaned = async (tripId) => {
+  if (!tripId) return false;
+
+  const remainingSchedules = await prisma.weeklySchedule.count({
+    where: { tripId, status: { not: "CANCELLED" } },
+  });
+  if (remainingSchedules > 0) return false;
+
+  return prisma.$transaction(async (tx) => {
+    const stillAssigned = await tx.weeklySchedule.count({
+      where: { tripId, status: { not: "CANCELLED" } },
+    });
+    if (stillAssigned > 0) return false;
+
+    const trip = await tx.trip.findUnique({
+      where: { id: tripId },
+      select: { driverId: true, vehicleId: true, routeId: true },
+    });
+    if (!trip) return false;
+
+    await tx.ride.deleteMany({ where: { tripId } });
+    const deleted = await tx.trip.deleteMany({ where: { id: tripId } });
+    if (deleted.count > 0) {
+      await finalizeOrphanedTripResources(tx, trip);
+    }
+    return deleted.count > 0;
+  });
+};
+
 const resolvePendingVehicleAssignments = async (req, res, next) => {
   try {
     const { weekStart, routeId, routeCode, employeeId, employeeCode } =
       req.body;
     if (!weekStart) {
       const response = badRequestResponse(
-        "weekStart (the Monday this schedule applies to) is required.",
+        "weekStart (the Saturday this schedule applies to) is required.",
       );
       return res.status(response.status.code).json(response);
     }
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
 
     let route = null;
     if (routeId || routeCode) {
@@ -320,7 +388,7 @@ const optimizeRouteAssignments = async (req, res, next) => {
       const response = badRequestResponse("weekStart is required.");
       return res.status(response.status.code).json(response);
     }
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
     const summary = await optimizeWeekAssignments(weekStartDate);
 
     if (summary?.optimizedRoutes?.length > 0) {
@@ -353,7 +421,7 @@ const resyncPendingRides = async (req, res, next) => {
       const response = badRequestResponse("weekStart is required.");
       return res.status(response.status.code).json(response);
     }
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
     const { jobId } = await enqueuePendingRideResync(weekStartDate);
     const response = okResponse(
       { jobId, weekStart: weekStartDate },
@@ -470,6 +538,8 @@ const buildReassignConflictResponse = (existing, newTrip) => {
 };
 
 const ASSIGNABLE_SCHEDULE_FIELDS = ["serviceType"];
+const defaultScheduleStatus = (driverId, vehicleId) =>
+  driverId && vehicleId ? "ACTIVE" : "DRAFT";
 
 const assignEmployeeToTrip = async (req, res, next) => {
   try {
@@ -484,6 +554,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
       friday,
       saturday,
       sunday,
+      offDay,
       status,
       confirmReassign,
     } = req.body;
@@ -506,7 +577,22 @@ const assignEmployeeToTrip = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    const weekStartDate = toDateOnly(weekStart);
+    const employee = await prisma.employee.findUnique({
+      where: { id: employeeId },
+      select: { serviceType: true },
+    });
+    const requestedOffDay = String(offDay ?? "").trim();
+    const requestedVehicleEntity = req.body.vehicleEntity
+      ? normalizeEntity(req.body.vehicleEntity)
+      : null;
+    if (req.body.vehicleEntity && !requestedVehicleEntity) {
+      const response = badRequestResponse(
+        "Invalid vehicleEntity — expected IBEX or VW.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
     const capacity = trip.vehicle.capacity;
 
     const officeArrivalSource = trip.route?.officeArrivalTime ?? null;
@@ -524,7 +610,7 @@ const assignEmployeeToTrip = async (req, res, next) => {
     }
 
     try {
-      const { schedule, remaining } = await prisma.$transaction(async (tx) => {
+      const { schedule, remaining, oldTripId } = await prisma.$transaction(async (tx) => {
         const occupancy = await tx.weeklySchedule.count({
           where: {
             tripId,
@@ -574,30 +660,50 @@ const assignEmployeeToTrip = async (req, res, next) => {
           tripId: trip.id,
           driverId: trip.driverId,
           vehicleId: trip.vehicleId,
+          vehicleEntity:
+            requestedVehicleEntity || trip.vehicle?.vehicleEntity || null,
+          vendorId:
+            req.body.vendorId ||
+            existing?.vendorId ||
+            trip.driver?.vendorId ||
+            null,
           shiftTiming,
           monday: monday ?? existing?.monday ?? "BOTH",
           tuesday: tuesday ?? existing?.tuesday ?? "BOTH",
           wednesday: wednesday ?? existing?.wednesday ?? "BOTH",
           thursday: thursday ?? existing?.thursday ?? "BOTH",
           friday: friday ?? existing?.friday ?? "BOTH",
-          saturday: saturday ?? existing?.saturday ?? "OFF",
-          sunday: sunday ?? existing?.sunday ?? "OFF",
+          saturday: saturday ?? existing?.saturday ?? "BOTH",
+          sunday: sunday ?? existing?.sunday ?? "BOTH",
           officeArrivalTime: officeArrivalDate,
           dropTime: dropDate,
           pickupTime: pickupDate,
+          offDay: requestedOffDay || existing?.offDay || null,
           serviceType:
             assignableFields.serviceType ||
             existing?.serviceType ||
+            employee?.serviceType ||
             "PICK_AND_DROP",
-          status: status || existing?.status || "ACTIVE",
+          status:
+            status ||
+            existing?.status ||
+            defaultScheduleStatus(trip.driverId, trip.vehicleId),
         };
 
         const savedSchedule = existing
           ? await tx.weeklySchedule.update({ where: { id: existing.id }, data })
           : await tx.weeklySchedule.create({ data });
 
-        return { schedule: savedSchedule, remaining: remainingSeats };
+        return {
+          schedule: savedSchedule,
+          remaining: remainingSeats,
+          oldTripId: existing?.tripId || null,
+        };
       });
+
+      if (oldTripId && oldTripId !== trip.id) {
+        await deleteTripIfOrphaned(oldTripId);
+      }
 
       // IMPORTANT: skipNotifications = true → rideSync will NOT send its own
       // generic notification. The controller sends one specific notification
@@ -695,7 +801,7 @@ const searchEmployeesForAssignment = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
     const trimmedQuery = String(query || "").trim();
     const take = Math.min(25, Math.max(1, parseInt(limit, 10) || 15));
 
@@ -780,6 +886,7 @@ const createWeeklySchedule = async (req, res, next) => {
       tripId,
       driverId,
       vehicleId,
+      vendorId,
       vehicleEntity,
       serviceType,
       monday,
@@ -789,6 +896,7 @@ const createWeeklySchedule = async (req, res, next) => {
       friday,
       saturday,
       sunday,
+      offDay,
       pickupTime,
       shiftTiming,
       officeArrivalTime,
@@ -831,14 +939,26 @@ const createWeeklySchedule = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
     const pickupDate = computePickupTime(officeArrivalDate);
+    const driverVendor = driverId
+      ? await prisma.driver.findUnique({
+          where: { id: driverId },
+          select: { vendorId: true },
+        })
+      : null;
+    const resolvedVendorId = vendorId || driverVendor?.vendorId || null;
 
     const existingSchedule = await prisma.weeklySchedule.findUnique({
       where: {
         employeeId_weekStart: {
           employeeId,
-          weekStart: toDateOnly(weekStart),
+          weekStart: toSaturdayUtcMidnight(weekStart),
         },
       },
+    });
+
+    const employee = await prisma.employee.findUnique({
+      where: { id: employeeId },
+      select: { serviceType: true },
     });
 
     if (existingSchedule) {
@@ -853,6 +973,7 @@ const createWeeklySchedule = async (req, res, next) => {
       tripId,
       driverId,
       vehicleId,
+      vendorId: resolvedVendorId,
     });
     if (fkError) {
       const response = badRequestResponse(fkError);
@@ -860,38 +981,40 @@ const createWeeklySchedule = async (req, res, next) => {
     }
 
     const response = await createRecord(prisma.weeklySchedule, {
-      weekStart: toDateOnly(weekStart),
+      weekStart: toSaturdayUtcMidnight(weekStart),
       employeeId,
       routeId,
       tripId,
       driverId,
       vehicleId,
+      vendorId: resolvedVendorId,
       vehicleEntity: normalizedVehicleEntity,
-      serviceType: serviceType || "PICK_AND_DROP",
+      serviceType: serviceType || employee?.serviceType || "PICK_AND_DROP",
       monday: monday || "BOTH",
       tuesday: tuesday || "BOTH",
       wednesday: wednesday || "BOTH",
       thursday: thursday || "BOTH",
       friday: friday || "BOTH",
-      saturday: saturday || "OFF",
-      sunday: sunday || "OFF",
+      saturday: saturday || "BOTH",
+      sunday: sunday || "BOTH",
       pickupTime: pickupDate,
       shiftTiming,
       officeArrivalTime: officeArrivalDate,
       dropTime: dropDate,
-      status: status || "ACTIVE",
+      offDay: String(offDay ?? "").trim() || null,
+      status: status || defaultScheduleStatus(driverId, vehicleId),
     });
 
     if (routeId) {
       try {
-        await optimizeWeekAssignments(toDateOnly(weekStart));
+        await optimizeWeekAssignments(toSaturdayUtcMidnight(weekStart));
       } catch (optimizeError) {
         // Best-effort
       }
     }
 
     // skipNotifications = true → controller sends the specific notification.
-    await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+    await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
       driverId,
       tripId,
       routeId,
@@ -906,7 +1029,7 @@ const createWeeklySchedule = async (req, res, next) => {
       });
       if (route) routeLabel = route.routeName || route.routeCode || routeLabel;
     }
-    const weekLabel = toDateOnly(weekStart).toISOString().slice(0, 10);
+    const weekLabel = toSaturdayUtcMidnight(weekStart).toISOString().slice(0, 10);
 
     await notifyEmployeeById(
       employeeId,
@@ -972,7 +1095,7 @@ const getAllWeeklySchedules = async (req, res, next) => {
     if (status) where.status = status;
 
     if (weekStart) {
-      const startDate = toDateOnly(weekStart);
+      const startDate = toSaturdayUtcMidnight(weekStart);
       const nextDay = new Date(startDate.getTime() + 24 * 60 * 60 * 1000);
       where.weekStart = { gte: startDate, lt: nextDay };
     }
@@ -1122,7 +1245,7 @@ const updateWeeklySchedule = async (req, res, next) => {
     const { id } = req.params;
     const updateData = { ...req.body };
     if (updateData.weekStart)
-      updateData.weekStart = toDateOnly(updateData.weekStart);
+      updateData.weekStart = toSaturdayUtcMidnight(updateData.weekStart);
     delete updateData.pickupTime;
 
     if ("officeArrivalTime" in updateData) {
@@ -1166,6 +1289,33 @@ const updateWeeklySchedule = async (req, res, next) => {
       return res.status(e.status.code).json(e);
     }
 
+    if ("shiftTiming" in updateData && !String(updateData.shiftTiming).trim()) {
+      delete updateData.shiftTiming;
+    }
+    if ("serviceType" in updateData && !String(updateData.serviceType).trim()) {
+      delete updateData.serviceType;
+    }
+    if ("offDay" in updateData && !String(updateData.offDay).trim()) {
+      delete updateData.offDay;
+    }
+    if ("driverId" in updateData) {
+      const driver = updateData.driverId
+        ? await prisma.driver.findUnique({
+            where: { id: updateData.driverId },
+            select: { vendorId: true, vehicle: true },
+          })
+        : null;
+      if (!("vendorId" in updateData)) {
+        updateData.vendorId = driver?.vendorId || null;
+      }
+      if (!("vehicleId" in updateData)) {
+        updateData.vehicleId = driver?.vehicle?.id || null;
+      }
+      if (!("vehicleEntity" in updateData)) {
+        updateData.vehicleEntity = driver?.vehicle?.vehicleEntity || null;
+      }
+    }
+
     if (
       !("shiftTiming" in updateData) &&
       ("officeArrivalTime" in updateData || "dropTime" in updateData)
@@ -1196,6 +1346,14 @@ const updateWeeklySchedule = async (req, res, next) => {
       driver: true,
       vehicle: true,
     });
+
+    const previousTripId = schedule.tripId;
+    const updatedTripId = "tripId" in updateData
+      ? updateData.tripId
+      : schedule.tripId;
+    if (previousTripId && previousTripId !== updatedTripId) {
+      await deleteTripIfOrphaned(previousTripId);
+    }
 
     const touchesAssignment = [
       "routeId",
@@ -1395,7 +1553,7 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
     delete updateData.pickupTime;
 
     if (updateData.weekStart) {
-      updateData.weekStart = toDateOnly(updateData.weekStart);
+      updateData.weekStart = toSaturdayUtcMidnight(updateData.weekStart);
     }
 
     if ("officeArrivalTime" in updateData) {
@@ -1450,6 +1608,33 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    if ("shiftTiming" in updateData && !String(updateData.shiftTiming).trim()) {
+      delete updateData.shiftTiming;
+    }
+    if ("serviceType" in updateData && !String(updateData.serviceType).trim()) {
+      delete updateData.serviceType;
+    }
+    if ("offDay" in updateData && !String(updateData.offDay).trim()) {
+      delete updateData.offDay;
+    }
+    if ("driverId" in updateData) {
+      const driver = updateData.driverId
+        ? await prisma.driver.findUnique({
+            where: { id: updateData.driverId },
+            select: { vendorId: true, vehicle: true },
+          })
+        : null;
+      if (!("vendorId" in updateData)) {
+        updateData.vendorId = driver?.vendorId || null;
+      }
+      if (!("vehicleId" in updateData)) {
+        updateData.vehicleId = driver?.vehicle?.id || null;
+      }
+      if (!("vehicleEntity" in updateData)) {
+        updateData.vehicleEntity = driver?.vehicle?.vehicleEntity || null;
+      }
+    }
+
     if (
       !("shiftTiming" in updateData) &&
       ("officeArrivalTime" in updateData || "dropTime" in updateData)
@@ -1491,6 +1676,14 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
         vendor: true,
       },
     });
+
+    const previousTripId = schedule.tripId;
+    const updatedTripId = "tripId" in updateData
+      ? updateData.tripId
+      : schedule.tripId;
+    if (previousTripId && previousTripId !== updatedTripId) {
+      await deleteTripIfOrphaned(previousTripId);
+    }
 
     // -------------------------------------------------------------------------
     // rideSync — ONLY when pattern OR assignment OR status changed.
@@ -1838,7 +2031,7 @@ const updateTripDriver = async (req, res, next) => {
         where: {
           driverId: safeDriverId,
           shiftTiming: trip.shiftTiming,
-          status: "ACTIVE",
+          status: defaultScheduleStatus(targetDriverId, targetVehicleId),
           routeId: trip.routeId,
           id: { not: tripId },
           weeklySchedules: {
@@ -1912,8 +2105,16 @@ const updateTripDriver = async (req, res, next) => {
           return { employeesMoved: employeesToMove };
         });
 
+        await prisma.$transaction((tx) =>
+          finalizeOrphanedTripResources(tx, {
+            driverId: trip.driverId,
+            vehicleId: trip.vehicleId,
+            routeId: trip.routeId,
+          }),
+        );
+
         if (weekStart) {
-          await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+          await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
             driverIds: [trip.driverId, safeDriverId].filter(Boolean),
             tripIds: [tripId, conflictingTrip.id],
             vehicleIds: [trip.vehicleId, driver.vehicle.id].filter(Boolean),
@@ -2113,7 +2314,7 @@ const updateTripDriver = async (req, res, next) => {
     );
 
     if (weekStart) {
-      await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+      await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
         driverIds: [trip.driverId, safeDriverId].filter(Boolean),
         tripIds: [tripId],
         vehicleIds: [trip.vehicleId, newVehicleId].filter(Boolean),
@@ -2482,8 +2683,16 @@ const mergeTrips = async (req, res, next) => {
       };
     });
 
+    await prisma.$transaction((tx) =>
+      finalizeOrphanedTripResources(tx, {
+        driverId: sourceTrip.driverId,
+        vehicleId: sourceTrip.vehicleId,
+        routeId: sourceTrip.routeId,
+      }),
+    );
+
     if (weekStart) {
-      await syncPendingRidesForWeekBestEffort(toDateOnly(weekStart), {
+      await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
         driverIds: [targetDriverId],
         tripIds: [targetTripId],
         vehicleIds: [targetVehicleId],
@@ -2650,7 +2859,9 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     schedules.forEach((s) => scheduleByEmployee.set(s.employeeId, s));
 
     const routeShiftNorm = normalizeShift(route.shiftTiming);
-    const routePickupNorm = normalizeTime(route.pickupStartTime);
+    const routePickupNorm = normalizeTime(
+      computePickupTime(route.officeArrivalTime),
+    );
     const routeArrivalNorm = normalizeTime(route.officeArrivalTime);
     const routeDropNorm = normalizeTime(route.dropTime);
 
@@ -2659,10 +2870,10 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
       const existing = scheduleByEmployee.get(emp.id);
       const effectiveShift =
         existing?.shiftTiming || emp.shiftTiming || route.shiftTiming;
-      const effectivePickup = existing?.pickupTime || route.pickupStartTime;
       const effectiveArrival =
         existing?.officeArrivalTime || route.officeArrivalTime;
       const effectiveDrop = existing?.dropTime || route.dropTime;
+      const effectivePickup = computePickupTime(effectiveArrival);
 
       const empShiftNorm = normalizeShift(effectiveShift);
       const empPickupNorm = normalizeTime(effectivePickup);
@@ -2769,6 +2980,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
         let targetTripId;
         let targetDriverId = null;
         let targetVehicleId = null;
+        let targetVehicleEntity = null;
         let action;
         let detailExtra = {};
 
@@ -2777,6 +2989,8 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           targetTripId = existingTripResult.trip.id;
           targetDriverId = existingTripResult.trip.driverId || null;
           targetVehicleId = existingTripResult.trip.vehicleId || null;
+          targetVehicleEntity =
+            existingTripResult.trip.vehicle?.vehicleEntity || null;
           action = existing
             ? "MOVED_TO_EXISTING_TRIP"
             : "CREATED_SCHEDULE_ON_EXISTING_TRIP";
@@ -2819,11 +3033,32 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           targetTripId = routeResult.trip.id;
           targetDriverId = routeResult.trip.driverId || null;
           targetVehicleId = routeResult.trip.vehicleId || null;
+          targetVehicleEntity = routeResult.trip.vehicle?.vehicleEntity || null;
           action = existing ? "CREATED_NEW_TRIP" : "CREATED_NEW_SCHEDULE";
           detailExtra = {
             newRouteCode: routeResult.route.routeCode,
             newTripNumber: routeResult.trip.tripNumber,
           };
+        }
+
+        if (targetDriverId) {
+          const targetDriver = await prisma.driver.findUnique({
+            where: { id: targetDriverId },
+            include: { vehicle: true },
+          });
+          targetVehicleId = targetDriver?.vehicle?.id || targetVehicleId;
+          targetVehicleEntity =
+            targetDriver?.vehicle?.vehicleEntity || targetVehicleEntity;
+        }
+
+        if (targetTripId && targetDriverId) {
+          await prisma.trip.update({
+            where: { id: targetTripId },
+            data: {
+              driverId: targetDriverId,
+              vehicleId: targetVehicleId,
+            },
+          });
         }
 
         const scheduleData = {
@@ -2833,13 +3068,26 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           tripId: targetTripId,
           driverId: targetDriverId,
           vehicleId: targetVehicleId,
+          vehicleEntity: targetVehicleEntity || existing?.vehicleEntity || null,
+          vendorId:
+            (targetDriverId
+              ? (
+                  await prisma.driver.findUnique({
+                    where: { id: targetDriverId },
+                    select: { vendorId: true },
+                  })
+                )?.vendorId
+              : null) ||
+            existing?.vendorId ||
+            null,
           shiftTiming: newShiftTiming,
           pickupTime: newPickupTime ? new Date(newPickupTime) : null,
           officeArrivalTime: newOfficeArrivalTime
             ? new Date(newOfficeArrivalTime)
             : null,
           dropTime: newDropTime ? new Date(newDropTime) : null,
-          serviceType: emp.serviceType || "PICK_AND_DROP",
+          serviceType:
+            emp.serviceType || route.serviceType || "PICK_AND_DROP",
           status: "ACTIVE",
         };
 
@@ -2952,7 +3200,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
 
 const getCurrentWeekSchedules = async (req, res, next) => {
   try {
-    const startOfWeek = mondayOfCurrentWeek();
+    const startOfWeek = saturdayOfCurrentWeek();
 
     const schedules = await prisma.weeklySchedule.findMany({
       where: {
@@ -3323,8 +3571,8 @@ const getScheduleStats = async (req, res, next) => {
 const getScheduleTableStats = async (req, res, next) => {
   try {
     const weekStartDate = req.query.weekStart
-      ? toDateOnly(req.query.weekStart)
-      : mondayOfCurrentWeek();
+      ? toSaturdayUtcMidnight(req.query.weekStart)
+      : saturdayOfCurrentWeek();
 
     const [
       activeEmployees,
@@ -3364,8 +3612,8 @@ const getScheduleTableGroupedByArea = async (req, res, next) => {
   try {
     const { search, areaId } = req.query;
     const weekStartDate = req.query.weekStart
-      ? toDateOnly(req.query.weekStart)
-      : mondayOfCurrentWeek();
+      ? toSaturdayUtcMidnight(req.query.weekStart)
+      : saturdayOfCurrentWeek();
 
     const where = { status: "ACTIVE" };
     if (areaId) where.areaId = areaId;
@@ -3682,12 +3930,12 @@ const updateSchedule = async (req, res, next) => {
     const { weekStart } = req.body;
     if (!weekStart) {
       const response = badRequestResponse(
-        "weekStart (the Monday this schedule applies to) is required.",
+        "weekStart (the Saturday this schedule applies to) is required.",
       );
       return res.status(response.status.code).json(response);
     }
 
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
 
     const tempFilePath = path.join(
       os.tmpdir(),
@@ -3753,11 +4001,11 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
     const { weekStart, batchSize: batchSizeRaw } = req.body;
     if (!weekStart) {
       const response = badRequestResponse(
-        "weekStart (the Monday this schedule applies to) is required.",
+        "weekStart (the Saturday this schedule applies to) is required.",
       );
       return res.status(response.status.code).json(response);
     }
-    const weekStartDate = toDateOnly(weekStart);
+    const weekStartDate = toSaturdayUtcMidnight(weekStart);
 
     let batchSize = DEFAULT_BATCH_SIZE;
     if (batchSizeRaw !== undefined && batchSizeRaw !== "") {
@@ -3862,13 +4110,14 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const weekStartDate = new Date(weekStart);
-    if (isNaN(weekStartDate.getTime())) {
+    const parsedWeekStart = new Date(weekStart);
+    if (isNaN(parsedWeekStart.getTime())) {
       const errorResponse = badRequestResponse(
         "Invalid weekStart date format. Please use YYYY-MM-DD.",
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+    const weekStartDate = toSaturdayUtcMidnight(parsedWeekStart);
 
     const weekEndDate = new Date(weekStartDate);
     weekEndDate.setDate(weekEndDate.getDate() + 7);
@@ -3999,6 +4248,8 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           select: {
             id: true,
             tripNumber: true,
+            driverId: true,
+            vehicleId: true,
             driver: {
               select: {
                 name: true,
@@ -4053,6 +4304,14 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
             },
           },
         });
+
+        for (const deletedTrip of tripsWithNoSchedules) {
+          await finalizeOrphanedTripResources(tx, {
+            driverId: deletedTrip.driverId,
+            vehicleId: deletedTrip.vehicleId,
+            routeId: null,
+          });
+        }
 
         const routeNames = [
           ...new Set(

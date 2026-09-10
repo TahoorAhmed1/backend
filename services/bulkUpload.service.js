@@ -21,6 +21,7 @@ const {
   findDriver,
   findEmployee,
   findVendor,
+  resolveDriverIdByName,
 } = require("./driverVehicleMatch.service");
 const {
   resolveConflictFreeAssignment,
@@ -28,6 +29,7 @@ const {
 } = require("./autoAssignment.service");
 const { findOrCreateRouteAndTrip } = require("./routeTrip.service");
 const { normalizeShift } = require("../utils/shiftTime");
+const { sortTripsByOccupancy } = require("../utils/tripSelection");
 
 // Job creation/status is now handled by bulkUpload.producer.js, which writes
 // to the BulkUploadJob table instead of this in-memory Map. That table
@@ -47,21 +49,6 @@ const updateJobProgress = async (jobId, patch) => {
       error.message,
     );
   }
-};
-
-// Resolves a driver NAME from the sheet (e.g. "Nadeem" / "Amir") to the
-// actual Driver.id UUID. Used by processUpdateScheduleJob so the
-// change-detection comparison never mixes a name string with a UUID — that
-// mismatch was why every row was flagged as "changed" on every update run,
-// regardless of whether anything actually changed.
-const resolveDriverIdByName = async (name) => {
-  const trimmed = String(name || "").trim();
-  if (!trimmed) return null;
-  const driver = await prisma.driver.findFirst({
-    where: { name: { equals: trimmed, mode: "insensitive" } },
-    select: { id: true },
-  });
-  return driver?.id || null;
 };
 
 const processUpdateScheduleJob = async (
@@ -203,8 +190,9 @@ const processUpdateScheduleJob = async (
     // row — her own row was never in the workbook, but the comparison still
     // treated the blank sheet cell as a driver change.
     const sheetDriverName = String(raw[colIndex.drivers] ?? "").trim();
+    const sheetVendorName = String(raw[colIndex.vendor] ?? "").trim();
     const sheetDriverId = sheetDriverName
-      ? ((await resolveDriverIdByName(sheetDriverName)) ??
+      ? ((await resolveDriverIdByName(sheetDriverName, sheetVendorName)) ??
         existingSchedule.driverId)
       : existingSchedule.driverId;
 
@@ -214,6 +202,8 @@ const processUpdateScheduleJob = async (
     const sheetShiftTiming = String(raw[colIndex.shiftTiming] ?? "").trim();
     const effectiveShiftTiming =
       sheetShiftTiming || existingSchedule.shiftTiming;
+    const offDaySet = parseOffDays(raw[colIndex.offDay]);
+    const dayValue = (day) => (offDaySet.has(day) ? "OFF" : "BOTH");
 
     const incoming = {
       shiftTiming: effectiveShiftTiming,
@@ -232,13 +222,13 @@ const processUpdateScheduleJob = async (
       dropTime: sheetDrop || existingSchedule.dropTime,
       offDay:
         String(raw[colIndex.offDay] ?? "").trim() || existingSchedule.offDay,
-      monday: "BOTH",
-      tuesday: "BOTH",
-      wednesday: "BOTH",
-      thursday: "BOTH",
-      friday: "BOTH",
-      saturday: "OFF",
-      sunday: "OFF",
+      monday: dayValue("monday"),
+      tuesday: dayValue("tuesday"),
+      wednesday: dayValue("wednesday"),
+      thursday: dayValue("thursday"),
+      friday: dayValue("friday"),
+      saturday: dayValue("saturday"),
+      sunday: dayValue("sunday"),
     };
 
     const hasChanged = scheduleDataChanged(comparable, incoming);
@@ -763,7 +753,12 @@ const processBulkUploadJob = async (
 
       const vendorName = get("vendor");
       const vehicleType = get("vehicleType");
-      const shiftTiming = get("shiftTiming");
+      const existingSchedule = caches.scheduleByEmployeeId.get(employee.id);
+      const shiftTiming =
+        get("shiftTiming") ||
+        existingSchedule?.shiftTiming ||
+        employee.shiftTiming ||
+        null;
       const driverEntries = parseDriverEntries(get("drivers"));
       const vendorRecord = vendorName
         ? await findVendor(vendorName, caches.vendor)
@@ -809,7 +804,6 @@ const processBulkUploadJob = async (
       // Dia ended up on Nadeem's trip). Falls through to no-driver only when
       // there genuinely is no existing schedule to preserve.
       if (!driverId) {
-        const existingSchedule = caches.scheduleByEmployeeId.get(employee.id);
         if (existingSchedule?.driverId) {
           driverId = existingSchedule.driverId;
           vehicleId = vehicleId || existingSchedule.vehicleId || null;
@@ -855,7 +849,11 @@ const processBulkUploadJob = async (
 
       const officeArrivalTimeRaw = get("officeArrivalTime");
       const dropTimeRaw = get("dropTime");
-      const serviceType = deriveServiceType(officeArrivalTimeRaw, dropTimeRaw);
+      const serviceType =
+        existingSchedule?.serviceType ||
+        employee.serviceType ||
+        deriveServiceType(officeArrivalTimeRaw, dropTimeRaw) ||
+        "PICK_AND_DROP";
       const officeArrivalDate = parseSheetTimeToDate(officeArrivalTimeRaw);
       const dropDate = parseSheetTimeToDate(dropTimeRaw);
       const pickupDate = computePickupTime(officeArrivalDate);
@@ -948,14 +946,11 @@ const processBulkUploadJob = async (
   );
   // ---------- END GROUPING FIX ----------
 
-  // Helper to sort trips by occupancy (highest first)
-  const sortByOccupancy = (trips) => {
-    return [...trips].sort((a, b) => {
-      const aOcc = caches.tripOccupancy.get(a.id) || 0;
-      const bOcc = caches.tripOccupancy.get(b.id) || 0;
-      return bOcc - aOcc;
-    });
-  };
+  const sortByOccupancy = (trips) =>
+    sortTripsByOccupancy(
+      trips,
+      (trip) => caches.tripOccupancy.get(trip.id) || 0,
+    );
 
   for (const [key, group] of employeeGroups) {
     const { areaRecord, shiftTiming, employees, driverId } = group;
@@ -997,6 +992,9 @@ const processBulkUploadJob = async (
           emp.assigned = true;
           emp.assignedTrip = trip;
           emp.assignedRoute = trip.route;
+          emp.shiftTiming =
+            emp.shiftTiming || trip.shiftTiming || trip.route?.shiftTiming || null;
+          emp.scheduleData.shiftTiming = emp.shiftTiming || undefined;
 
           if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
             await prisma.trip.update({
@@ -1105,6 +1103,9 @@ const processBulkUploadJob = async (
           emp.assigned = true;
           emp.assignedTrip = trip;
           emp.assignedRoute = trip.route;
+          emp.shiftTiming =
+            emp.shiftTiming || trip.shiftTiming || trip.route?.shiftTiming || null;
+          emp.scheduleData.shiftTiming = emp.shiftTiming || undefined;
 
           // Override driver if sheet specifies one
           if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
@@ -1268,6 +1269,9 @@ const processBulkUploadJob = async (
       }
 
       for (const emp of toAssign) {
+        emp.shiftTiming =
+          emp.shiftTiming || trip.shiftTiming || trip.route?.shiftTiming || null;
+        emp.scheduleData.shiftTiming = emp.shiftTiming || undefined;
         if (emp.driverId && trip.driverId && emp.driverId !== trip.driverId) {
           await prisma.trip.update({
             where: { id: trip.id },

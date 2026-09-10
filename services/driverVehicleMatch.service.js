@@ -145,6 +145,17 @@ const findDriver = async (
   return result;
 };
 
+const resolveDriverIdByName = async (driverName, vendorName, cache, extraCaches) => {
+  const driver = await findDriver(
+    driverName,
+    vendorName,
+    undefined,
+    cache,
+    extraCaches,
+  );
+  return driver?.id || null;
+};
+
 
 const findVehicleByReg = async (vehicleReg, cache) => {
   const trimmed = String(vehicleReg || "").trim();
@@ -190,6 +201,7 @@ const findEmployee = async (employeeCode, caches) => {
 module.exports = {
   pickBestDriverCandidate,
   findDriver,
+  resolveDriverIdByName,
   findVehicleByReg,
   findVendor,
   findEmployee,
