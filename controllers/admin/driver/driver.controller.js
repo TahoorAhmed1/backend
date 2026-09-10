@@ -196,7 +196,6 @@ const getTodayRide = async (req, res, next) => {
       },
       orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
     });
-    console.log('rides', rides)
 
     const response = okResponse(
       rides.map((ride) => ({
@@ -426,7 +425,7 @@ const startRide = async (req, res, next) => {
       rideId: req.params.id,
       nextStatus: "STARTED",
     });
-    console.log('error', error)
+    console.log("error", error);
     if (error) return res.status(error.status.code).json(error);
 
     return res.status(response.status.code).json(response);
@@ -1211,24 +1210,26 @@ const getNotifications = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = parseInt(req.query.skip) || 0;
+    const { skip, take } = parsePagination(req.query);
     const { status } = req.query;
 
-    const where = { userId, ...(status && { status }) };
+    const where = {
+      userId,
+      ...(status && { status }),
+    };
 
     const [notifications, total] = await Promise.all([
       prisma.notification.findMany({
         where,
         orderBy: { createdAt: "desc" },
         skip,
-        take: limit,
+        take,
       }),
       prisma.notification.count({ where }),
     ]);
 
     const response = okResponse(
-      { data: notifications, total, limit, skip },
+      { data: notifications, total, skip, take },
       "Notifications retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
