@@ -71,13 +71,13 @@ const sendNotificationToUser = async (
     console.error("[notificationService] Pusher failed:", err);
   }
 
-  sendExpoPush(userId, {
-    title,
-    body,
-    data,
-  }).catch((err) => {
-    console.error("[notificationService] Expo push failed:", err);
-  });
+  // sendExpoPush(userId, {
+  //   title,
+  //   body,
+  //   data,
+  // }).catch((err) => {
+  //   console.error("[notificationService] Expo push failed:", err);
+  // });
 
   return notification;
 };

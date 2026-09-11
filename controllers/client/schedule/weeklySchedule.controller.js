@@ -1927,51 +1927,7 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
       schedule.route?.routeName || schedule.route?.routeCode || "their route";
     const weekLabel = weekStartDate.toISOString().slice(0, 10);
 
-    // Notify ONLY the affected employee
-    await notifyEmployeeById(
-      employeeId,
-      {
-        title: "Removed from schedule",
-        body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was removed.`,
-        data: {
-          type: "SCHEDULE_EMPLOYEE_REMOVED",
-          employeeId,
-          routeId: schedule.routeId,
-        },
-        event: "schedule-updated",
-      },
-      { notifyAdmins: false },
-    ).catch((err) =>
-      console.error(
-        "[deleteSingleEmployeeSchedule] Failed to notify employee:",
-        err,
-      ),
-    );
-
-    // Notify ONLY the affected driver (if any)
-    if (schedule.driverId) {
-      await notifyDriverById(
-        schedule.driverId,
-        {
-          title: "Passenger removed from your trip",
-          body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
-          data: {
-            type: "SCHEDULE_EMPLOYEE_REMOVED",
-            employeeId,
-            routeId: schedule.routeId,
-          },
-          event: "schedule-updated",
-        },
-        { notifyAdmins: false },
-      ).catch((err) =>
-        console.error(
-          "[deleteSingleEmployeeSchedule] Failed to notify driver:",
-          err,
-        ),
-      );
-    }
-
-    const response = okResponse(
+     const response = okResponse(
       {
         weekStart: weekStartDate.toISOString().slice(0, 10),
         employeeId: employeeId,
@@ -1979,6 +1935,51 @@ const deleteSingleEmployeeSchedule = async (req, res, next) => {
       },
       "Employee schedule and associated rides deleted successfully.",
     );
+    // Notify ONLY the affected employee
+    // await notifyEmployeeById(
+    //   employeeId,
+    //   {
+    //     title: "Removed from schedule",
+    //     body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was removed.`,
+    //     data: {
+    //       type: "SCHEDULE_EMPLOYEE_REMOVED",
+    //       employeeId,
+    //       routeId: schedule.routeId,
+    //     },
+    //     event: "schedule-updated",
+    //   },
+    //   { notifyAdmins: false },
+    // ).catch((err) =>
+    //   console.error(
+    //     "[deleteSingleEmployeeSchedule] Failed to notify employee:",
+    //     err,
+    //   ),
+    // );
+
+    // Notify ONLY the affected driver (if any)
+    // if (schedule.driverId) {
+    //   await notifyDriverById(
+    //     schedule.driverId,
+    //     {
+    //       title: "Passenger removed from your trip",
+    //       body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
+    //       data: {
+    //         type: "SCHEDULE_EMPLOYEE_REMOVED",
+    //         employeeId,
+    //         routeId: schedule.routeId,
+    //       },
+    //       event: "schedule-updated",
+    //     },
+    //     { notifyAdmins: false },
+    //   ).catch((err) =>
+    //     console.error(
+    //       "[deleteSingleEmployeeSchedule] Failed to notify driver:",
+    //       err,
+    //     ),
+    //   );
+    // }
+
+   
     console.log("response.data", response.data);
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -4111,39 +4112,52 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
   try {
     const { weekStart, confirm } = req.body;
 
+    // ---------------------------------------------------------
+    // VALIDATION
+    // ---------------------------------------------------------
     if (!weekStart) {
       const errorResponse = badRequestResponse(
-        "weekStart is required. Please provide the week starting date.",
+        "weekStart is required. Please provide the week starting date."
       );
+
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
     if (confirm !== true) {
       const errorResponse = badRequestResponse(
-        "Please confirm this action by setting confirm: true",
+        "Please confirm this action by setting confirm: true"
       );
+
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
     const parsedWeekStart = new Date(weekStart);
+
     if (isNaN(parsedWeekStart.getTime())) {
       const errorResponse = badRequestResponse(
-        "Invalid weekStart date format. Please use YYYY-MM-DD.",
+        "Invalid weekStart date format. Please use YYYY-MM-DD."
       );
+
       return res.status(errorResponse.status.code).json(errorResponse);
     }
+
     const weekStartDate = toSaturdayUtcMidnight(parsedWeekStart);
 
     const weekEndDate = new Date(weekStartDate);
-    weekEndDate.setDate(weekEndDate.getDate() + 7);
+    weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 7);
 
+    // ---------------------------------------------------------
+    // FETCH SCHEDULES
+    // ---------------------------------------------------------
     const schedulesToDelete = await prisma.weeklySchedule.findMany({
       where: {
         weekStart: {
           gte: weekStartDate,
           lt: weekEndDate,
         },
-        status: { not: "CANCELLED" },
+        status: {
+          not: "CANCELLED",
+        },
       },
       select: {
         id: true,
@@ -4165,43 +4179,90 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           deleted: 0,
           message: `No schedules found for week ${weekStart}`,
         },
-        "No schedules found to delete.",
+        "No schedules found to delete."
       );
+
       return res.status(response.status.code).json(response);
     }
 
+    // ---------------------------------------------------------
+    // PREPARE IDS
+    // ---------------------------------------------------------
     const tripIds = [
-      ...new Set(schedulesToDelete.map((s) => s.tripId).filter(Boolean)),
+      ...new Set(
+        schedulesToDelete
+          .map((schedule) => schedule.tripId)
+          .filter(Boolean)
+      ),
     ];
 
     const routeIds = [
-      ...new Set(schedulesToDelete.map((s) => s.routeId).filter(Boolean)),
+      ...new Set(
+        schedulesToDelete
+          .map((schedule) => schedule.routeId)
+          .filter(Boolean)
+      ),
     ];
 
-    const employeeIds = schedulesToDelete.map((s) => s.employeeId);
+    const employeeIds = [
+      ...new Set(
+        schedulesToDelete
+          .map((schedule) => schedule.employeeId)
+          .filter(Boolean)
+      ),
+    ];
 
-    const scheduleIds = schedulesToDelete.map((s) => s.id);
+    const scheduleIds = schedulesToDelete.map((schedule) => schedule.id);
+
+    const affectedDriverIds = [
+      ...new Set(
+        schedulesToDelete
+          .map((schedule) => schedule.driverId)
+          .filter(Boolean)
+      ),
+    ];
 
     const stats = {
       totalSchedules: schedulesToDelete.length,
       tripsAffected: tripIds.length,
       routesAffected: routeIds.length,
-      employeeCount: schedulesToDelete.length,
+      employeeCount: employeeIds.length,
     };
 
+    // ---------------------------------------------------------
+    // DATABASE TRANSACTION
+    // ---------------------------------------------------------
     const result = await prisma.$transaction(
       async (tx) => {
+        // -----------------------------------------------------
+        // FIND RIDES
+        // -----------------------------------------------------
         const ridesToDelete = await tx.ride.findMany({
           where: {
             OR: [
-              { tripId: { in: tripIds } },
-              {
-                passengers: {
-                  some: {
-                    employeeId: { in: employeeIds },
-                  },
-                },
-              },
+              ...(tripIds.length > 0
+                ? [
+                    {
+                      tripId: {
+                        in: tripIds,
+                      },
+                    },
+                  ]
+                : []),
+
+              ...(employeeIds.length > 0
+                ? [
+                    {
+                      passengers: {
+                        some: {
+                          employeeId: {
+                            in: employeeIds,
+                          },
+                        },
+                      },
+                    },
+                  ]
+                : []),
             ],
           },
           select: {
@@ -4209,147 +4270,201 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           },
         });
 
-        const rideIds = ridesToDelete.map((r) => r.id);
+        const rideIds = ridesToDelete.map((ride) => ride.id);
 
+        // -----------------------------------------------------
+        // DELETE RIDE DEPENDENCIES
+        // -----------------------------------------------------
         if (rideIds.length > 0) {
           await tx.ridePassenger.deleteMany({
             where: {
-              rideId: { in: rideIds },
+              rideId: {
+                in: rideIds,
+              },
             },
           });
-        }
 
-        if (rideIds.length > 0) {
           await tx.attendance.deleteMany({
             where: {
-              rideId: { in: rideIds },
+              rideId: {
+                in: rideIds,
+              },
             },
           });
-        }
 
-        if (rideIds.length > 0) {
           await tx.complaint.deleteMany({
             where: {
-              rideId: { in: rideIds },
+              rideId: {
+                in: rideIds,
+              },
+            },
+          });
+
+          await tx.ride.deleteMany({
+            where: {
+              id: {
+                in: rideIds,
+              },
             },
           });
         }
 
-        const ridesDeleted = await tx.ride.deleteMany({
-          where: {
-            id: { in: rideIds },
-          },
-        });
-
+        // -----------------------------------------------------
+        // DELETE WEEKLY SCHEDULES
+        // -----------------------------------------------------
         const schedulesDeleted = await tx.weeklySchedule.deleteMany({
           where: {
             weekStart: {
               gte: weekStartDate,
               lt: weekEndDate,
             },
-            status: { not: "CANCELLED" },
-          },
-        });
-
-        const tripsWithNoSchedules = await tx.trip.findMany({
-          where: {
-            id: {
-              in: tripIds,
-            },
-            weeklySchedules: {
-              none: {},
-            },
-          },
-          select: {
-            id: true,
-            tripNumber: true,
-            driverId: true,
-            vehicleId: true,
-            driver: {
-              select: {
-                name: true,
-              },
-            },
-            vehicle: {
-              select: {
-                vehicleNumber: true,
-              },
-            },
-            route: {
-              select: {
-                routeCode: true,
-              },
+            status: {
+              not: "CANCELLED",
             },
           },
         });
 
-        const tripsDeleted = await tx.trip.deleteMany({
-          where: {
-            id: {
-              in: tripsWithNoSchedules.map((t) => t.id),
-            },
-          },
-        });
+        // -----------------------------------------------------
+        // FIND TRIPS WITH NO REMAINING SCHEDULES
+        // -----------------------------------------------------
+        const tripsWithNoSchedules =
+          tripIds.length > 0
+            ? await tx.trip.findMany({
+                where: {
+                  id: {
+                    in: tripIds,
+                  },
+                  weeklySchedules: {
+                    none: {},
+                  },
+                },
+                select: {
+                  id: true,
+                  tripNumber: true,
+                  driverId: true,
+                  vehicleId: true,
 
-        const routesWithNoSchedules = await tx.route.findMany({
-          where: {
-            id: {
-              in: routeIds,
-            },
-            weeklySchedules: {
-              none: {},
-            },
-          },
-          select: {
-            id: true,
-            routeCode: true,
-            routeName: true,
-            area: {
-              select: {
-                name: true,
-              },
-            },
-          },
-        });
+                  driver: {
+                    select: {
+                      name: true,
+                    },
+                  },
 
-        const routesDeleted = await tx.route.deleteMany({
-          where: {
-            id: {
-              in: routesWithNoSchedules.map((r) => r.id),
-            },
-          },
-        });
+                  vehicle: {
+                    select: {
+                      vehicleNumber: true,
+                    },
+                  },
 
+                  route: {
+                    select: {
+                      routeCode: true,
+                    },
+                  },
+                },
+              })
+            : [];
+
+        // -----------------------------------------------------
+        // DELETE TRIPS
+        // -----------------------------------------------------
+        const tripsDeleted =
+          tripsWithNoSchedules.length > 0
+            ? await tx.trip.deleteMany({
+                where: {
+                  id: {
+                    in: tripsWithNoSchedules.map((trip) => trip.id),
+                  },
+                },
+              })
+            : { count: 0 };
+
+        // -----------------------------------------------------
+        // FIND ROUTES WITH NO REMAINING SCHEDULES
+        // -----------------------------------------------------
+        const routesWithNoSchedules =
+          routeIds.length > 0
+            ? await tx.route.findMany({
+                where: {
+                  id: {
+                    in: routeIds,
+                  },
+                  weeklySchedules: {
+                    none: {},
+                  },
+                },
+                select: {
+                  id: true,
+                  routeCode: true,
+                  routeName: true,
+
+                  area: {
+                    select: {
+                      name: true,
+                    },
+                  },
+                },
+              })
+            : [];
+
+        // -----------------------------------------------------
+        // DELETE ROUTES
+        // -----------------------------------------------------
+        const routesDeleted =
+          routesWithNoSchedules.length > 0
+            ? await tx.route.deleteMany({
+                where: {
+                  id: {
+                    in: routesWithNoSchedules.map((route) => route.id),
+                  },
+                },
+              })
+            : { count: 0 };
+
+        // -----------------------------------------------------
+        // ROUTE NAMES FOR AUDIT
+        // -----------------------------------------------------
         const routeNames = [
           ...new Set(
-            schedulesToDelete.map((s) => s.route?.routeCode).filter(Boolean),
+            schedulesToDelete
+              .map((schedule) => schedule.route?.routeCode)
+              .filter(Boolean)
           ),
         ];
 
+        // -----------------------------------------------------
+        // AUDIT LOG
+        // -----------------------------------------------------
         await tx.auditLog.create({
           data: {
             userId: req.user?.id || null,
             action: "BULK_DELETE_ALL_WEEKLY_SCHEDULES",
             model: "WeeklySchedule",
             recordId: `week-${weekStart}`,
+
             before: {
-              weekStart: weekStart,
+              weekStart,
               schedulesCount: stats.totalSchedules,
-              tripIds: tripIds,
-              routeIds: routeIds,
-              employeeIds: employeeIds,
-              scheduleIds: scheduleIds,
-              routeNames: routeNames,
+              tripIds,
+              routeIds,
+              employeeIds,
+              scheduleIds,
+              routeNames,
             },
+
             after: {
               deleted: {
                 schedules: schedulesDeleted.count,
                 trips: tripsDeleted.count,
                 routes: routesDeleted.count,
-                rides: ridesDeleted.count,
+                rides: rideIds.length,
               },
             },
-            ipAddress: req.ip || req.connection.remoteAddress || null,
+
+            ipAddress:
+              req.ip ||
+              req.connection?.remoteAddress ||
+              null,
           },
         });
 
@@ -4357,84 +4472,139 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           schedulesDeleted: schedulesDeleted.count,
           tripsDeleted: tripsDeleted.count,
           routesDeleted: routesDeleted.count,
-          ridesDeleted: ridesDeleted.count,
-          deletedTripResources: tripsWithNoSchedules.map((t) => ({
-            driverId: t.driverId,
-            vehicleId: t.vehicleId,
+          ridesDeleted: rideIds.length,
+
+          deletedTripResources: tripsWithNoSchedules.map((trip) => ({
+            driverId: trip.driverId,
+            vehicleId: trip.vehicleId,
           })),
-          tripsWithNoSchedules: tripsWithNoSchedules.map((t) => ({
-            id: t.id,
-            tripNumber: t.tripNumber,
-            driver: t.driver?.name || "Unassigned",
-            vehicle: t.vehicle?.vehicleNumber || "Unassigned",
-            route: t.route?.routeCode || "Unknown",
+
+          tripsWithNoSchedules: tripsWithNoSchedules.map((trip) => ({
+            id: trip.id,
+            tripNumber: trip.tripNumber,
+            driver: trip.driver?.name || "Unassigned",
+            vehicle: trip.vehicle?.vehicleNumber || "Unassigned",
+            route: trip.route?.routeCode || "Unknown",
           })),
-          routesWithNoSchedules: routesWithNoSchedules.map((r) => ({
-            id: r.id,
-            code: r.routeCode,
-            name: r.routeName,
-            area: r.area?.name || "Unknown",
+
+          routesWithNoSchedules: routesWithNoSchedules.map((route) => ({
+            id: route.id,
+            code: route.routeCode,
+            name: route.routeName,
+            area: route.area?.name || "Unknown",
           })),
+
           routesAffected: routeNames,
         };
       },
       {
         timeout: 30000,
-      },
+      }
     );
 
-    await finalizeBulkDeletedTripResources(result.deletedTripResources);
-
-    const affectedDriverIdsSet = new Set(
-      schedulesToDelete.map((s) => s.driverId).filter(Boolean),
+    // ---------------------------------------------------------
+    // FINALIZE DELETED TRIP RESOURCES
+    // ---------------------------------------------------------
+    await finalizeBulkDeletedTripResources(
+      result.deletedTripResources
     );
-    const weekLabelForNotify = weekStartDate.toISOString().slice(0, 10);
 
-    for (const s of schedulesToDelete) {
-      if (!s.employeeId) continue;
-      await notifyEmployeeById(
-        s.employeeId,
-        {
-          title: "Schedule removed",
-          body: `Your schedule for the week of ${weekLabelForNotify} was removed.`,
-          data: {
-            type: "SCHEDULE_EMPLOYEE_REMOVED",
-            employeeId: s.employeeId,
-            weekStart: weekLabelForNotify,
-          },
-          event: "schedule-updated",
-        },
-        { notifyAdmins: false },
-      ).catch((err) =>
-        console.error(
-          "[deleteAllWeeklySchedules] Failed to notify employee:",
-          err,
-        ),
+    // ---------------------------------------------------------
+    // NOTIFICATION DATA
+    // ---------------------------------------------------------
+    const weekLabelForNotify = weekStartDate
+      .toISOString()
+      .slice(0, 10);
+
+    // ---------------------------------------------------------
+    // BACKGROUND NOTIFICATIONS
+    //
+    // IMPORTANT:
+    // No await here.
+    // API response will NOT wait for notifications.
+    // ---------------------------------------------------------
+    setImmediate(() => {
+      const notificationJobs = [];
+
+      // Employee notifications
+      for (const schedule of schedulesToDelete) {
+        if (!schedule.employeeId) continue;
+
+        notificationJobs.push(
+          notifyEmployeeById(
+            schedule.employeeId,
+            {
+              title: "Schedule removed",
+              body: `Your schedule for the week of ${weekLabelForNotify} was removed.`,
+              data: {
+                type: "SCHEDULE_EMPLOYEE_REMOVED",
+                employeeId: schedule.employeeId,
+                weekStart: weekLabelForNotify,
+              },
+              event: "schedule-updated",
+            },
+            {
+              notifyAdmins: false,
+            }
+          )
+        );
+      }
+
+      // Driver notifications
+      for (const driverId of affectedDriverIds) {
+        notificationJobs.push(
+          notifyDriverById(
+            driverId,
+            {
+              title: "Trips removed",
+              body: `Your trip(s) for the week of ${weekLabelForNotify} were removed in a bulk schedule deletion.`,
+              data: {
+                type: "TRIP_DRIVER_REMOVED",
+                weekStart: weekLabelForNotify,
+              },
+              event: "schedule-updated",
+            },
+            {
+              notifyAdmins: false,
+            }
+          )
+        );
+      }
+
+      // Execute all notifications concurrently
+      return Promise.allSettled(notificationJobs);
+    }).then((results) => {
+      const failed = results.filter(
+        (result) => result.status === "rejected"
       );
-    }
 
-    for (const driverId of affectedDriverIdsSet) {
-      await notifyDriverById(
-        driverId,
-        {
-          title: "Trips removed",
-          body: `Your trip(s) for the week of ${weekLabelForNotify} were removed in a bulk schedule deletion.`,
-          data: { type: "TRIP_DRIVER_REMOVED", weekStart: weekLabelForNotify },
-          event: "schedule-updated",
-        },
-        { notifyAdmins: false },
-      ).catch((err) =>
+      if (failed.length > 0) {
         console.error(
-          "[deleteAllWeeklySchedules] Failed to notify driver:",
-          err,
-        ),
-      );
-    }
+          `[deleteAllWeeklySchedules] ${failed.length} notification(s) failed`
+        );
 
+        failed.forEach((failure) => {
+          console.error(
+            "[deleteAllWeeklySchedules] Notification error:",
+            failure.reason
+          );
+        });
+      }
+    }).catch((error) => {
+      console.error(
+        "[deleteAllWeeklySchedules] Background notification error:",
+        error
+      );
+    });
+
+    // ---------------------------------------------------------
+    // RETURN RESPONSE IMMEDIATELY
+    // ---------------------------------------------------------
     const response = okResponse(
       {
         action: "BULK_DELETE_ALL_COMPLETED",
-        weekStart: weekStart,
+        weekStart,
+
         stats: {
           ...stats,
           schedulesDeleted: result.schedulesDeleted,
@@ -4443,20 +4613,27 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           ridesDeleted: result.ridesDeleted,
           routesAffected: result.routesAffected,
         },
+
         deletedTrips: result.tripsWithNoSchedules,
         deletedRoutes: result.routesWithNoSchedules,
-        message: `✅ Successfully deleted ALL schedules for week ${weekStart}: 
-          ${result.schedulesDeleted} schedule(s), 
-          ${result.tripsDeleted} trip(s), 
-          ${result.routesDeleted} route(s), 
+
+        message: `Successfully deleted ALL schedules for week ${weekStart}: 
+          ${result.schedulesDeleted} schedule(s),
+          ${result.tripsDeleted} trip(s),
+          ${result.routesDeleted} route(s),
           ${result.ridesDeleted} ride(s)
           from ${result.routesAffected.length} route(s).`,
       },
-      `Bulk delete completed for week ${weekStart}`,
+      `Bulk delete completed for week ${weekStart}`
     );
+
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.error("[deleteAllWeeklySchedules] Error:", error);
+    console.error(
+      "[deleteAllWeeklySchedules] Error:",
+      error
+    );
+
     next(error);
   }
 };
