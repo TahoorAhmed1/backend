@@ -153,15 +153,15 @@ const finalizeOrphanedTripResources = async (
   }
 
   if (routeId) {
- 
     const remainingTrips = await tx.trip.count({
       where: { routeId, status: "ACTIVE" },
     });
-    const remainingSchedules = remainingTrips === 0
-      ? await tx.weeklySchedule.count({
-          where: { routeId, status: { not: "CANCELLED" } },
-        })
-      : 0;
+    const remainingSchedules =
+      remainingTrips === 0
+        ? await tx.weeklySchedule.count({
+            where: { routeId, status: { not: "CANCELLED" } },
+          })
+        : 0;
 
     if (remainingTrips === 0 && remainingSchedules === 0) {
       await tx.route.delete({ where: { id: routeId } });
@@ -2076,7 +2076,7 @@ const updateTripDriver = async (req, res, next) => {
         where: {
           driverId: safeDriverId,
           shiftTiming: trip.shiftTiming,
-          status: defaultScheduleStatus(targetDriverId, targetVehicleId),
+          status: defaultScheduleStatus(safeDriverId, newVehicleId),
           routeId: trip.routeId,
           id: { not: tripId },
           weeklySchedules: {

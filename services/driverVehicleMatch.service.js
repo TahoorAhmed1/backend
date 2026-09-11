@@ -52,6 +52,21 @@ const pickBestDriverCandidate = (candidates, normalizedVendor) => {
 };
 
 
+// Sheet cells sometimes name more than one driver for a single row, e.g.
+// "Asim 03006853754 / Azam 03092500123" (seen in practice for shared/backup
+// drivers). We only support assigning one driver per trip row, so we take
+// the first name and flag the row (via __multiDriverCell/__droppedDriverNames
+// on the returned driver) so the dropped name(s) surface for manual review
+// instead of silently disappearing. Handles "/", ",", "&", and " and " as
+// separators between driver entries.
+const DRIVER_CELL_SEPARATOR_REGEX = /\s*\/\s*|\s*,\s*|\s+(?:and|&)\s+/i;
+
+const splitDriverCell = (rawInput) =>
+  rawInput
+    .split(DRIVER_CELL_SEPARATOR_REGEX)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
 const findDriver = async (
   driverName,
   vendorNameFromSheet,
@@ -59,8 +74,13 @@ const findDriver = async (
   cache,
   extraCaches,
 ) => {
-  const trimmedName = String(driverName || "").trim();
-  if (!trimmedName) return null;
+  const rawInput = String(driverName || "").trim();
+  if (!rawInput) return null;
+
+  const driverParts = splitDriverCell(rawInput);
+  const hadMultipleDrivers = driverParts.length > 1;
+  const droppedDriverNames = hadMultipleDrivers ? driverParts.slice(1) : [];
+  const trimmedName = driverParts[0] || rawInput;
 
   const normalizedName = trimmedName.replace(/\s+/g, " ");
   const normalizedVendor = normalizeMatch(vendorNameFromSheet);
@@ -139,6 +159,10 @@ const findDriver = async (
 
   const result = pickBestDriverCandidate(candidates, normalizedVendor);
   if (result && matchedLoosely) result.__looseNameMatch = true;
+  if (result && hadMultipleDrivers) {
+    result.__multiDriverCell = true;
+    result.__droppedDriverNames = droppedDriverNames;
+  }
 
   cache?.set(cacheKey, result);
   if (result) extraCaches?.driverById?.set(result.id, result);
@@ -200,6 +224,7 @@ const findEmployee = async (employeeCode, caches) => {
 
 module.exports = {
   pickBestDriverCandidate,
+  splitDriverCell,
   findDriver,
   resolveDriverIdByName,
   findVehicleByReg,

@@ -14,6 +14,14 @@ const { findVendor } = require("./driverVehicleMatch.service");
 const routeTripService = require("./routeTrip.service");
 const { selectAvailableTrip } = require("../utils/tripSelection");
 
+// NOTE: keep this in sync with the `VehicleType` enum in schema.prisma
+// (CAR, VAN, HIJET, KARVAN, BUS) and with DEFAULT_CAPACITY_BY_VEHICLE_TYPE
+// in routeTrip.service.js. Previously this constant was referenced in three
+// places below (findBestAvailableVehicle x2, findOrCreateVehicleForDriver)
+// but never defined anywhere in the codebase, so any code path that hit
+// `VEHICLE_TYPES.has(...)` threw `ReferenceError: VEHICLE_TYPES is not defined`.
+const VEHICLE_TYPES = new Set(["CAR", "VAN", "HIJET", "KARVAN", "BUS"]);
+
 const findBestAvailableDriver = async (
   weekStartDate,
   candidateShiftTiming,
