@@ -899,6 +899,7 @@ const processBulkUploadJob = async (
         assigned: false,
         assignedTrip: null,
         assignedRoute: null,
+        existingStatus: existingSchedule?.status || null,
         scheduleData: {
           weekStart: weekStartDate,
           employeeId: employee.id,
@@ -913,7 +914,7 @@ const processBulkUploadJob = async (
           dropTime: dropDate || undefined,
           offDay: get("offDay") || undefined,
           ...dayFields,
-          status: "DRAFT",
+          status: existingSchedule?.status || "DRAFT",
         },
       };
 
@@ -1038,8 +1039,6 @@ const processBulkUploadJob = async (
           emp.scheduleData.tripId = trip.id;
           emp.scheduleData.driverId = emp.driverId;
           emp.scheduleData.vehicleId = emp.vehicleId;
-          emp.scheduleData.status =
-            emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
 
           occupancy++;
           caches.tripOccupancy.set(trip.id, occupancy);
@@ -1150,8 +1149,6 @@ const processBulkUploadJob = async (
           emp.scheduleData.tripId = trip.id;
           emp.scheduleData.driverId = emp.driverId;
           emp.scheduleData.vehicleId = emp.vehicleId;
-          emp.scheduleData.status =
-            emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
 
           occupancy++;
           caches.tripOccupancy.set(trip.id, occupancy);
@@ -1313,8 +1310,6 @@ const processBulkUploadJob = async (
         emp.scheduleData.tripId = trip.id;
         emp.scheduleData.driverId = emp.driverId;
         emp.scheduleData.vehicleId = emp.vehicleId;
-        emp.scheduleData.status =
-          emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT";
 
         emp.assigned = true;
         results.employeesReassigned++;
@@ -1349,6 +1344,12 @@ const processBulkUploadJob = async (
         const idx = remainingEmployees.indexOf(emp);
         if (idx > -1) remainingEmployees.splice(idx, 1);
       }
+    }
+
+    for (const emp of employees) {
+      emp.scheduleData.status =
+        emp.existingStatus ||
+        (emp.driverId && emp.vehicleId ? "ACTIVE" : "DRAFT");
     }
 
     if (pendingWrites.length >= 25) {

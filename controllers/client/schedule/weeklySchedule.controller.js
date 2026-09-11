@@ -124,7 +124,10 @@ const deleteScheduleAndOrphanedRides = async (schedule) => {
   return { weekStartDate, employeeId };
 };
 
-const finalizeOrphanedTripResources = async (tx, { driverId, vehicleId, routeId }) => {
+const finalizeOrphanedTripResources = async (
+  tx,
+  { driverId, vehicleId, routeId },
+) => {
   if (driverId) {
     const otherDriverTrips = await tx.trip.count({
       where: { driverId, status: "ACTIVE" },
@@ -150,16 +153,53 @@ const finalizeOrphanedTripResources = async (tx, { driverId, vehicleId, routeId 
   }
 
   if (routeId) {
-    const [remainingTrips, remainingSchedules] = await Promise.all([
-      tx.trip.count({ where: { routeId, status: "ACTIVE" } }),
-      tx.weeklySchedule.count({
-        where: { routeId, status: { not: "CANCELLED" } },
-      }),
-    ]);
+ 
+    const remainingTrips = await tx.trip.count({
+      where: { routeId, status: "ACTIVE" },
+    });
+    const remainingSchedules = remainingTrips === 0
+      ? await tx.weeklySchedule.count({
+          where: { routeId, status: { not: "CANCELLED" } },
+        })
+      : 0;
+
     if (remainingTrips === 0 && remainingSchedules === 0) {
       await tx.route.delete({ where: { id: routeId } });
     }
   }
+};
+
+const finalizeBulkDeletedTripResources = async (deletedTrips) => {
+  const driverIds = [
+    ...new Set(deletedTrips.map((trip) => trip.driverId).filter(Boolean)),
+  ];
+  const vehicleIds = [
+    ...new Set(deletedTrips.map((trip) => trip.vehicleId).filter(Boolean)),
+  ];
+
+  if (driverIds.length === 0 && vehicleIds.length === 0) return;
+
+  await prisma.$transaction(async (tx) => {
+    if (driverIds.length > 0) {
+      await tx.driver.updateMany({
+        where: {
+          id: { in: driverIds },
+          trips: { none: { status: "ACTIVE" } },
+        },
+        data: { status: "AVAILABLE" },
+      });
+    }
+
+    if (vehicleIds.length > 0) {
+      await tx.vehicle.updateMany({
+        where: {
+          id: { in: vehicleIds },
+          trips: { none: { status: "ACTIVE" } },
+        },
+        data: { status: "ACTIVE" },
+      });
+    }
+  });
 };
 
 const deleteTripIfOrphaned = async (tripId) => {
@@ -610,96 +650,101 @@ const assignEmployeeToTrip = async (req, res, next) => {
     }
 
     try {
-      const { schedule, remaining, oldTripId } = await prisma.$transaction(async (tx) => {
-        const occupancy = await tx.weeklySchedule.count({
-          where: {
-            tripId,
+      const { schedule, remaining, oldTripId } = await prisma.$transaction(
+        async (tx) => {
+          const occupancy = await tx.weeklySchedule.count({
+            where: {
+              tripId,
+              weekStart: weekStartDate,
+              status: { not: "CANCELLED" },
+              employeeId: { not: employeeId },
+            },
+          });
+          const remainingSeats = capacity - occupancy;
+          if (remainingSeats <= 0) {
+            const err = new Error("TRIP_AT_CAPACITY");
+            err.code = "TRIP_AT_CAPACITY";
+            throw err;
+          }
+
+          const existing = await tx.weeklySchedule.findUnique({
+            where: {
+              employeeId_weekStart: { employeeId, weekStart: weekStartDate },
+            },
+            include: { employee: true, route: true, trip: true },
+          });
+
+          if (existing?.isLocked) {
+            const err = new Error("SCHEDULE_LOCKED");
+            err.code = "SCHEDULE_LOCKED";
+            throw err;
+          }
+
+          if (
+            existing &&
+            existing.status !== "CANCELLED" &&
+            existing.tripId &&
+            existing.tripId !== tripId &&
+            !confirmReassign
+          ) {
+            const err = new Error("REASSIGN_CONFIRM_NEEDED");
+            err.code = "REASSIGN_CONFIRM_NEEDED";
+            err.existing = existing;
+            throw err;
+          }
+
+          const data = {
+            ...assignableFields,
             weekStart: weekStartDate,
-            status: { not: "CANCELLED" },
-            employeeId: { not: employeeId },
-          },
-        });
-        const remainingSeats = capacity - occupancy;
-        if (remainingSeats <= 0) {
-          const err = new Error("TRIP_AT_CAPACITY");
-          err.code = "TRIP_AT_CAPACITY";
-          throw err;
-        }
+            employeeId,
+            routeId: trip.routeId,
+            tripId: trip.id,
+            driverId: trip.driverId,
+            vehicleId: trip.vehicleId,
+            vehicleEntity:
+              requestedVehicleEntity || trip.vehicle?.vehicleEntity || null,
+            vendorId:
+              req.body.vendorId ||
+              existing?.vendorId ||
+              trip.driver?.vendorId ||
+              null,
+            shiftTiming,
+            monday: monday ?? existing?.monday ?? "BOTH",
+            tuesday: tuesday ?? existing?.tuesday ?? "BOTH",
+            wednesday: wednesday ?? existing?.wednesday ?? "BOTH",
+            thursday: thursday ?? existing?.thursday ?? "BOTH",
+            friday: friday ?? existing?.friday ?? "BOTH",
+            saturday: saturday ?? existing?.saturday ?? "BOTH",
+            sunday: sunday ?? existing?.sunday ?? "BOTH",
+            officeArrivalTime: officeArrivalDate,
+            dropTime: dropDate,
+            pickupTime: pickupDate,
+            offDay: requestedOffDay || existing?.offDay || null,
+            serviceType:
+              assignableFields.serviceType ||
+              existing?.serviceType ||
+              employee?.serviceType ||
+              "PICK_AND_DROP",
+            status:
+              status ||
+              existing?.status ||
+              defaultScheduleStatus(trip.driverId, trip.vehicleId),
+          };
 
-        const existing = await tx.weeklySchedule.findUnique({
-          where: {
-            employeeId_weekStart: { employeeId, weekStart: weekStartDate },
-          },
-          include: { employee: true, route: true, trip: true },
-        });
+          const savedSchedule = existing
+            ? await tx.weeklySchedule.update({
+                where: { id: existing.id },
+                data,
+              })
+            : await tx.weeklySchedule.create({ data });
 
-        if (existing?.isLocked) {
-          const err = new Error("SCHEDULE_LOCKED");
-          err.code = "SCHEDULE_LOCKED";
-          throw err;
-        }
-
-        if (
-          existing &&
-          existing.status !== "CANCELLED" &&
-          existing.tripId &&
-          existing.tripId !== tripId &&
-          !confirmReassign
-        ) {
-          const err = new Error("REASSIGN_CONFIRM_NEEDED");
-          err.code = "REASSIGN_CONFIRM_NEEDED";
-          err.existing = existing;
-          throw err;
-        }
-
-        const data = {
-          ...assignableFields,
-          weekStart: weekStartDate,
-          employeeId,
-          routeId: trip.routeId,
-          tripId: trip.id,
-          driverId: trip.driverId,
-          vehicleId: trip.vehicleId,
-          vehicleEntity:
-            requestedVehicleEntity || trip.vehicle?.vehicleEntity || null,
-          vendorId:
-            req.body.vendorId ||
-            existing?.vendorId ||
-            trip.driver?.vendorId ||
-            null,
-          shiftTiming,
-          monday: monday ?? existing?.monday ?? "BOTH",
-          tuesday: tuesday ?? existing?.tuesday ?? "BOTH",
-          wednesday: wednesday ?? existing?.wednesday ?? "BOTH",
-          thursday: thursday ?? existing?.thursday ?? "BOTH",
-          friday: friday ?? existing?.friday ?? "BOTH",
-          saturday: saturday ?? existing?.saturday ?? "BOTH",
-          sunday: sunday ?? existing?.sunday ?? "BOTH",
-          officeArrivalTime: officeArrivalDate,
-          dropTime: dropDate,
-          pickupTime: pickupDate,
-          offDay: requestedOffDay || existing?.offDay || null,
-          serviceType:
-            assignableFields.serviceType ||
-            existing?.serviceType ||
-            employee?.serviceType ||
-            "PICK_AND_DROP",
-          status:
-            status ||
-            existing?.status ||
-            defaultScheduleStatus(trip.driverId, trip.vehicleId),
-        };
-
-        const savedSchedule = existing
-          ? await tx.weeklySchedule.update({ where: { id: existing.id }, data })
-          : await tx.weeklySchedule.create({ data });
-
-        return {
-          schedule: savedSchedule,
-          remaining: remainingSeats,
-          oldTripId: existing?.tripId || null,
-        };
-      });
+          return {
+            schedule: savedSchedule,
+            remaining: remainingSeats,
+            oldTripId: existing?.tripId || null,
+          };
+        },
+      );
 
       if (oldTripId && oldTripId !== trip.id) {
         await deleteTripIfOrphaned(oldTripId);
@@ -1029,7 +1074,9 @@ const createWeeklySchedule = async (req, res, next) => {
       });
       if (route) routeLabel = route.routeName || route.routeCode || routeLabel;
     }
-    const weekLabel = toSaturdayUtcMidnight(weekStart).toISOString().slice(0, 10);
+    const weekLabel = toSaturdayUtcMidnight(weekStart)
+      .toISOString()
+      .slice(0, 10);
 
     await notifyEmployeeById(
       employeeId,
@@ -1348,9 +1395,8 @@ const updateWeeklySchedule = async (req, res, next) => {
     });
 
     const previousTripId = schedule.tripId;
-    const updatedTripId = "tripId" in updateData
-      ? updateData.tripId
-      : schedule.tripId;
+    const updatedTripId =
+      "tripId" in updateData ? updateData.tripId : schedule.tripId;
     if (previousTripId && previousTripId !== updatedTripId) {
       await deleteTripIfOrphaned(previousTripId);
     }
@@ -1495,41 +1541,41 @@ const deleteWeeklySchedule = async (req, res, next) => {
       schedule.route?.routeName || schedule.route?.routeCode || "their route";
     const weekLabel = schedule.weekStart.toISOString().slice(0, 10);
 
-    await notifyEmployeeById(
-      schedule.employeeId,
-      {
-        title: "Removed from schedule",
-        body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was removed.`,
-        data: {
-          type: "SCHEDULE_EMPLOYEE_REMOVED",
-          employeeId: schedule.employeeId,
-          routeId: schedule.routeId,
-        },
-        event: "schedule-updated",
-      },
-      { notifyAdmins: false },
-    ).catch((err) =>
-      console.error("[deleteWeeklySchedule] Failed to notify employee:", err),
-    );
+    // await notifyEmployeeById(
+    //   schedule.employeeId,
+    //   {
+    //     title: "Removed from schedule",
+    //     body: `Your schedule on ${routeLabel} for the week of ${weekLabel} was removed.`,
+    //     data: {
+    //       type: "SCHEDULE_EMPLOYEE_REMOVED",
+    //       employeeId: schedule.employeeId,
+    //       routeId: schedule.routeId,
+    //     },
+    //     event: "schedule-updated",
+    //   },
+    //   { notifyAdmins: false },
+    // ).catch((err) =>
+    //   console.error("[deleteWeeklySchedule] Failed to notify employee:", err),
+    // );
 
-    if (schedule.driverId) {
-      await notifyDriverById(
-        schedule.driverId,
-        {
-          title: "Passenger removed from your trip",
-          body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
-          data: {
-            type: "SCHEDULE_EMPLOYEE_REMOVED",
-            employeeId: schedule.employeeId,
-            routeId: schedule.routeId,
-          },
-          event: "schedule-updated",
-        },
-        { notifyAdmins: false },
-      ).catch((err) =>
-        console.error("[deleteWeeklySchedule] Failed to notify driver:", err),
-      );
-    }
+    // if (schedule.driverId) {
+    //   await notifyDriverById(
+    //     schedule.driverId,
+    //     {
+    //       title: "Passenger removed from your trip",
+    //       body: `${schedule.employee?.name || "An employee"} was removed from your trip on ${routeLabel} for the week of ${weekLabel}.`,
+    //       data: {
+    //         type: "SCHEDULE_EMPLOYEE_REMOVED",
+    //         employeeId: schedule.employeeId,
+    //         routeId: schedule.routeId,
+    //       },
+    //       event: "schedule-updated",
+    //     },
+    //     { notifyAdmins: false },
+    //   ).catch((err) =>
+    //     console.error("[deleteWeeklySchedule] Failed to notify driver:", err),
+    //   );
+    // }
 
     const response = okResponse(
       { id },
@@ -1678,9 +1724,8 @@ const updateSingleEmployeeSchedule = async (req, res, next) => {
     });
 
     const previousTripId = schedule.tripId;
-    const updatedTripId = "tripId" in updateData
-      ? updateData.tripId
-      : schedule.tripId;
+    const updatedTripId =
+      "tripId" in updateData ? updateData.tripId : schedule.tripId;
     if (previousTripId && previousTripId !== updatedTripId) {
       await deleteTripIfOrphaned(previousTripId);
     }
@@ -2105,21 +2150,26 @@ const updateTripDriver = async (req, res, next) => {
           return { employeesMoved: employeesToMove };
         });
 
-        await prisma.$transaction((tx) =>
-          finalizeOrphanedTripResources(tx, {
-            driverId: trip.driverId,
-            vehicleId: trip.vehicleId,
-            routeId: trip.routeId,
-          }),
+        await prisma.$transaction(
+          (tx) =>
+            finalizeOrphanedTripResources(tx, {
+              driverId: trip.driverId,
+              vehicleId: trip.vehicleId,
+              routeId: trip.routeId,
+            }),
+          { timeout: 30000 }, // <-- exactly 30000
         );
 
         if (weekStart) {
-          await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
-            driverIds: [trip.driverId, safeDriverId].filter(Boolean),
-            tripIds: [tripId, conflictingTrip.id],
-            vehicleIds: [trip.vehicleId, driver.vehicle.id].filter(Boolean),
-            skipNotifications: true,
-          }).catch(() => {});
+          await syncPendingRidesForWeekBestEffort(
+            toSaturdayUtcMidnight(weekStart),
+            {
+              driverIds: [trip.driverId, safeDriverId].filter(Boolean),
+              tripIds: [tripId, conflictingTrip.id],
+              vehicleIds: [trip.vehicleId, driver.vehicle.id].filter(Boolean),
+              skipNotifications: true,
+            },
+          ).catch(() => {});
         }
 
         const mergedRouteLabel =
@@ -2314,13 +2364,16 @@ const updateTripDriver = async (req, res, next) => {
     );
 
     if (weekStart) {
-      await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
-        driverIds: [trip.driverId, safeDriverId].filter(Boolean),
-        tripIds: [tripId],
-        vehicleIds: [trip.vehicleId, newVehicleId].filter(Boolean),
-        routeIds: [trip.routeId, updatedTrip.routeId].filter(Boolean),
-        skipNotifications: true,
-      }).catch(() => {});
+      await syncPendingRidesForWeekBestEffort(
+        toSaturdayUtcMidnight(weekStart),
+        {
+          driverIds: [trip.driverId, safeDriverId].filter(Boolean),
+          tripIds: [tripId],
+          vehicleIds: [trip.vehicleId, newVehicleId].filter(Boolean),
+          routeIds: [trip.routeId, updatedTrip.routeId].filter(Boolean),
+          skipNotifications: true,
+        },
+      ).catch(() => {});
     }
 
     if (trip.driverId !== safeDriverId) {
@@ -2683,22 +2736,27 @@ const mergeTrips = async (req, res, next) => {
       };
     });
 
-    await prisma.$transaction((tx) =>
-      finalizeOrphanedTripResources(tx, {
-        driverId: sourceTrip.driverId,
-        vehicleId: sourceTrip.vehicleId,
-        routeId: sourceTrip.routeId,
-      }),
+    await prisma.$transaction(
+      (tx) =>
+        finalizeOrphanedTripResources(tx, {
+          driverId: sourceTrip.driverId,
+          vehicleId: sourceTrip.vehicleId,
+          routeId: sourceTrip.routeId,
+        }),
+      { timeout: 30000 }, // <-- exactly 30000
     );
 
     if (weekStart) {
-      await syncPendingRidesForWeekBestEffort(toSaturdayUtcMidnight(weekStart), {
-        driverIds: [targetDriverId],
-        tripIds: [targetTripId],
-        vehicleIds: [targetVehicleId],
-        routeIds: [targetRouteId],
-        skipNotifications: true,
-      }).catch(() => {});
+      await syncPendingRidesForWeekBestEffort(
+        toSaturdayUtcMidnight(weekStart),
+        {
+          driverIds: [targetDriverId],
+          tripIds: [targetTripId],
+          vehicleIds: [targetVehicleId],
+          routeIds: [targetRouteId],
+          skipNotifications: true,
+        },
+      ).catch(() => {});
     }
 
     const mergedRouteLabel =
@@ -3061,6 +3119,11 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           });
         }
 
+        const normalizedVehicleEntity =
+          normalizeEntity(targetVehicleEntity) ||
+          normalizeEntity(existing?.vehicleEntity) ||
+          null;
+
         const scheduleData = {
           employeeId: emp.id,
           weekStart: weekStartDate,
@@ -3068,7 +3131,7 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
           tripId: targetTripId,
           driverId: targetDriverId,
           vehicleId: targetVehicleId,
-          vehicleEntity: targetVehicleEntity || existing?.vehicleEntity || null,
+          vehicleEntity: normalizedVehicleEntity || null,
           vendorId:
             (targetDriverId
               ? (
@@ -3086,9 +3149,9 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
             ? new Date(newOfficeArrivalTime)
             : null,
           dropTime: newDropTime ? new Date(newDropTime) : null,
-          serviceType:
-            emp.serviceType || route.serviceType || "PICK_AND_DROP",
-          status: "ACTIVE",
+          offDay: existing?.offDay ?? null,
+          serviceType: emp.serviceType || route.serviceType || "PICK_AND_DROP",
+          status: defaultScheduleStatus(targetDriverId, targetVehicleId),
         };
 
         let savedSchedule;
@@ -3125,57 +3188,9 @@ const reassignMismatchedShiftEmployees = async (req, res, next) => {
     }
 
     for (const tripId of oldTripIds) {
-      const trip = await prisma.trip.findUnique({
-        where: { id: tripId },
-        include: {
-          weeklySchedules: {
-            where: {
-              status: { not: "CANCELLED" },
-              id: { notIn: Array.from(movedScheduleIds) },
-            },
-          },
-          rides: true,
-          driver: { include: { vehicle: true } },
-          vehicle: true,
-        },
-      });
-      if (!trip) continue;
-      const remainingSchedules = trip.weeklySchedules.filter(
-        (s) => !movedScheduleIds.has(s.id),
-      );
-
-      if (remainingSchedules.length === 0) {
-        const rideCount = await prisma.ride.deleteMany({ where: { tripId } });
-        await prisma.trip.delete({ where: { id: tripId } });
+      const orphaned = await deleteTripIfOrphaned(tripId);
+      if (orphaned) {
         results.tripsDeleted++;
-        results.ridesDeleted += rideCount.count;
-
-        if (trip.driverId) {
-          await prisma.driver.update({
-            where: { id: trip.driverId },
-            data: { status: "AVAILABLE" },
-          });
-          results.driversFreed++;
-        }
-        if (trip.vehicleId) {
-          await prisma.vehicle.update({
-            where: { id: trip.vehicleId },
-            data: { status: "ACTIVE" },
-          });
-          results.vehiclesFreed++;
-        }
-
-        const remainingTrips = await prisma.trip.count({
-          where: { routeId: trip.routeId, status: "ACTIVE" },
-        });
-        if (remainingTrips === 0) {
-          const routeToClean = await prisma.route.findUnique({
-            where: { id: trip.routeId },
-          });
-          if (routeToClean && routeToClean.areaId) {
-            await prisma.route.delete({ where: { id: trip.routeId } });
-          }
-        }
       }
     }
 
@@ -4305,14 +4320,6 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           },
         });
 
-        for (const deletedTrip of tripsWithNoSchedules) {
-          await finalizeOrphanedTripResources(tx, {
-            driverId: deletedTrip.driverId,
-            vehicleId: deletedTrip.vehicleId,
-            routeId: null,
-          });
-        }
-
         const routeNames = [
           ...new Set(
             schedulesToDelete.map((s) => s.route?.routeCode).filter(Boolean),
@@ -4351,6 +4358,10 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
           tripsDeleted: tripsDeleted.count,
           routesDeleted: routesDeleted.count,
           ridesDeleted: ridesDeleted.count,
+          deletedTripResources: tripsWithNoSchedules.map((t) => ({
+            driverId: t.driverId,
+            vehicleId: t.vehicleId,
+          })),
           tripsWithNoSchedules: tripsWithNoSchedules.map((t) => ({
             id: t.id,
             tripNumber: t.tripNumber,
@@ -4371,6 +4382,8 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
         timeout: 30000,
       },
     );
+
+    await finalizeBulkDeletedTripResources(result.deletedTripResources);
 
     const affectedDriverIdsSet = new Set(
       schedulesToDelete.map((s) => s.driverId).filter(Boolean),
