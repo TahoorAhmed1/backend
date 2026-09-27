@@ -5,9 +5,9 @@
   "main": "app.js",
   "scripts": {
     "dev": "cross-env NODE_ENV=development nodemon server.js ",
-    "deploy": "node  server.js",
-    "start": "node  server.js",
-    "postinstall": "prisma generate"
+    "deploy": "NODE_OPTIONS=--no-deprecation   cross-env cross-envnode server.js",
+    "start": "NODE_OPTIONS=--no-deprecation cross-env cross-env NODE_ENV=production node server.js",
+    "generate": "prisma generate"
   },
   "author": "",
   "license": "ISC",
