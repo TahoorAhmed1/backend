@@ -11,6 +11,10 @@ module.exports = {
       kill_timeout: 15 * 60 * 1000,
       listen_timeout: 15 * 60 * 1000,
       source_map_support: false,
+      env_file: ".env",
+      env: {
+        NODE_ENV: "production",
+      },
     },
 
     {
@@ -22,6 +26,10 @@ module.exports = {
       max_memory_restart: "600M",
       kill_timeout: 15 * 60 * 1000,
       source_map_support: false,
+      env_file: ".env",
+      env: {
+        NODE_ENV: "production",
+      },
     },
   ],
 };
