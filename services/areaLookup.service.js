@@ -1,5 +1,3 @@
-// ---------- Area / sub-area lookup and normalization ----------
-
 const { prisma } = require("../lib/prisma");
 const { normalizeAreaName } = require("../utils/xlsxParsing");
 
