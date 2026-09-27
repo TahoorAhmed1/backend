@@ -7,22 +7,29 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ibex' }}
 
     steps:
-      # 1️⃣ Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2️⃣ Setup Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # 5️⃣ Build and push Docker image
+      # ── Required: log in to Docker Hub ──────────────────────────────────
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}   # must be an Access Token, not the account password
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -31,10 +38,10 @@ jobs:
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/node-app:latest
             ${{ secrets.DOCKER_USERNAME }}/node-app:${{ github.sha }}
-          cache-from: type=inline
-          cache-to: type=inline
+          # Better cache (inline often fails with the default builder)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # 6️⃣ Deploy Node.js on EC2
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.0
         with:
@@ -43,7 +50,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             echo "🔹 Logging into Docker Hub on EC2..."
-            docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
             echo "🔹 Pulling the latest backend image..."
             docker pull ${{ secrets.DOCKER_USERNAME }}/node-app:latest
@@ -52,7 +59,7 @@ jobs:
             docker stop myapp || true
             docker rm -f myapp || true
 
-            echo "🔹 Starting the app automatically..."
+            echo "🔹 Starting the app..."
             if [ -f /home/${{ secrets.EC2_USER }}/backend/docker-compose.yml ]; then
               cd /home/${{ secrets.EC2_USER }}/backend
               docker compose down || true
@@ -73,7 +80,6 @@ jobs:
             echo "🔹 Checking app health..."
             curl -fsS http://localhost:3000 || true
 
-      # 7️⃣ Deployment complete
       - name: Done
         run: echo "✅ Backend deployed successfully!"
 
