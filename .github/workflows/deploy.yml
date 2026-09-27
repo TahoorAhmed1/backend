@@ -12,11 +12,9 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/ibex' }}
 
     steps:
-      # 1️⃣ Checkout repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2️⃣ Setup Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
