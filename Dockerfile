@@ -1,5 +1,5 @@
 
-FROM node:20-bookworm-slim AS deps
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 
 COPY package*.json ./
@@ -7,13 +7,11 @@ COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
-
-FROM node:20-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 WORKDIR /app
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
 
 ARG DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ibex
 ENV DATABASE_URL=${DATABASE_URL}
@@ -21,7 +19,7 @@ ENV DATABASE_URL=${DATABASE_URL}
 RUN --mount=type=cache,target=/root/.npm \
     npx prisma generate
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production \

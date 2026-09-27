@@ -1,8 +1,11 @@
 services:
   myapp:
+    image: myapp:local
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ibex
       cache_from:
         - type=gha
 
@@ -17,3 +20,4 @@ services:
 
     environment:
       NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ibex
