@@ -1,5 +1,5 @@
 const { prisma } = require("../lib/prisma");
-const { bulkUploadQueue } = require("../lib/queue");
+const { ensureQueueConfigured } = require("../lib/queue");
 
 const MIN_BATCH_SIZE = 10;
 const MAX_BATCH_SIZE = 1000;
@@ -19,6 +19,8 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
     MAX_BATCH_SIZE,
     Math.max(MIN_BATCH_SIZE, batchSize || DEFAULT_BATCH_SIZE),
   );
+
+  const queue = ensureQueueConfigured();
 
   // Same "one active job per week" rule the old in-memory Map enforced,
   // now checked against the DB so it holds across restarts/instances.
@@ -41,7 +43,7 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
   try {
     // jobId as the BullMQ job id too - if enqueueBulkUpload is ever called
     // twice with the same job.id this dedupes instead of double-queueing.
-    await bulkUploadQueue.add(
+    await queue.add(
       "process",
       {
         jobId: job.id,
@@ -80,6 +82,8 @@ const enqueueUpdateSchedule = async (
     Math.max(MIN_BATCH_SIZE, batchSize || DEFAULT_BATCH_SIZE),
   );
 
+  const queue = ensureQueueConfigured();
+
   const conflicting = await prisma.bulkUploadJob.findFirst({
     where: { weekStart: weekStartDate, status: "processing" },
   });
@@ -97,7 +101,7 @@ const enqueueUpdateSchedule = async (
   });
 
   try {
-    await bulkUploadQueue.add(
+    await queue.add(
       "process",
       {
         jobId: job.id,
@@ -132,7 +136,8 @@ const getBulkUploadJobStatus = async (jobId) => {
 };
 
 const enqueuePendingRideResync = async (weekStartDate) => {
-  const job = await bulkUploadQueue.add(
+  const queue = ensureQueueConfigured();
+  const job = await queue.add(
     "resync-pending-rides",
     { weekStartDate: weekStartDate.toISOString() },
     {

@@ -7,7 +7,7 @@ const fs = require("fs/promises");
 const XLSX = require("xlsx");
 const { Worker } = require("bullmq");
 const { prisma } = require("../lib/prisma");
-const { connection, QUEUE_NAME } = require("../lib/queue");
+const { connection, QUEUE_NAME, ensureQueueConfigured } = require("../lib/queue");
 const {
   processBulkUploadJob,
   processUpdateScheduleJob,
@@ -15,6 +15,8 @@ const {
 const { syncPendingRidesForWeek } = require("../lib/rideplaing");
 
 const startBulkUploadWorker = () => {
+  ensureQueueConfigured();
+
   const worker = new Worker(
     QUEUE_NAME,
     async (job) => {

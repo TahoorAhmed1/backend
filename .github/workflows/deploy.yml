@@ -55,6 +55,23 @@ jobs:
             echo "🔹 Pulling the latest backend image..."
             docker pull ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
+            echo "🔹 Preparing runtime env file..."
+            mkdir -p /home/${{ secrets.EC2_USER }}/backend
+            cat > /home/${{ secrets.EC2_USER }}/backend/.env <<'EOF'
+            PORT=8000
+            NODE_ENV=production
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            REDIS_URL=${{ secrets.REDIS_URL }}
+            REDIS_TLS=true
+            REDIS_SSL=true
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            OTP_JWT_SECRET_KEY=${{ secrets.OTP_JWT_SECRET_KEY }}
+            EMAIL_VERIFICATION=${{ secrets.EMAIL_VERIFICATION }}
+            HOST=${{ secrets.HOST }}
+            WEB_CONCURRENCY=2
+            EOF
+            chmod 600 /home/${{ secrets.EC2_USER }}/backend/.env
+
             echo "🔹 Stopping any old app instance..."
             docker stop myapp || true
             docker rm -f myapp || true
@@ -69,17 +86,7 @@ jobs:
                 --name myapp \
                 -p 8000:8000 \
                 --restart unless-stopped \
-                -e NODE_ENV=production \
-                -e PORT=8000 \
-                -e DATABASE_URL='${{ secrets.DATABASE_URL }}' \
-                -e REDIS_URL='${{ secrets.REDIS_URL }}' \
-                -e REDIS_TLS='true' \
-                -e REDIS_SSL='true' \
-                -e JWT_SECRET_KEY='${{ secrets.JWT_SECRET_KEY }}' \
-                -e OTP_JWT_SECRET_KEY='${{ secrets.OTP_JWT_SECRET_KEY }}' \
-                -e EMAIL_VERIFICATION='${{ secrets.EMAIL_VERIFICATION }}' \
-                -e HOST='${{ secrets.HOST }}' \
-                -e WEB_CONCURRENCY='2' \
+                --env-file /home/${{ secrets.EC2_USER }}/backend/.env \
                 ${{ secrets.DOCKER_USERNAME }}/node-app:latest
             fi
 
