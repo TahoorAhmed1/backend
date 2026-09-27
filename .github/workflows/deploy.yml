@@ -67,10 +67,19 @@ jobs:
             else
               docker run -d \
                 --name myapp \
-                -p 3000:3000 \
+                -p 8000:8000 \
                 --restart unless-stopped \
                 -e NODE_ENV=production \
+                -e PORT=8000 \
                 -e DATABASE_URL='${{ secrets.DATABASE_URL }}' \
+                -e REDIS_URL='${{ secrets.REDIS_URL }}' \
+                -e REDIS_TLS='true' \
+                -e REDIS_SSL='true' \
+                -e JWT_SECRET_KEY='${{ secrets.JWT_SECRET_KEY }}' \
+                -e OTP_JWT_SECRET_KEY='${{ secrets.OTP_JWT_SECRET_KEY }}' \
+                -e EMAIL_VERIFICATION='${{ secrets.EMAIL_VERIFICATION }}' \
+                -e HOST='${{ secrets.HOST }}' \
+                -e WEB_CONCURRENCY='2' \
                 ${{ secrets.DOCKER_USERNAME }}/node-app:latest
             fi
 
@@ -78,7 +87,7 @@ jobs:
             docker ps
 
             echo "🔹 Checking app health..."
-            curl -fsS http://localhost:3000 || true
+            curl -fsS http://localhost:8000 || true
 
       - name: Done
         run: echo "✅ Backend deployed successfully!"

@@ -23,7 +23,8 @@ FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production \
-    NODE_OPTIONS="--no-deprecation"
+    NODE_OPTIONS="--no-deprecation" \
+    PORT=8000
 
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g pm2
@@ -31,6 +32,6 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app .
 
-EXPOSE 3000
+EXPOSE 8000
 
 CMD ["pm2-runtime", "ecosystem.config.js"]

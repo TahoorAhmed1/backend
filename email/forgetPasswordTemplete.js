@@ -20,7 +20,7 @@ const Email_Template_Reminder = (userId, token) => {
           <table style="margin: 30px auto;">
             <tr>
               <td style="background-color: #007bff; padding: 10px 20px;">
-                <a href="http://localhost:3000/reset-password/${token}?userId=${userId}" style="color: #fff; text-decoration: none;">Reset Password</a>
+                <a href="http://localhost:8000/reset-password/${token}?userId=${userId}" style="color: #fff; text-decoration: none;">Reset Password</a>
               </td>
             </tr>
           </table>

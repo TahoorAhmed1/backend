@@ -139,7 +139,7 @@ const Email_Template_Reminder = (data, user, filter_course) => {
                     padding-bottom: 26px;
   
                   ">
-                          <a href=${`http://localhost:3000?course=${filter_course?.id}&userid=${user?.id}&professorId=${data?.professor_id}&universityId=${data?.university_id}&assessmentType=${data?.assessmentType}`}> <button style="
+                          <a href=${`http://localhost:8000?course=${filter_course?.id}&userid=${user?.id}&professorId=${data?.professor_id}&universityId=${data?.university_id}&assessmentType=${data?.assessmentType}`}> <button style="
                       max-width: 250px;
                       padding: 10px 20px;
                       background: #053c6f;
@@ -154,7 +154,7 @@ const Email_Template_Reminder = (data, user, filter_course) => {
                       width: 100%;
                       border: #ffffff;
                     ">
-                                  <a href="https://www.google.com/"> </a><a href=${`http://localhost:3000?course=${filter_course?.id}&userid=${user?.id}&professorId=${data?.professor_id}&universityId=${data?.university_id}&assessmentType=${data?.assessmentType}`}
+                                  <a href="https://www.google.com/"> </a><a href=${`http://localhost:8000?course=${filter_course?.id}&userid=${user?.id}&professorId=${data?.professor_id}&universityId=${data?.university_id}&assessmentType=${data?.assessmentType}`}
                                       style="color: #ffffff; text-decoration: none">Add Your Reviews
                                   </a>
                               </button>

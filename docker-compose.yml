@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ibex
+        DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/ibex}
       cache_from:
         - type=gha
 
@@ -16,8 +16,17 @@ services:
       - .env
 
     ports:
-      - "3000:3000"
+      - "8000:8000"
 
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ibex
+      PORT: ${PORT:-8000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/ibex}
+      REDIS_URL: ${REDIS_URL}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      OTP_JWT_SECRET_KEY: ${OTP_JWT_SECRET_KEY}
+      EMAIL_VERIFICATION: ${EMAIL_VERIFICATION}
+      HOST: ${HOST}
+      REDIS_TLS: ${REDIS_TLS:-true}
+      REDIS_SSL: ${REDIS_SSL:-true}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
