@@ -1,6 +1,9 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 WORKDIR /app
+
+ARG DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ibex
+ENV DATABASE_URL=${DATABASE_URL}
 
 COPY package*.json ./
 
