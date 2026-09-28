@@ -3,7 +3,7 @@ npm-debug.log
 .git
 .gitignore
 .env
-.env.*
+.env*
 coverage
 logs
 Dockerfile
