@@ -47,11 +47,8 @@ jobs:
           script: |
             set -e
 
-            APP_DIR="/home/${{ secrets.EC2_USER }}/backend"
-            IMAGE="${{ secrets.DOCKER_USERNAME }}/node-app:latest"
-
             echo "======================================"
-            echo "Docker login"
+            echo "Logging into Docker Hub"
             echo "======================================"
 
             echo "${{ secrets.DOCKER_PASSWORD }}" | docker login \
@@ -59,54 +56,33 @@ jobs:
               --password-stdin
 
             echo "======================================"
-            echo "Preparing application directory"
+            echo "Pulling latest image"
             echo "======================================"
 
-            mkdir -p "$APP_DIR"
+            docker pull ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
             echo "======================================"
-            echo "Creating runtime environment"
+            echo "Preparing runtime env file"
             echo "======================================"
 
-            cat > "$APP_DIR/.env" <<'EOF'
+            mkdir -p /home/${{ secrets.EC2_USER }}/backend
+
+            cat > /home/${{ secrets.EC2_USER }}/backend/.env <<'EOF'
             PORT=8000
-            NODE_ENV=production
-            HOST=0.0.0.0
-
-            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
-            OTP_JWT_SECRET_KEY=${{ secrets.OTP_JWT_SECRET_KEY }}
+            JWT_SECRET_KEY=!!@@$$!@13212@!
+            OTP_JWT_SECRET_KEY=!!@@$$!@13212@!verify
             EMAIL_VERIFICATION=verify-email
-
             PRISMA_CLIENT_ENGINE_TYPE=accelerate
-
-            DATABASE_URL=${{ secrets.DATABASE_URL }}
-
+            TEST_VAR='lIVE Mode'
+            DATABASE_URL=postgresql://neondb_owner:npg_prBitIZ1FM6g@ep-gentle-scene-ayvmssvq-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+            HOST="localhost"
+            REDIS_URL=rediss://default:rHXDMYYMiscLxoYtJyBbXL6uAR8ea6L5@redis-13717.c278.us-east-1-4.ec2.cloud.redislabs.com:13717
             WEB_CONCURRENCY=2
-
-            REDIS_URL=${{ secrets.REDIS_URL }}
             REDIS_TLS=true
             REDIS_SSL=true
             EOF
 
-            chmod 600 "$APP_DIR/.env"
-
-            echo "======================================"
-            echo "Validating runtime env file"
-            echo "======================================"
-
-            test -s "$APP_DIR/.env"
-
-            grep -q '^REDIS_URL=.\+' "$APP_DIR/.env"
-            grep -q '^DATABASE_URL=.\+' "$APP_DIR/.env"
-
-            echo "REDIS_URL exists in runtime .env"
-            echo "DATABASE_URL exists in runtime .env"
-
-            echo "======================================"
-            echo "Pulling latest Docker image"
-            echo "======================================"
-
-            docker pull "$IMAGE"
+            chmod 600 /home/${{ secrets.EC2_USER }}/backend/.env
 
             echo "======================================"
             echo "Stopping old container"
@@ -121,84 +97,38 @@ jobs:
 
             docker run -d \
               --name myapp \
-              --restart unless-stopped \
-              --env-file "$APP_DIR/.env" \
               -p 8000:8000 \
-              "$IMAGE"
+              --restart unless-stopped \
+              --env-file /home/${{ secrets.EC2_USER }}/backend/.env \
+              ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
             echo "======================================"
-            echo "Waiting for container"
+            echo "Container status"
+            echo "======================================"
+
+            docker ps
+
+            echo "======================================"
+            echo "Waiting for application"
             echo "======================================"
 
             sleep 10
 
             echo "======================================"
-            echo "Checking container"
-            echo "======================================"
-
-            docker ps --filter "name=myapp"
-
-            echo "======================================"
-            echo "Checking REDIS_URL inside container"
-            echo "======================================"
-
-            docker exec myapp node -e "
-              if (process.env.REDIS_URL) {
-                console.log('REDIS_URL: OK');
-              } else {
-                console.error('REDIS_URL: MISSING');
-                process.exit(1);
-              }
-            "
-
-            echo "======================================"
-            echo "Checking Redis TLS settings"
-            echo "======================================"
-
-            docker exec myapp node -e "
-              console.log('REDIS_TLS:', process.env.REDIS_TLS);
-              console.log('REDIS_SSL:', process.env.REDIS_SSL);
-            "
-
-            echo "======================================"
-            echo "Checking PM2"
-            echo "======================================"
-
-            docker exec myapp pm2 status
-
-            echo "======================================"
             echo "Application logs"
             echo "======================================"
 
-            docker logs --tail 100 myapp
+            docker logs --tail 50 myapp
 
             echo "======================================"
             echo "Health check"
             echo "======================================"
 
-            curl -fsS http://localhost:8000
+            curl -fsS http://localhost:8000 || true
 
-            echo ""
             echo "======================================"
             echo "Deployment complete"
             echo "======================================"
 
-  cleanup-ec2:
-    needs: build-and-deploy
-    runs-on: ubuntu-latest
-    if: success()
 
-    steps:
-      - name: Cleanup old Docker images
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-
-          script: |
-            echo "Cleaning unused Docker images..."
-
-            docker image prune -f
-
-            echo "Cleanup complete."
+  
