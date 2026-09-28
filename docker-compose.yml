@@ -1,6 +1,7 @@
 services:
   myapp:
     image: myapp:local
+
     build:
       context: .
       dockerfile: Dockerfile
@@ -21,12 +22,11 @@ services:
     environment:
       NODE_ENV: production
       PORT: ${PORT:-8000}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/ibex}
-      REDIS_URL: ${REDIS_URL}
+      DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       OTP_JWT_SECRET_KEY: ${OTP_JWT_SECRET_KEY}
       EMAIL_VERIFICATION: ${EMAIL_VERIFICATION}
       HOST: ${HOST}
-      REDIS_TLS: ${REDIS_TLS:-false}
-      REDIS_SSL: ${REDIS_SSL:-false}
+      REDIS_TLS: ${REDIS_TLS:-true}
+      REDIS_SSL: ${REDIS_SSL:-true}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
