@@ -5,28 +5,28 @@ const { normalizeRedisUrl, validateRedisConfiguration } = require('../lib/queue'
 const pm2Config = require('../ecosystem.config.js');
 
 test('normalizeRedisUrl keeps a valid redis scheme', () => {
-  assert.equal(normalizeRedisUrl('redis://localhost:6379'), 'redis://localhost:6379');
+  assert.equal(normalizeRedisUrl('rediss://localhost:6379'), 'rediss://localhost:6379');
 });
 
 test('normalizeRedisUrl adds a redis scheme when missing', () => {
-  assert.equal(normalizeRedisUrl('localhost:6379'), 'redis://localhost:6379');
+  assert.equal(normalizeRedisUrl('localhost:6379'), 'rediss://localhost:6379');
 });
 
 test('normalizeRedisUrl throws for blank values', () => {
   assert.throws(() => normalizeRedisUrl('   '), /REDIS_URL is not configured/i);
 });
 
-test('validateRedisConfiguration rejects plain redis:// with TLS enabled', () => {
+test('validateRedisConfiguration rejects plain rediss:// with TLS enabled', () => {
   const originalUrl = process.env.REDIS_URL;
   const originalTls = process.env.REDIS_TLS;
 
-  process.env.REDIS_URL = 'redis://localhost:6379';
+  process.env.REDIS_URL = 'rediss://localhost:6379';
   process.env.REDIS_TLS = 'true';
 
   try {
     assert.throws(
       () => validateRedisConfiguration(),
-      /REDIS_TLS\/REDIS_SSL is enabled but REDIS_URL uses redis:\/\//i,
+      /REDIS_TLS\/REDIS_SSL is enabled but REDIS_URL uses rediss:\/\//i,
     );
   } finally {
     if (originalUrl === undefined) delete process.env.REDIS_URL;
