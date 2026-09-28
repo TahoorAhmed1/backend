@@ -4,10 +4,10 @@
   "description": "",
   "main": "app.js",
   "scripts": {
-    "dev": "cross-env NODE_ENV=development nodemon server.js ",
-    "deploy": "NODE_OPTIONS=--no-deprecation   cross-env cross-envnode server.js",
-    "start": "NODE_OPTIONS=--no-deprecation cross-env cross-env NODE_ENV=production node server.js",
-    "generate": "prisma generate"
+   "dev": "cross-env NODE_ENV=development nodemon server.js",
+    "generate": "prisma generate",
+    "deploy": "cross-env NODE_ENV=production NODE_OPTIONS=--no-deprecation node server.js",
+    "start": "cross-env NODE_ENV=production NODE_OPTIONS=--no-deprecation node server.js"
   },
   "author": "",
   "license": "ISC",
