@@ -5,7 +5,6 @@ module.exports = {
       script: "./server.js",
       exec_mode: "fork",
       instances: 1,
-      wait_ready: true,
       autorestart: true,
       max_memory_restart: "500M",
       kill_timeout: 15 * 60 * 1000,

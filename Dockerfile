@@ -1,6 +1,3 @@
-# =========================
-# Dependencies
-# =========================
 FROM node:22-bookworm-slim AS deps
 
 WORKDIR /app
@@ -11,9 +8,6 @@ RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
 
-# =========================
-# Build
-# =========================
 FROM node:22-bookworm-slim AS build
 
 WORKDIR /app
@@ -28,9 +22,6 @@ ENV DATABASE_URL=${DATABASE_URL}
 RUN npx prisma generate
 
 
-# =========================
-# Runtime
-# =========================
 FROM node:22-bookworm-slim AS runtime
 
 WORKDIR /app
