@@ -38,15 +38,6 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy to EC2
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          REDIS_URL: ${{ secrets.REDIS_URL }}
-          REDIS_TLS: ${{ secrets.REDIS_TLS || 'false' }}
-          REDIS_SSL: ${{ secrets.REDIS_SSL || 'false' }}
-          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
-          OTP_JWT_SECRET_KEY: ${{ secrets.OTP_JWT_SECRET_KEY }}
-          EMAIL_VERIFICATION: ${{ secrets.EMAIL_VERIFICATION }}
-          HOST: ${{ secrets.HOST }}
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -75,6 +66,7 @@ jobs:
             echo "======================================"
 
             mkdir -p /home/${{ secrets.EC2_USER }}/backend
+
             cat > /home/${{ secrets.EC2_USER }}/backend/.env <<'EOF'
             PORT=8000
             JWT_SECRET_KEY=!!@@$$!@13212@!
