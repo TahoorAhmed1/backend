@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { normalizeRedisUrl } = require('../lib/queue');
+const { normalizeRedisUrl, validateRedisConfiguration } = require('../lib/queue');
 const pm2Config = require('../ecosystem.config.js');
 
 test('normalizeRedisUrl keeps a valid redis scheme', () => {
@@ -14,6 +14,27 @@ test('normalizeRedisUrl adds a redis scheme when missing', () => {
 
 test('normalizeRedisUrl throws for blank values', () => {
   assert.throws(() => normalizeRedisUrl('   '), /REDIS_URL is not configured/i);
+});
+
+test('validateRedisConfiguration rejects plain redis:// with TLS enabled', () => {
+  const originalUrl = process.env.REDIS_URL;
+  const originalTls = process.env.REDIS_TLS;
+
+  process.env.REDIS_URL = 'redis://localhost:6379';
+  process.env.REDIS_TLS = 'true';
+
+  try {
+    assert.throws(
+      () => validateRedisConfiguration(),
+      /REDIS_TLS\/REDIS_SSL is enabled but REDIS_URL uses redis:\/\//i,
+    );
+  } finally {
+    if (originalUrl === undefined) delete process.env.REDIS_URL;
+    else process.env.REDIS_URL = originalUrl;
+
+    if (originalTls === undefined) delete process.env.REDIS_TLS;
+    else process.env.REDIS_TLS = originalTls;
+  }
 });
 
 test('pm2 loads the project env file for all managed apps', () => {

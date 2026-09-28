@@ -27,6 +27,6 @@ services:
       OTP_JWT_SECRET_KEY: ${OTP_JWT_SECRET_KEY}
       EMAIL_VERIFICATION: ${EMAIL_VERIFICATION}
       HOST: ${HOST}
-      REDIS_TLS: ${REDIS_TLS:-true}
-      REDIS_SSL: ${REDIS_SSL:-true}
+      REDIS_TLS: ${REDIS_TLS:-false}
+      REDIS_SSL: ${REDIS_SSL:-false}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
