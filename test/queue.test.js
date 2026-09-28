@@ -22,3 +22,33 @@ test('pm2 loads the project env file for all managed apps', () => {
   assert.ok(apps.some((app) => app.name === 'myapp' && app.env_file === '.env'));
   assert.ok(apps.some((app) => app.name === 'myapp-bulk' && app.env_file === '.env'));
 });
+
+test('startBulkUploadWorker does not crash if Redis is not configured', () => {
+  const queueModulePath = require.resolve('../lib/queue');
+  const workerModulePath = require.resolve('../worker/bulkupload.worker');
+  const originalQueueModule = require.cache[queueModulePath];
+
+  const stubQueue = {
+    connection: null,
+    QUEUE_NAME: 'bulk-upload',
+    ensureQueueConfigured: () => {
+      throw new Error('REDIS_URL is not configured. Set it to a valid Redis endpoint before starting the bulk upload queue.');
+    },
+  };
+
+  require.cache[queueModulePath] = { exports: stubQueue };
+  delete require.cache[workerModulePath];
+
+  try {
+    const { startBulkUploadWorker } = require('../worker/bulkupload.worker');
+    assert.equal(startBulkUploadWorker(), null);
+  } finally {
+    if (originalQueueModule) {
+      require.cache[queueModulePath] = originalQueueModule;
+    } else {
+      delete require.cache[queueModulePath];
+    }
+
+    delete require.cache[workerModulePath];
+  }
+});

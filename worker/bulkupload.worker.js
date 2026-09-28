@@ -15,7 +15,15 @@ const {
 const { syncPendingRidesForWeek } = require("../lib/rideplaing");
 
 const startBulkUploadWorker = () => {
-  ensureQueueConfigured();
+  try {
+    ensureQueueConfigured();
+  } catch (error) {
+    console.warn(
+      "[bulkUpload.worker] Redis is not configured; bulk upload worker is disabled until REDIS_URL is available.",
+      error.message,
+    );
+    return null;
+  }
 
   const worker = new Worker(
     QUEUE_NAME,
