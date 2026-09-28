@@ -38,8 +38,8 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app .
 
-# Copy .env into the image
-COPY .env 
+# Fixed: COPY needs source AND destination
+COPY .env .
 
 EXPOSE 8000
 
