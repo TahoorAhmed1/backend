@@ -4,6 +4,48 @@ const { ensureQueueConfigured } = require("../lib/queue");
 const MIN_BATCH_SIZE = 10;
 const MAX_BATCH_SIZE = 1000;
 const DEFAULT_BATCH_SIZE = 100;
+const LIVE_QUEUE_STATES = new Set([
+  "active",
+  "delayed",
+  "paused",
+  "prioritized",
+  "waiting",
+  "waiting-children",
+]);
+
+const findConflictingJob = async (queue, bulkUploadJobs, weekStartDate) => {
+  const conflicting = await bulkUploadJobs.findFirst({
+    where: { weekStart: weekStartDate, status: "processing" },
+  });
+
+  if (!conflicting) return null;
+
+  const queueJob = await queue.getJob(conflicting.id);
+  const state = queueJob ? await queueJob.getState() : "missing";
+
+  if (LIVE_QUEUE_STATES.has(state)) {
+    return { conflict: true, existingJobId: conflicting.id };
+  }
+
+  const completed = state === "completed";
+  const data = {
+    status: completed ? "completed" : "failed",
+    error: completed
+      ? null
+      : queueJob?.failedReason ||
+        `Queue job ${state} before the database status was updated.`,
+    completedAt: queueJob?.finishedOn
+      ? new Date(queueJob.finishedOn)
+      : new Date(),
+  };
+
+  if (completed && queueJob.returnvalue !== undefined) {
+    data.result = queueJob.returnvalue;
+  }
+
+  await bulkUploadJobs.update({ where: { id: conflicting.id }, data });
+  return null;
+};
 
 /**
  * Enqueues a bulk upload job. Call this from your upload route handler
@@ -22,11 +64,12 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
 
   const queue = ensureQueueConfigured();
 
-  // Same "one active job per week" rule the old in-memory Map enforced,
-  // now checked against the DB so it holds across restarts/instances.
-  const conflicting = await prisma.bulkUploadJob.findFirst({
-    where: { weekStart: weekStartDate, status: "processing" },
-  });
+  // A processing row only blocks uploads while its BullMQ job is still live.
+  const conflicting = await findConflictingJob(
+    queue,
+    prisma.bulkUploadJob,
+    weekStartDate,
+  );
   if (conflicting) {
     return { conflict: true, existingJobId: conflicting.id };
   }
@@ -84,9 +127,11 @@ const enqueueUpdateSchedule = async (
 
   const queue = ensureQueueConfigured();
 
-  const conflicting = await prisma.bulkUploadJob.findFirst({
-    where: { weekStart: weekStartDate, status: "processing" },
-  });
+  const conflicting = await findConflictingJob(
+    queue,
+    prisma.bulkUploadJob,
+    weekStartDate,
+  );
   if (conflicting) {
     return { conflict: true, existingJobId: conflicting.id };
   }
@@ -156,4 +201,5 @@ module.exports = {
   enqueueUpdateSchedule,
   enqueuePendingRideResync,
   getBulkUploadJobStatus,
+  findConflictingJob,
 };
