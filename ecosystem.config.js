@@ -12,8 +12,8 @@ module.exports = {
       source_map_support: false,
 
       env: {
-        NODE_ENV: "production"
-      }
+        NODE_ENV: "production",
+      },
     },
 
     {
@@ -28,8 +28,8 @@ module.exports = {
       source_map_support: false,
 
       env: {
-        NODE_ENV: "production"
-      }
-    }
-  ]
+        NODE_ENV: "production",
+      },
+    },
+  ],
 };
