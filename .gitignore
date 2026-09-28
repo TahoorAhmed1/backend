@@ -1,6 +1,5 @@
 .gitOrg
 .gitDev
-.env
-.env.development
+
 /node_modules
 .all-access-ibex.pem
