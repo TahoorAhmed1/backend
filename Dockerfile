@@ -28,9 +28,16 @@ FROM node:22-bookworm-slim AS runtime
 
 WORKDIR /app
 
+ARG REDIS_URL=""
+ARG REDIS_TLS="false"
+ARG REDIS_SSL="false"
+
 ENV NODE_ENV=production \
     NODE_OPTIONS="--no-deprecation" \
-    PORT=8000
+    PORT=8000 \
+    REDIS_URL=${REDIS_URL} \
+    REDIS_TLS=${REDIS_TLS} \
+    REDIS_SSL=${REDIS_SSL}
 
 RUN --mount=type=cache,target=/root/.npm \
     npm install -g pm2
@@ -38,7 +45,7 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app .
 
-# Fixed: COPY needs source AND destination
+# Ensure local env file is available if present in the build context.
 COPY .env .
 
 EXPOSE 8000

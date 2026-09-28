@@ -38,6 +38,15 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy to EC2
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          REDIS_TLS: ${{ secrets.REDIS_TLS || 'false' }}
+          REDIS_SSL: ${{ secrets.REDIS_SSL || 'false' }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          OTP_JWT_SECRET_KEY: ${{ secrets.OTP_JWT_SECRET_KEY }}
+          EMAIL_VERIFICATION: ${{ secrets.EMAIL_VERIFICATION }}
+          HOST: ${{ secrets.HOST }}
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -62,17 +71,26 @@ jobs:
             docker pull ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
             echo "======================================"
-            echo "Checking existing .env"
+            echo "Preparing runtime env file"
             echo "======================================"
 
-            if [ ! -f /home/${{ secrets.EC2_USER }}/backend/.env ]; then
-              echo "ERROR: .env file not found!"
-              exit 1
-            fi
+            mkdir -p /home/${{ secrets.EC2_USER }}/backend
+            cat > /home/${{ secrets.EC2_USER }}/backend/.env <<'EOF'
+            PORT=8000
+            JWT_SECRET_KEY=!!@@$$!@13212@!
+            OTP_JWT_SECRET_KEY=!!@@$$!@13212@!verify
+            EMAIL_VERIFICATION=verify-email
+            PRISMA_CLIENT_ENGINE_TYPE=accelerate
+            TEST_VAR='lIVE Mode'
+            DATABASE_URL=postgresql://neondb_owner:npg_prBitIZ1FM6g@ep-gentle-scene-ayvmssvq-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+            HOST="localhost"
+            REDIS_URL=redis://default:rHXDMYYMiscLxoYtJyBbXL6uAR8ea6L5@redis-13717.c278.us-east-1-4.ec2.cloud.redislabs.com:13717
+            WEB_CONCURRENCY=2
+            REDIS_TLS=true
+            REDIS_SSL=true
+            EOF
 
             chmod 600 /home/${{ secrets.EC2_USER }}/backend/.env
-
-            echo "Existing .env found."
 
             echo "======================================"
             echo "Stopping old container"
