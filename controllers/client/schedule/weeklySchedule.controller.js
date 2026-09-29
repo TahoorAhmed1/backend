@@ -4572,29 +4572,31 @@ const deleteAllWeeklySchedules = async (req, res, next) => {
       }
 
       // Execute all notifications concurrently
-      return Promise.allSettled(notificationJobs);
-    }).then((results) => {
-      const failed = results.filter(
-        (result) => result.status === "rejected"
-      );
+      Promise.allSettled(notificationJobs)
+        .then((results) => {
+          const failed = results.filter(
+            (result) => result.status === "rejected"
+          );
 
-      if (failed.length > 0) {
-        console.error(
-          `[deleteAllWeeklySchedules] ${failed.length} notification(s) failed`
-        );
+          if (failed.length > 0) {
+            console.error(
+              `[deleteAllWeeklySchedules] ${failed.length} notification(s) failed`
+            );
 
-        failed.forEach((failure) => {
+            failed.forEach((failure) => {
+              console.error(
+                "[deleteAllWeeklySchedules] Notification error:",
+                failure.reason
+              );
+            });
+          }
+        })
+        .catch((error) => {
           console.error(
-            "[deleteAllWeeklySchedules] Notification error:",
-            failure.reason
+            "[deleteAllWeeklySchedules] Background notification error:",
+            error
           );
         });
-      }
-    }).catch((error) => {
-      console.error(
-        "[deleteAllWeeklySchedules] Background notification error:",
-        error
-      );
     });
 
     // ---------------------------------------------------------

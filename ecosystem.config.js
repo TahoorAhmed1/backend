@@ -10,12 +10,9 @@ module.exports = {
       kill_timeout: 15 * 60 * 1000,
       listen_timeout: 15 * 60 * 1000,
       source_map_support: false,
-
-      env: {
-        NODE_ENV: "production",
-      },
+      env: { NODE_ENV: "development" },
+      env_production: { NODE_ENV: "production" },
     },
-
     {
       name: "myapp-bulk",
       script: "./worker/bulkupload.process.js",
@@ -26,10 +23,8 @@ module.exports = {
       kill_timeout: 15 * 60 * 1000,
       listen_timeout: 15 * 60 * 1000,
       source_map_support: false,
-
-      env: {
-        NODE_ENV: "production",
-      },
+      env: { NODE_ENV: "development" },
+      env_production: { NODE_ENV: "production" },
     },
   ],
 };
