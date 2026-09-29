@@ -92,6 +92,7 @@ const startBulkUploadWorker = () => {
           employeeCodeFilter?.length || 0,
       });
 
+      let terminalStatusPersisted = false;
       try {
         const workbook = XLSX.readFile(filePath);
 
@@ -122,8 +123,7 @@ const startBulkUploadWorker = () => {
             completedAt: new Date(),
           },
         });
-
-        await fs.unlink(filePath).catch(() => {});
+        terminalStatusPersisted = true;
 
         console.log(
           `[bulkUpload.worker] job ${jobId} completed`,
@@ -142,8 +142,13 @@ const startBulkUploadWorker = () => {
             completedAt: new Date(),
           },
         });
+        terminalStatusPersisted = true;
 
         throw error;
+      } finally {
+        if (terminalStatusPersisted) {
+          await fs.unlink(filePath).catch(() => {});
+        }
       }
     },
     {
@@ -259,10 +264,14 @@ const startBulkUploadWorker = () => {
             data.result = queueJob.returnvalue;
           }
 
-          await prisma.bulkUploadJob.updateMany({
+          const reconciled = await prisma.bulkUploadJob.updateMany({
             where: { id: pendingJob.id, status: "processing" },
             data,
           });
+
+          if (reconciled.count > 0 && pendingJob.filePath) {
+            await fs.unlink(pendingJob.filePath).catch(() => {});
+          }
         }
       }
     } catch (error) {
