@@ -1,58 +1,25 @@
 const { prisma } = require("../lib/prisma");
-const { ensureQueueConfigured } = require("../lib/queue");
 
 const MIN_BATCH_SIZE = 10;
 const MAX_BATCH_SIZE = 1000;
 const DEFAULT_BATCH_SIZE = 100;
-const LIVE_QUEUE_STATES = new Set([
-  "active",
-  "delayed",
-  "paused",
-  "prioritized",
-  "waiting",
-  "waiting-children",
-]);
 
-const findConflictingJob = async (queue, bulkUploadJobs, weekStartDate) => {
+const findConflictingJob = async (bulkUploadJobs, weekStartDate) => {
   const conflicting = await bulkUploadJobs.findFirst({
-    where: { weekStart: weekStartDate, status: "processing" },
+    where: {
+      weekStart: weekStartDate,
+      status: "processing",
+      jobType: "BULK_UPLOAD",
+    },
   });
 
-  if (!conflicting) return null;
-
-  const queueJob = await queue.getJob(conflicting.id);
-  const state = queueJob ? await queueJob.getState() : "missing";
-
-  if (LIVE_QUEUE_STATES.has(state)) {
-    return { conflict: true, existingJobId: conflicting.id };
-  }
-
-  const completed = state === "completed";
-  const data = {
-    status: completed ? "completed" : "failed",
-    error: completed
-      ? null
-      : queueJob?.failedReason ||
-        `Queue job ${state} before the database status was updated.`,
-    completedAt: queueJob?.finishedOn
-      ? new Date(queueJob.finishedOn)
-      : new Date(),
-  };
-
-  if (completed && queueJob.returnvalue !== undefined) {
-    data.result = queueJob.returnvalue;
-  }
-
-  await bulkUploadJobs.update({ where: { id: conflicting.id }, data });
-  return null;
+  return conflicting
+    ? { conflict: true, existingJobId: conflicting.id }
+    : null;
 };
 
 /**
- * Enqueues a bulk upload job. Call this from your upload route handler
- * with the path of the file already saved to disk (e.g. by multer) -
- * do NOT parse the workbook here and do NOT pass parsed rows into the
- * queue payload. Keeping the payload tiny is what keeps this cheap to
- * run, whether you're on a small Redis instance or, here, plain Postgres.
+ * Persists a bulk upload job for the bulk process to dispatch to BullMQ.
  *
  * Returns immediately - the actual processing happens in the worker.
  */
@@ -62,11 +29,7 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
     Math.max(MIN_BATCH_SIZE, batchSize || DEFAULT_BATCH_SIZE),
   );
 
-  const queue = ensureQueueConfigured();
-
-  // A processing row only blocks uploads while its BullMQ job is still live.
   const conflicting = await findConflictingJob(
-    queue,
     prisma.bulkUploadJob,
     weekStartDate,
   );
@@ -80,36 +43,10 @@ const enqueueBulkUpload = async (filePath, weekStartDate, batchSize = DEFAULT_BA
       filePath,
       batchSize: clampedBatchSize,
       status: "processing",
+      jobType: "BULK_UPLOAD",
+      action: "BULK_UPLOAD",
     },
   });
-
-  try {
-    // jobId as the BullMQ job id too - if enqueueBulkUpload is ever called
-    // twice with the same job.id this dedupes instead of double-queueing.
-    await queue.add(
-      "process",
-      {
-        jobId: job.id,
-        filePath,
-        weekStartDate: weekStartDate.toISOString(),
-        batchSize: clampedBatchSize,
-      },
-      { jobId: job.id },
-    );
-  } catch (error) {
-    // If we couldn't even hand the job to the queue, don't leave it stuck
-    // in "processing" forever - that would block every future upload for
-    // this week with a false 409 conflict.
-    await prisma.bulkUploadJob.update({
-      where: { id: job.id },
-      data: {
-        status: "failed",
-        error: `Failed to enqueue: ${error.message}`,
-        completedAt: new Date(),
-      },
-    });
-    throw error;
-  }
 
   return { conflict: false, jobId: job.id };
 };
@@ -125,10 +62,7 @@ const enqueueUpdateSchedule = async (
     Math.max(MIN_BATCH_SIZE, batchSize || DEFAULT_BATCH_SIZE),
   );
 
-  const queue = ensureQueueConfigured();
-
   const conflicting = await findConflictingJob(
-    queue,
     prisma.bulkUploadJob,
     weekStartDate,
   );
@@ -142,33 +76,11 @@ const enqueueUpdateSchedule = async (
       filePath,
       batchSize: clampedBatchSize,
       status: "processing",
+      jobType: "BULK_UPLOAD",
+      action: "UPDATE_SCHEDULE",
+      employeeCodeFilter,
     },
   });
-
-  try {
-    await queue.add(
-      "process",
-      {
-        jobId: job.id,
-        filePath,
-        weekStartDate: weekStartDate.toISOString(),
-        batchSize: clampedBatchSize,
-        action: "UPDATE_SCHEDULE",
-        employeeCodeFilter,
-      },
-      { jobId: job.id },
-    );
-  } catch (error) {
-    await prisma.bulkUploadJob.update({
-      where: { id: job.id },
-      data: {
-        status: "failed",
-        error: `Failed to enqueue: ${error.message}`,
-        completedAt: new Date(),
-      },
-    });
-    throw error;
-  }
 
   return { conflict: false, jobId: job.id };
 };
@@ -181,16 +93,54 @@ const getBulkUploadJobStatus = async (jobId) => {
 };
 
 const enqueuePendingRideResync = async (weekStartDate) => {
-  const queue = ensureQueueConfigured();
-  const job = await queue.add(
-    "resync-pending-rides",
-    { weekStartDate: weekStartDate.toISOString() },
-    {
-      jobId: `resync-pending-rides-${weekStartDate.toISOString().slice(0, 10)}`,
-    },
-  );
+  const dedupeKey = `resync-pending-rides-${weekStartDate
+    .toISOString()
+    .slice(0, 10)}`;
+  const existing = await prisma.bulkUploadJob.findFirst({
+    where: { dedupeKey },
+  });
 
-  return { jobId: job.id };
+  if (existing?.status === "processing") {
+    return { jobId: existing.id };
+  }
+
+  if (existing) {
+    await prisma.bulkUploadJob.updateMany({
+      where: {
+        id: existing.id,
+        status: { in: ["completed", "failed"] },
+      },
+      data: {
+        status: "processing",
+        dispatchedAt: null,
+        startedAt: new Date(),
+        completedAt: null,
+        result: null,
+        error: null,
+      },
+    });
+    return { jobId: existing.id };
+  }
+
+  try {
+    const job = await prisma.bulkUploadJob.create({
+      data: {
+        weekStart: weekStartDate,
+        status: "processing",
+        jobType: "RESYNC_PENDING_RIDES",
+        dedupeKey,
+        filePath: null,
+      },
+    });
+    return { jobId: job.id };
+  } catch (error) {
+    if (error.code !== "P2002") throw error;
+    const concurrentJob = await prisma.bulkUploadJob.findUnique({
+      where: { dedupeKey },
+    });
+    if (!concurrentJob) throw error;
+    return { jobId: concurrentJob.id };
+  }
 };
 
 module.exports = {

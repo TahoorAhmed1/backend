@@ -563,7 +563,12 @@ model BulkUploadJob {
   id               String    @id @default(cuid())
   weekStart        DateTime
   status           String    @default("processing") // processing | completed | failed
-  filePath         String
+  filePath         String?
+  jobType          String    @default("BULK_UPLOAD")
+  action           String    @default("BULK_UPLOAD")
+  employeeCodeFilter Json?
+  dispatchedAt     DateTime?
+  dedupeKey        String?   
   totalRows        Int       @default(0)
   processedRows    Int       @default(0)
   batchSize        Int       @default(100)

@@ -1355,6 +1355,8 @@ const processBulkUploadJob = async (
     if (pendingWrites.length >= 25) {
       await flushPendingWrites();
     }
+
+    await new Promise((resolve) => setImmediate(resolve));
   }
 
   console.log(

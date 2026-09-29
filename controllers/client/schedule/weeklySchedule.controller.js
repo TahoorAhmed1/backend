@@ -49,7 +49,6 @@ const {
   optimizeWeekAssignments,
 } = require("../../../services/routeOptimization.service");
 const fs = require("fs/promises");
-const os = require("os");
 const path = require("path");
 const {
   enqueueBulkUpload,
@@ -60,6 +59,19 @@ const {
   MAX_BATCH_SIZE,
   DEFAULT_BATCH_SIZE,
 } = require("../../../services/bulkupload.producer");
+
+const saveBulkUploadFile = async (prefix, buffer) => {
+  const uploadDirectory = path.resolve(
+    process.env.BULK_UPLOAD_DIR || "storage/bulk-uploads",
+  );
+  await fs.mkdir(uploadDirectory, { recursive: true });
+  const filePath = path.join(
+    uploadDirectory,
+    `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xlsx`,
+  );
+  await fs.writeFile(filePath, buffer);
+  return filePath;
+};
 
 const {
   notifyEmployeeById,
@@ -3953,11 +3965,10 @@ const updateSchedule = async (req, res, next) => {
 
     const weekStartDate = toSaturdayUtcMidnight(weekStart);
 
-    const tempFilePath = path.join(
-      os.tmpdir(),
-      `update-schedule-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xlsx`,
+    const tempFilePath = await saveBulkUploadFile(
+      "update-schedule",
+      req.file.buffer,
     );
-    await fs.writeFile(tempFilePath, req.file.buffer);
 
     let jobResult;
     try {
@@ -4035,39 +4046,10 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
       batchSize = Math.min(MAX_BATCH_SIZE, Math.max(MIN_BATCH_SIZE, parsed));
     }
 
-    let workbook;
-    try {
-      workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-    } catch (parseError) {
-      const response = badRequestResponse(
-        "Couldn't read that file as an .xlsx/.xls workbook.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    let totalRows = 0;
-    for (const sheetName of workbook.SheetNames) {
-      const sheet = workbook.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        raw: false,
-        defval: "",
-      });
-      const headerRowIndex = rows.findIndex((r) =>
-        r.some((cell) => String(cell).trim().toLowerCase() === "employee id"),
-      );
-      if (headerRowIndex === -1) continue;
-      totalRows += rows.slice(headerRowIndex + 1).filter((r) => {
-        const first = String(r[0] ?? "").trim();
-        return first.length > 0;
-      }).length;
-    }
-
-    const tempFilePath = path.join(
-      os.tmpdir(),
-      `bulk-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.xlsx`,
+    const tempFilePath = await saveBulkUploadFile(
+      "bulk-upload",
+      req.file.buffer,
     );
-    await fs.writeFile(tempFilePath, req.file.buffer);
 
     let jobResult;
     try {
@@ -4096,9 +4078,7 @@ const bulkUploadWeeklySchedule = async (req, res, next) => {
     const response = okResponse(
       {
         jobId,
-        totalRows,
         batchSize,
-        totalBatches: totalRows ? Math.ceil(totalRows / batchSize) : 0,
       },
       "Bulk upload started with capacity-aware assignment. Poll bulk-upload-status/:jobId for progress.",
     );
