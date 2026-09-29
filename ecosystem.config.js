@@ -3,6 +3,7 @@ module.exports = {
     {
       name: "myapp",
       script: "./server.js",
+      env_file: ".env",
       exec_mode: "fork",
       instances: 1,
       autorestart: true,
@@ -16,6 +17,7 @@ module.exports = {
     {
       name: "myapp-bulk",
       script: "./worker/bulkupload.process.js",
+      env_file: ".env",
       exec_mode: "fork",
       instances: 1,
       autorestart: true,

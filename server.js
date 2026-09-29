@@ -15,7 +15,7 @@ const envFile =
 
 dotenv.config({
   path: path.resolve(__dirname, envFile),
-  override: true,
+  override: false,
 });
 
 const port = Number(process.env.PORT) || 8000;

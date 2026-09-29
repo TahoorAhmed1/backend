@@ -275,7 +275,7 @@ const startBulkUploadWorker = () => {
         }
       }
     } catch (error) {
-      console.error("[bulkUpload.worker] queue polling failed:", error.message);
+      console.error("[bulkUpload.worker] queue polling failed:", error);
     } finally {
       queuePollInProgress = false;
     }

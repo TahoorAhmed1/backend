@@ -14,9 +14,9 @@ const envPath = path.resolve(__dirname, "..", envFile);
 const fallbackPath = path.resolve(__dirname, "..", ".env");
 
 if (fs.existsSync(envPath)) {
-  dotenv.config({ path: envPath, override: false });
+  dotenv.config({ path: envPath, override: true });
 } else if (fs.existsSync(fallbackPath)) {
-  dotenv.config({ path: fallbackPath, override: false });
+  dotenv.config({ path: fallbackPath, override: true });
 }
 
 console.log("[bulkUpload.process] environment:", {
