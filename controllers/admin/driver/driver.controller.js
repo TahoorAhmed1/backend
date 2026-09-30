@@ -20,6 +20,17 @@ const {
 // account deactivations, etc. — anything without one obvious recipient.
 // Sourced from the notification service so this can't silently drift
 // out of sync with the role set the service itself uses for notifyAdmins.
+
+const parsePagination = (query) => {
+  const skip = parseInt(query.skip, 10) || 0;
+  const take = parseInt(query.take, 10) || 10;
+
+  return {
+    skip: Math.max(0, skip),
+    take: Math.max(1, Math.min(take, 100)),
+  };
+};
+
 const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
 
 const getDriverFromReq = async (req) => {
@@ -1145,16 +1156,20 @@ const updateComplaint = async (req, res, next) => {
       ...(status && { status }),
     });
 
-    if (status === "DISMISSED") {
-      notifyRoles(STAFF_ROLES, {
-        title: "Complaint withdrawn",
-        body: `${driver.name} withdrew their complaint: ${complaint.title}`,
-        data: { complaintId: complaint.id, type: "COMPLAINT_DISMISSED" },
-        event: "notification-created",
-      }).catch((err) =>
-        console.error("[driver_controller] notifyRoles failed:", err),
-      );
-    }
+    notifyRoles(STAFF_ROLES, {
+      title: status === "DISMISSED" ? "Complaint withdrawn" : "Complaint updated",
+      body:
+        status === "DISMISSED"
+          ? `${driver.name} withdrew their complaint: ${complaint.title}`
+          : `${driver.name} updated their complaint: ${title?.trim() ?? complaint.title}`,
+      data: {
+        complaintId: complaint.id,
+        type: status === "DISMISSED" ? "COMPLAINT_DISMISSED" : "COMPLAINT_UPDATED",
+      },
+      event: "notification-created",
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1376,6 +1391,15 @@ const verifyLicense = async (req, res, next) => {
       });
     }
 
+    notifyRoles(STAFF_ROLES, {
+      title: "License verification submitted",
+      body: `${driver.name} submitted a license for verification.`,
+      data: { driverId: driver.id, type: "DRIVER_LICENSE_SUBMITTED" },
+      event: "notification-created",
+    }).catch((err) =>
+      console.error("[driver_controller] notifyRoles failed:", err),
+    );
+
     await prisma.auditLog.create({
       data: {
         userId: req.user?.userId ?? null,
@@ -1385,15 +1409,6 @@ const verifyLicense = async (req, res, next) => {
         after: { licenseNumber: licenseNumber?.trim() ?? driver.licenseNumber },
       },
     });
-
-    notifyRoles(STAFF_ROLES, {
-      title: "License verification submitted",
-      body: `${driver.name} submitted a license for verification.`,
-      data: { driverId: driver.id, type: "DRIVER_LICENSE_SUBMITTED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
 
     const response = okResponse(
       { driverId: driver.id, status: "PENDING_REVIEW" },

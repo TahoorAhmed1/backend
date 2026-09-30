@@ -305,16 +305,6 @@ const confirmTodayRide = async (req, res, next) => {
       },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "RIDE_PICKUP_CONFIRMATION",
-        model: "Ride",
-        recordId: ridePassenger.rideId,
-        after: { employeeId: employee.id, confirmed },
-      },
-    });
-
     const driverUserId = ridePassenger.ride?.driver?.userId;
     if (driverUserId) {
       const routeName = ridePassenger.ride?.route?.routeName ?? "today's ride";
@@ -325,6 +315,16 @@ const confirmTodayRide = async (req, res, next) => {
         event: "ride-response",
       }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
     }
+
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user?.userId ?? null,
+        action: "RIDE_PICKUP_CONFIRMATION",
+        model: "Ride",
+        recordId: ridePassenger.rideId,
+        after: { employeeId: employee.id, confirmed },
+      },
+    });
 
     const response = okResponse(
       {
@@ -482,16 +482,6 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
       },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: confirmed ? "RIDE_ACCEPTED_BY_EMPLOYEE" : "RIDE_REJECTED_BY_EMPLOYEE",
-        model: "Ride",
-        recordId: rideId,
-        after: { employeeId: employee.id, ...(reason && { reason: String(reason).trim() }) },
-      },
-    });
-
     const driverUserId = ridePassenger.ride?.driver?.userId;
     if (driverUserId) {
       const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
@@ -504,6 +494,16 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
         event: "ride-response",
       }).catch((err) => console.error("[employee_controller] notifyUser failed:", err));
     }
+
+    await prisma.auditLog.create({
+      data: {
+        userId: req.user?.userId ?? null,
+        action: confirmed ? "RIDE_ACCEPTED_BY_EMPLOYEE" : "RIDE_REJECTED_BY_EMPLOYEE",
+        model: "Ride",
+        recordId: rideId,
+        after: { employeeId: employee.id, ...(reason && { reason: String(reason).trim() }) },
+      },
+    });
 
     const response = okResponse(
       { rideId, confirmed, confirmationStatus: updated.confirmationStatus },

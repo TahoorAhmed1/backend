@@ -49,12 +49,16 @@ const sendNotificationToUser = async (
     );
   }
 
+  if (!notification) {
+    return null;
+  }
+
   const payload = {
-    id: notification?.id ?? null,
+    id: notification.id,
     title,
     body,
     data,
-    createdAt: notification?.createdAt ?? new Date(),
+    createdAt: notification.createdAt,
   };
 
   const channel = `private-user-${userId}`;

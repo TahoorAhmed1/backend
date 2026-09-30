@@ -22,9 +22,7 @@ const getNotifications = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    const skip = (parseInt(1) - 1) * parseInt(10);
-    const take = Math.min(Math.max(parseInt(10) || 10, 1), 100);
-	
+    const { skip, take } = parsePagination(req.query);
     const { status } = req.query;
     const where = {
       userId,
@@ -35,8 +33,8 @@ const getNotifications = async (req, res, next) => {
       prisma.notification.findMany({
         where,
         orderBy: { createdAt: "desc" },
-        skip: skip || 10,
-        take: skip || 10,
+        skip,
+        take,
       }),
       prisma.notification.count({ where }),
     ]);
