@@ -5,10 +5,7 @@ const { Expo } = require("expo-server-sdk");
 const expo = new Expo();
 
 /**
- * Staff roles that get notified about driver/employee schedule changes
- * (new complaints, vehicle issues, etc. already use notifyRoles directly —
- * this is specifically the "ops needs to know" role set for assignment
- * changes covered by notifyAdmins below).
+ * Staff roles that get notified about driver/employee schedule changes.
  */
 const ADMIN_NOTIFY_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
 
@@ -43,10 +40,7 @@ const sendNotificationToUser = async (
       },
     });
   } catch (err) {
-    console.error(
-      "[notificationService] Failed to persist notification:",
-      err,
-    );
+    console.error("[notificationService] Failed to persist notification:", err);
   }
 
   if (!notification) {
@@ -101,14 +95,8 @@ const getStaffUserIds = async (excludedIds = []) => {
 
 /**
  * Send an event to its normal recipient and copy it to the staff audience.
- * The internal flag prevents notifyRoles from broadcasting the same event
- * back through this helper a second time.
  */
-const notifyUser = async (
-  userId,
-  payload,
-  { notifyAdmins = true } = {},
-) => {
+const notifyUser = async (userId, payload, { notifyAdmins = true } = {}) => {
   const notification = await sendNotificationToUser(userId, payload);
 
   if (!notifyAdmins) {
@@ -145,9 +133,7 @@ const notifyUsers = async (
   );
 
   const notifications = await Promise.all(
-    uniqueIds.map((id) =>
-      notifyUser(id, payload, { notifyAdmins: false }),
-    ),
+    uniqueIds.map((id) => notifyUser(id, payload, { notifyAdmins: false })),
   );
 
   if (!notifyAdmins) {
@@ -155,6 +141,7 @@ const notifyUsers = async (
   }
 
   const staffUserIds = await getStaffUserIds(uniqueIds);
+
   const staffNotifications = await Promise.all(
     staffUserIds.map((staffUserId) =>
       sendNotificationToUser(staffUserId, payload),
@@ -165,12 +152,7 @@ const notifyUsers = async (
 };
 
 /**
- * Notify every user who holds one of the given roles
- * (e.g. ["ADMIN", "MANAGER", "DISPATCHER"]).
- *
- * Used for events that staff/dispatch need to know about but
- * that don't have a single obvious recipient — new complaints,
- * license verification submissions, account deactivations, etc.
+ * Notify every user who holds one of the given roles.
  */
 const notifyRoles = async (roles = [], payload) => {
   if (!roles.length) {
@@ -199,16 +181,13 @@ const notifyRoles = async (roles = [], payload) => {
 /**
  * Send Expo push notification.
  */
-const sendExpoPush = async (userId, { title, body, data }) => {
-  // ---------------------------------------------------------
+const sendExpoPush = async (userId, { title, body, data = {} }) => {
   // Find active device tokens
-  // ---------------------------------------------------------
   const tokens = await prisma.deviceToken.findMany({
     where: {
       userId,
       isActive: true,
     },
-
     select: {
       token: true,
     },
@@ -221,9 +200,7 @@ const sendExpoPush = async (userId, { title, body, data }) => {
     return;
   }
 
-  // ---------------------------------------------------------
-  // Validate Expo tokens
-  // ---------------------------------------------------------
+  // Validate Expo tokens and build messages
   const messages = tokens
     .filter(({ token }) => {
       const valid = Expo.isExpoPushToken(token);
@@ -236,10 +213,16 @@ const sendExpoPush = async (userId, { title, body, data }) => {
     })
     .map(({ token }) => ({
       to: token,
-      sound: "default",
+      sound: "notification.wav",
+      channelId: "alerts_v2",
+      priority: "high",
       title,
       body,
-      data,
+      data: {
+        ...data,
+        notificationSound: "notification.wav",
+        channelId: "alerts_v2",
+      },
     }));
 
   if (messages.length === 0) {
@@ -248,28 +231,35 @@ const sendExpoPush = async (userId, { title, body, data }) => {
   }
 
   console.log(
+    "[Expo] Notification configuration:",
+    JSON.stringify(
+      messages.map((message) => ({
+        to: message.to,
+        sound: message.sound,
+        channelId: message.channelId,
+        priority: message.priority,
+      })),
+      null,
+      2,
+    ),
+  );
+
+  console.log(
     `[Expo] Sending ${messages.length} push notification(s) to user ${userId}`,
   );
 
-  // ---------------------------------------------------------
   // Chunk messages
-  // ---------------------------------------------------------
   const chunks = expo.chunkPushNotifications(messages);
 
   const receiptIds = [];
   const staleTokens = [];
 
-  // ---------------------------------------------------------
   // Send messages
-  // ---------------------------------------------------------
   for (const chunk of chunks) {
     try {
       const tickets = await expo.sendPushNotificationsAsync(chunk);
 
-      console.log(
-        "[Expo] Push tickets:",
-        JSON.stringify(tickets, null, 2),
-      );
+      console.log("[Expo] Push tickets:", JSON.stringify(tickets, null, 2));
 
       tickets.forEach((ticket, index) => {
         // Accepted by Expo
@@ -294,29 +284,21 @@ const sendExpoPush = async (userId, { title, body, data }) => {
     }
   }
 
-  // ---------------------------------------------------------
   // Check Expo delivery receipts
-  // ---------------------------------------------------------
   if (receiptIds.length > 0) {
-    console.log(
-      `[Expo] Waiting for ${receiptIds.length} receipt(s)...`,
-    );
+    console.log(`[Expo] Waiting for ${receiptIds.length} receipt(s)...`);
 
     // Give Expo a short amount of time to generate receipts.
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    const receiptChunks =
-      expo.chunkPushNotificationReceiptIds(receiptIds);
+    const receiptChunks = expo.chunkPushNotificationReceiptIds(receiptIds);
 
     for (const receiptChunk of receiptChunks) {
       try {
         const receipts =
           await expo.getPushNotificationReceiptsAsync(receiptChunk);
 
-        console.log(
-          "[Expo] Push receipts:",
-          JSON.stringify(receipts, null, 2),
-        );
+        console.log("[Expo] Push receipts:", JSON.stringify(receipts, null, 2));
 
         for (const [receiptId, receipt] of Object.entries(receipts)) {
           if (receipt.status === "ok") {
@@ -332,21 +314,16 @@ const sendExpoPush = async (userId, { title, body, data }) => {
           );
 
           if (receipt.details?.error === "DeviceNotRegistered") {
-            console.warn(
-              `[Expo] DeviceNotRegistered for receipt ${receiptId}`,
-            );
+            console.warn(`[Expo] DeviceNotRegistered for receipt ${receiptId}`);
           }
         }
       } catch (error) {
-        console.error(
-          "[Expo] Failed to retrieve push receipts:",
-          error,
-        );
+        console.error("[Expo] Failed to retrieve push receipts:", error);
       }
     }
   }
 
-
+  // Deactivate stale device tokens
   if (staleTokens.length > 0) {
     await prisma.deviceToken.updateMany({
       where: {
@@ -354,7 +331,6 @@ const sendExpoPush = async (userId, { title, body, data }) => {
           in: staleTokens,
         },
       },
-
       data: {
         isActive: false,
       },
@@ -367,7 +343,6 @@ const sendExpoPush = async (userId, { title, body, data }) => {
 
   console.log(`[Expo] Push processing completed for user ${userId}`);
 };
-
 
 const notifyDriverById = async (driverId, payload, options = {}) => {
   if (!driverId) return null;
@@ -387,7 +362,6 @@ const notifyDriverById = async (driverId, payload, options = {}) => {
   return notifyUser(driver.userId, payload, options);
 };
 
-
 const notifyEmployeeById = async (employeeId, payload, options = {}) => {
   if (!employeeId) return null;
 
@@ -405,7 +379,6 @@ const notifyEmployeeById = async (employeeId, payload, options = {}) => {
 
   return notifyUser(employee.userId, payload, options);
 };
-
 
 const notifyAdmins = (payload) => notifyRoles(ADMIN_NOTIFY_ROLES, payload);
 
