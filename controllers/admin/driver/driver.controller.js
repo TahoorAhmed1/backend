@@ -837,6 +837,21 @@ const markAttendance = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    const rideDate = startOfDay(ride.rideDate);
+    const existingAttendance = await prisma.attendance.findUnique({
+      where: {
+        employeeId_rideDate: { employeeId: resolvedEmployeeId, rideDate },
+      },
+      include: { employee: { select: { id: true, name: true, userId: true } } },
+    });
+    if (existingAttendance?.rideId === ride.id) {
+      const response = okResponse(
+        existingAttendance,
+        "Attendance was already marked for this passenger.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
     const { error, attendance } = await upsertAttendanceForEmployee({
       ride,
       employeeId: resolvedEmployeeId,
