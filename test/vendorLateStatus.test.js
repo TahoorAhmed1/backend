@@ -15,20 +15,20 @@ test("normalizeVendorLateStatus handles all vendor statuses", () => {
 });
 
 test("operator status stays authoritative and cannot be auto-rewritten from service type", () => {
-  assert.equal(calculateVendorLateStatus("LATE", null, null), "LATE");
-  assert.equal(calculateVendorLateStatus("On Time", null, null), "ON_TIME");
-  assert.equal(calculateVendorLateStatus("DROP_ONLY", null, null), "UNCLASSIFIED");
-  assert.equal(calculateVendorLateStatus("only drop", null, null), "ONLY_DROP");
+  assert.equal(calculateVendorLateStatus("LATE", null, null).status, "LATE");
+  assert.equal(calculateVendorLateStatus("On Time", null, null).status, "ON_TIME");
+  assert.equal(calculateVendorLateStatus("DROP_ONLY", null, null).status, "UNCLASSIFIED");
+  assert.equal(calculateVendorLateStatus("only drop", null, null).status, "ONLY_DROP");
 });
 
 test("positive delay and blank delay produce warnings without changing status", () => {
   const onTime = calculateVendorLateStatus({ status: "On Time", delayMinutes: 15 }, null, null);
-  assert.equal(onTime, "ON_TIME");
-  assert.ok(calculateVendorLateStatus.lastResult.warnings.length > 0);
+  assert.equal(onTime.status, "ON_TIME");
+  assert.ok(onTime.warnings.length > 0);
 
   const late = calculateVendorLateStatus({ status: "LATE", delayMinutes: null }, null, null);
-  assert.equal(late, "LATE");
-  assert.ok(calculateVendorLateStatus.lastResult.warnings.length > 0);
+  assert.equal(late.status, "LATE");
+  assert.ok(late.warnings.length > 0);
 });
 
 test("summary matches the required totals model", () => {

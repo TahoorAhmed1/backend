@@ -11,7 +11,7 @@ const normalizeVendorLateStatus = (input) => {
     return "UNCLASSIFIED";
   }
 
-  let candidate = input;
+  let candidate = input;  
 
   if (typeof input === "object") {
     /*
@@ -154,15 +154,11 @@ const calculateVendorLateStatus = (
     delayMinutes
   );
 
-  const result = {
+  return {
     status,
     delayMinutes,
     warnings,
   };
-
-  calculateVendorLateStatus.lastResult = result;
-
-  return status;
 };
 
 const buildVendorValidationSummary = (records = []) => {
