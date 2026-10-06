@@ -392,6 +392,10 @@ const rideCreateSchema = Joi.object({
     vehicleId: Joi.string().uuid().optional().allow(null, ""),
     vendorId: Joi.string().uuid().optional().allow(null, ""),
     areaId: Joi.string().uuid().optional().allow(null, ""),
+    serviceType: Joi.string()
+      .optional()
+      .default("PICK_AND_DROP")
+      .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
     pickupTime: Joi.string().optional().allow(null, ""),
     dropTime: Joi.string().optional().allow(null, ""),
     employeeId: Joi.string().uuid().optional().allow(null, ""),
@@ -414,6 +418,9 @@ const rideUpdateSchema = Joi.object({
     vehicleId: Joi.string().uuid().optional().allow(null, ""),
     vendorId: Joi.string().uuid().optional().allow(null, ""),
     areaId: Joi.string().uuid().optional().allow(null, ""),
+    serviceType: Joi.string()
+      .optional()
+      .valid("PICK_AND_DROP", "DROP_ONLY", "PICK_ONLY"),
     pickupTime: Joi.string().optional().allow(null, ""),
     dropTime: Joi.string().optional().allow(null, ""),
     employeeId: Joi.string().uuid().optional().allow(null, ""),
@@ -430,12 +437,16 @@ const attendanceCreateSchema = Joi.object({
     rideDate: Joi.date().required(),
     employeeId: Joi.string().uuid().required(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
+    leg: Joi.string().optional().valid("PICKUP", "DROP").default("PICKUP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
       .optional()
       .default("PRESENT")
       .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW"),
+    vendorLateStatus: Joi.string()
+      .optional()
+      .valid("ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"),
   }),
 });
 
@@ -447,11 +458,15 @@ const attendanceScanSchema = Joi.object({
     driverQrCode: Joi.string().required(),
     rideDate: Joi.date().required(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
+    leg: Joi.string().optional().valid("PICKUP", "DROP").default("PICKUP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
       .optional()
       .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW"),
+    vendorLateStatus: Joi.string()
+      .optional()
+      .valid("ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"),
   }),
 });
 
@@ -464,11 +479,15 @@ const attendanceUpdateSchema = Joi.object({
     rideDate: Joi.date().optional(),
     employeeId: Joi.string().uuid().optional(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
+    leg: Joi.string().optional().valid("PICKUP", "DROP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
       .optional()
       .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW"),
+    vendorLateStatus: Joi.string()
+      .optional()
+      .valid("ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"),
   }),
 });
 
@@ -659,6 +678,11 @@ const markAttendanceSchema = Joi.object({
     status: Joi.string()
       .valid("PRESENT", "LATE", "ABSENT", "NO_SHOW")
       .default("PRESENT"),
+    vendorLateStatus: Joi.string()
+      .valid("ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED")
+      .allow(null, ""),
+    delayMinutes: Joi.number().integer().min(0).allow(null, ""),
+    leg: Joi.string().valid("PICKUP", "DROP").default("PICKUP"),
   })
     .or("employeeId", "qrCode")
     .messages({
