@@ -1,11 +1,5 @@
 const { prisma } = require("../../../lib/prisma");
-const {
-  createRecord,
-  getRecords,
-  getRecordById,
-  updateRecord,
-  deleteRecord,
-} = require("../../../utils/crudHelper");
+
 const {
   badRequestResponse,
   okResponse,
