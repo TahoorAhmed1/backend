@@ -7,6 +7,10 @@ const {
   deleteRecord,
 } = require("../../../utils/crudHelper");
 const {
+  normalizeVendorLateStatus,
+  calculateVendorLateStatus,
+} = require("../../../utils/vendorLateStatus");
+const {
   badRequestResponse,
   okResponse,
   createSuccessResponse,
@@ -63,9 +67,17 @@ function formatDateForResponse(value) {
 
 const createAttendance = async (req, res, next) => {
   try {
-    const { rideDate, employeeId, rideId, arrivalTime, delayMinutes, status } = req.body;
+    const {
+      rideDate,
+      employeeId,
+      rideId,
+      arrivalTime,
+      delayMinutes,
+      status,
+      leg,
+      vendorLateStatus,
+    } = req.body;
 
-    // Validate required fields
     if (!rideDate) {
       const response = badRequestResponse("Ride date is required.");
       return res.status(response.status.code).json(response);
@@ -76,40 +88,65 @@ const createAttendance = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // Validate employee exists
     const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
     if (!employee) {
       const response = badRequestResponse("Employee not found.");
       return res.status(response.status.code).json(response);
     }
 
-    const attendanceDate = new Date(rideDate);
+    if (rideId && !(await prisma.ride.findUnique({ where: { id: rideId } }))) {
+      const response = badRequestResponse("Ride not found.");
+      return res.status(response.status.code).json(response);
+    }
 
-    // Check for existing record
-    const existingRecord = await prisma.attendance.findUnique({
+    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    const delayValue = delayMinutes === "" || delayMinutes === null || delayMinutes === undefined ? null : Number(delayMinutes);
+
+    if (delayValue !== null && Number.isNaN(delayValue)) {
+      const response = badRequestResponse("Delay minutes must be a valid number.");
+      return res.status(response.status.code).json(response);
+    }
+
+    if (delayValue !== null && delayValue < 0) {
+      const response = badRequestResponse("Delay minutes cannot be negative.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const attendanceDate = new Date(rideDate);
+    const existingRecord = await prisma.attendance.findFirst({
       where: {
-        employeeId_rideDate: {
-          employeeId,
-          rideDate: attendanceDate,
-        },
+        employeeId,
+        rideDate: attendanceDate,
+        leg: normalizedLeg,
       },
     });
 
     if (existingRecord) {
       const response = badRequestResponse(
-        "Attendance record already exists for this employee on this date.",
+        "Attendance record already exists for this employee on this date and leg.",
       );
       return res.status(response.status.code).json(response);
     }
+
+    const nextVendorLateStatus = calculateVendorLateStatus(
+      {
+        status: vendorLateStatus ?? status,
+        delayMinutes: delayValue,
+      },
+      null,
+      null,
+    );
 
     const attendance = await prisma.attendance.create({
       data: {
         rideDate: attendanceDate,
         employeeId,
         rideId: rideId || null,
+        leg: normalizedLeg,
         arrivalTime: arrivalTime ? new Date(arrivalTime) : null,
-        delayMinutes: delayMinutes ?? null,
+        delayMinutes: delayValue,
         status: status || "PRESENT",
+        vendorLateStatus: nextVendorLateStatus,
       },
       include: {
         employee: {
@@ -150,9 +187,10 @@ const scanAttendanceByQrCode = async (req, res, next) => {
       arrivalTime,
       delayMinutes,
       status,
+      leg,
+      vendorLateStatus,
     } = req.body;
 
-    // Validate required fields
     if (!employeeId) {
       const response = badRequestResponse("Employee ID is required.");
       return res.status(response.status.code).json(response);
@@ -168,7 +206,6 @@ const scanAttendanceByQrCode = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // Find driver by QR code
     const driverUser = await prisma.user.findUnique({
       where: { qrCode: driverQrCode },
       include: { driver: true },
@@ -179,40 +216,60 @@ const scanAttendanceByQrCode = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
-    // Validate employee exists
     const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
     if (!employee) {
       const response = badRequestResponse("Employee not found.");
       return res.status(response.status.code).json(response);
     }
 
-    const attendanceDate = new Date(rideDate);
+    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    const delayValue = delayMinutes === "" || delayMinutes === null || delayMinutes === undefined ? null : Number(delayMinutes);
 
-    // Check for existing record
-    const existingRecord = await prisma.attendance.findUnique({
+    if (delayValue !== null && Number.isNaN(delayValue)) {
+      const response = badRequestResponse("Delay minutes must be a valid number.");
+      return res.status(response.status.code).json(response);
+    }
+
+    if (delayValue !== null && delayValue < 0) {
+      const response = badRequestResponse("Delay minutes cannot be negative.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const attendanceDate = new Date(rideDate);
+    const existingRecord = await prisma.attendance.findFirst({
       where: {
-        employeeId_rideDate: {
-          employeeId,
-          rideDate: attendanceDate,
-        },
+        employeeId,
+        rideDate: attendanceDate,
+        leg: normalizedLeg,
       },
     });
 
     if (existingRecord) {
       const response = badRequestResponse(
-        "Attendance record already exists for this employee on this date.",
+        "Attendance record already exists for this employee on this date and leg.",
       );
       return res.status(response.status.code).json(response);
     }
+
+    const nextVendorLateStatus = calculateVendorLateStatus(
+      {
+        status: vendorLateStatus ?? status,
+        delayMinutes: delayValue,
+      },
+      null,
+      null,
+    );
 
     const attendance = await prisma.attendance.create({
       data: {
         rideDate: attendanceDate,
         employeeId,
         rideId: rideId || null,
+        leg: normalizedLeg,
         arrivalTime: arrivalTime ? new Date(arrivalTime) : new Date(),
-        delayMinutes: delayMinutes ?? null,
-        status: status || (delayMinutes ? "LATE" : "PRESENT"),
+        delayMinutes: delayValue,
+        status: status || (delayValue > 0 ? "LATE" : "PRESENT"),
+        vendorLateStatus: nextVendorLateStatus,
       },
       include: {
         employee: {
@@ -474,7 +531,7 @@ const getAttendanceById = async (req, res, next) => {
 const updateAttendance = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { arrivalTime, delayMinutes, status, rideId } = req.body;
+    const { arrivalTime, delayMinutes, status, rideId, leg, vendorLateStatus } = req.body;
 
     const attendance = await prisma.attendance.findUnique({ where: { id } });
     if (!attendance) {
@@ -484,9 +541,31 @@ const updateAttendance = async (req, res, next) => {
 
     const updateData = {};
     if (arrivalTime) updateData.arrivalTime = new Date(arrivalTime);
-    if (delayMinutes !== undefined) updateData.delayMinutes = delayMinutes;
+    if (delayMinutes !== undefined) {
+      const parsedDelay = delayMinutes === "" || delayMinutes === null ? null : Number(delayMinutes);
+      if (parsedDelay !== null && Number.isNaN(parsedDelay)) {
+        const response = badRequestResponse("Delay minutes must be a valid number.");
+        return res.status(response.status.code).json(response);
+      }
+      if (parsedDelay !== null && parsedDelay < 0) {
+        const response = badRequestResponse("Delay minutes cannot be negative.");
+        return res.status(response.status.code).json(response);
+      }
+      updateData.delayMinutes = parsedDelay;
+    }
     if (status) updateData.status = status;
     if (rideId) updateData.rideId = rideId;
+    if (leg) updateData.leg = leg === "DROP" ? "DROP" : "PICKUP";
+
+    const nextVendorLateStatus = calculateVendorLateStatus(
+      {
+        status: vendorLateStatus ?? status ?? attendance.vendorLateStatus,
+        delayMinutes: updateData.delayMinutes ?? attendance.delayMinutes,
+      },
+      null,
+      null,
+    );
+    updateData.vendorLateStatus = nextVendorLateStatus;
 
     const updatedAttendance = await prisma.attendance.update({
       where: { id },

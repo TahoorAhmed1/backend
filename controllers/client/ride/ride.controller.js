@@ -77,6 +77,7 @@ const createRide = async (req, res, next) => {
       officeArrivalTime,
       dropTime,
       status,
+      serviceType,
     } = req.body;
 
     // Validate required fields
@@ -115,16 +116,20 @@ const createRide = async (req, res, next) => {
       }
     }
 
+    const resolvedVendorId = vendorId || route.vendorId || null;
+    const resolvedServiceType = serviceType || route.serviceType || "PICK_AND_DROP";
+
     const ride = await prisma.ride.create({
       data: {
         rideDate: new Date(rideDate),
         routeId,
         driverId: driverId || null,
         vehicleId: vehicleId || null,
-        vendorId: vendorId || null,
+        vendorId: resolvedVendorId,
         areaId: areaId || null,
         subAreaId: subAreaId || null,
         tripId: tripId || null,
+        serviceType: resolvedServiceType,
         pickupTime: pickupTime ? new Date(pickupTime) : null,
         officeArrivalTime: officeArrivalTime ? new Date(officeArrivalTime) : null,
         dropTime: dropTime ? new Date(dropTime) : null,

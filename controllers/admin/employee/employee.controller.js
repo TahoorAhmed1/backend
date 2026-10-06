@@ -24,24 +24,51 @@ const getEmployeeFromReq = async (req) => {
   return prisma.employee.findUnique({ where: { userId } });
 };
 
+const toKarachiDateParts = (date = new Date()) => {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Karachi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const parts = formatter.formatToParts(new Date(date));
+  const lookup = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+
+  return {
+    year: Number(lookup.year),
+    month: Number(lookup.month),
+    day: Number(lookup.day),
+  };
+};
+
 const startOfDay = (date = new Date()) => {
-  const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+  const { year, month, day } = toKarachiDateParts(date);
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+05:00`);
 };
 
 const endOfDay = (date = new Date()) => {
-  const d = new Date(date);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
+  const { year, month, day } = toKarachiDateParts(date);
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T23:59:59.999+05:00`);
 };
 
-// Saturday as week start
+// Saturday as week start in Asia/Karachi operational time
 const saturdayOf = (date = new Date()) => {
   const d = new Date(date);
-  const day = d.getUTCDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-  
-  const diff = day === 6 ? 0 : -(day + 1);
-  
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + diff, 0, 0, 0, 0));
+  const karachiWeekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Karachi",
+    weekday: "short",
+  }).format(d);
+  const karachiDayIndex = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(karachiWeekday);
+
+  const diff = karachiDayIndex === 6 ? 0 : -(karachiDayIndex + 1);
+  const weekStart = new Date(d);
+  weekStart.setDate(d.getDate() + diff);
+  return startOfDay(weekStart);
 };
 
 const LATE_GRACE_MINUTES = 10;
@@ -418,7 +445,7 @@ const getRideDetails = async (req, res, next) => {
     }
 
     const ridePassenger = await prisma.ridePassenger.findUnique({
-      where: { rideId_employeeId: { rideId: req.params.id, employeeId: employee.id } },
+      where: { rideId_employeeId_leg: { rideId: req.params.id, employeeId: employee.id, leg: "PICKUP" } },
       include: {
         ride: {
           include: {
@@ -459,7 +486,7 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
     }
 
     const ridePassenger = await prisma.ridePassenger.findUnique({
-      where: { rideId_employeeId: { rideId, employeeId: employee.id } },
+      where: { rideId_employeeId_leg: { rideId, employeeId: employee.id, leg: "PICKUP" } },
       include: {
         ride: {
           select: {
@@ -769,7 +796,7 @@ const markAttendanceByQr = async (req, res, next) => {
     }
 
     const passenger = await prisma.ridePassenger.findUnique({
-      where: { rideId_employeeId: { rideId: ride.id, employeeId: employee.id } },
+      where: { rideId_employeeId_leg: { rideId: ride.id, employeeId: employee.id, leg: "PICKUP" } },
     });
     if (!passenger) {
       const errorResponse = badRequestResponse(
@@ -782,10 +809,11 @@ const markAttendanceByQr = async (req, res, next) => {
     const status = computeArrivalStatus(ride.pickupTime, now);
     const rideDate = startOfDay(ride.rideDate);
 
+    const leg = "PICKUP";
     const attendance = await prisma.attendance.upsert({
-      where: { employeeId_rideDate: { employeeId: employee.id, rideDate } },
+      where: { employeeId_rideDate_leg: { employeeId: employee.id, rideDate, leg } },
       update: { status, rideId: ride.id, arrivalTime: now },
-      create: { employeeId: employee.id, rideId: ride.id, rideDate, status, arrivalTime: now },
+      create: { employeeId: employee.id, rideId: ride.id, rideDate, leg, status, arrivalTime: now },
     });
 
     // scannedUser IS the driver's user account (that's what the QR encodes),
@@ -865,15 +893,17 @@ const markMyAttendance = async (req, res, next) => {
     const ridePassenger = ridePassengers[0];
     const rideDate = startOfDay();
 
+    const leg = "PICKUP";
     const attendance = await prisma.attendance.upsert({
       where: {
-        employeeId_rideDate: { employeeId: employee.id, rideDate },
+        employeeId_rideDate_leg: { employeeId: employee.id, rideDate, leg },
       },
       update: { status, rideId: ridePassenger.rideId, arrivalTime: new Date() },
       create: {
         employeeId: employee.id,
         rideId: ridePassenger.rideId,
         rideDate,
+        leg,
         status,
         arrivalTime: new Date(),
       },

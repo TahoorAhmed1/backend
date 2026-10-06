@@ -15,6 +15,9 @@ const {
   notifyRoles,
   ADMIN_NOTIFY_ROLES,
 } = require("../../../services/notification.service");
+const {
+  normalizeVendorLateStatus,
+} = require("../../../utils/vendorLateStatus");
 
 // Roles that should be told about complaints, license submissions,
 // account deactivations, etc. — anything without one obvious recipient.
@@ -39,26 +42,36 @@ const getDriverFromReq = async (req) => {
   return prisma.driver.findUnique({ where: { userId } });
 };
 
-const startOfDay = (date = new Date()) => {
-  const d = new Date(date);
-  return new Date(
-    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0),
+const toKarachiDateParts = (date = new Date()) => {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Karachi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+
+  const parts = formatter.formatToParts(new Date(date));
+  const lookup = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
   );
+
+  return {
+    year: Number(lookup.year),
+    month: Number(lookup.month),
+    day: Number(lookup.day),
+  };
+};
+
+const startOfDay = (date = new Date()) => {
+  const { year, month, day } = toKarachiDateParts(date);
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+05:00`);
 };
 
 const endOfDay = (date = new Date()) => {
-  const d = new Date(date);
-  return new Date(
-    Date.UTC(
-      d.getUTCFullYear(),
-      d.getUTCMonth(),
-      d.getUTCDate(),
-      23,
-      59,
-      59,
-      999,
-    ),
-  );
+  const { year, month, day } = toKarachiDateParts(date);
+  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T23:59:59.999+05:00`);
 };
 
 const getMyProfile = async (req, res, next) => {
@@ -536,7 +549,7 @@ const completeRide = async (req, res, next) => {
         passengers: {
           include: { employee: { select: { id: true, name: true } } },
         },
-        attendances: { select: { employeeId: true } },
+        attendances: { select: { employeeId: true, leg: true } },
       },
     });
     if (!ride || ride.driverId !== driver.id) {
@@ -544,11 +557,11 @@ const completeRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const resolvedEmployeeIds = new Set(
-      ride.attendances.map((a) => a.employeeId),
+    const resolvedAttendanceKeys = new Set(
+      ride.attendances.map((a) => `${a.employeeId}:${a.leg || "PICKUP"}`),
     );
     const pendingPassengers = ride.passengers.filter(
-      (p) => !resolvedEmployeeIds.has(p.employee.id),
+      (p) => !resolvedAttendanceKeys.has(`${p.employeeId}:${p.leg || "PICKUP"}`),
     );
 
     if (pendingPassengers.length > 0) {
@@ -682,7 +695,13 @@ const getRideStops = async (req, res, next) => {
           },
         },
         attendances: {
-          select: { employeeId: true, status: true },
+          select: {
+            employeeId: true,
+            leg: true,
+            status: true,
+            vendorLateStatus: true,
+            delayMinutes: true,
+          },
         },
       },
     });
@@ -692,19 +711,27 @@ const getRideStops = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const attendanceByEmployee = Object.fromEntries(
-      ride.attendances.map((a) => [a.employeeId, a.status]),
+    const attendanceByEmployeeLeg = Object.fromEntries(
+      ride.attendances.map((a) => [`${a.employeeId}:${a.leg || "PICKUP"}`, a]),
     );
 
-    const passengerStops = ride.passengers.map((p) => ({
-      kind: "passenger",
-      employeeId: p.employee.id,
-      employeeName: p.employee.name,
-      contact: p.contact || p.employee.contactNumber,
-      address: p.address || p.employee.address,
-      areaName: p.employee.area?.name ?? null,
-      status: attendanceByEmployee[p.employee.id] || "PENDING",
-    }));
+    const passengerStops = ride.passengers.map((p) => {
+      const leg = p.leg || "PICKUP";
+      const attendance = attendanceByEmployeeLeg[`${p.employeeId}:${leg}`];
+
+      return {
+        kind: "passenger",
+        employeeId: p.employee.id,
+        employeeName: p.employee.name,
+        leg,
+        contact: p.contact || p.employee.contactNumber,
+        address: p.address || p.employee.address,
+        areaName: p.employee.area?.name ?? null,
+        status: attendance?.status || "PENDING",
+        vendorLateStatus: attendance?.vendorLateStatus || "UNCLASSIFIED",
+        delayMinutes: attendance?.delayMinutes ?? null,
+      };
+    });
 
     const response = okResponse(
       { rideId: ride.id, stops: passengerStops },
@@ -743,25 +770,78 @@ function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
     : "PRESENT";
 }
 
-const upsertAttendanceForEmployee = async ({ ride, employeeId, status }) => {
+const upsertAttendanceForEmployee = async ({
+  ride,
+  employeeId,
+  status,
+  vendorLateStatus,
+  delayMinutes,
+  leg = "PICKUP",
+}) => {
+  const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+
   const passenger = await prisma.ridePassenger.findUnique({
-    where: { rideId_employeeId: { rideId: ride.id, employeeId } },
+    where: {
+      rideId_employeeId_leg: {
+        rideId: ride.id,
+        employeeId,
+        leg: normalizedLeg,
+      },
+    },
   });
   if (!passenger) {
     return { error: badRequestResponse("This passenger is not on this ride.") };
   }
 
+  const delayValue =
+    delayMinutes === "" || delayMinutes === null || delayMinutes === undefined
+      ? null
+      : Number(delayMinutes);
+
+  if (delayValue !== null && Number.isNaN(delayValue)) {
+    return {
+      error: badRequestResponse("Delay minutes must be a valid number."),
+    };
+  }
+
+  if (delayValue !== null && delayValue < 0) {
+    return {
+      error: badRequestResponse("Delay minutes cannot be negative."),
+    };
+  }
+
+  const normalizedVendorLateStatus =
+    vendorLateStatus === undefined || vendorLateStatus === null || vendorLateStatus === ""
+      ? "UNCLASSIFIED"
+      : normalizeVendorLateStatus(vendorLateStatus);
+
   const rideDate = startOfDay(ride.rideDate);
 
   const attendance = await prisma.attendance.upsert({
-    where: { employeeId_rideDate: { employeeId, rideDate } },
-    update: { status, rideId: ride.id, arrivalTime: new Date() },
+    where: {
+      employeeId_rideDate_leg: {
+        employeeId,
+        rideDate,
+        leg: normalizedLeg,
+      },
+    },
+    update: {
+      status,
+      rideId: ride.id,
+      arrivalTime: new Date(),
+      leg: normalizedLeg,
+      vendorLateStatus: normalizedVendorLateStatus,
+      delayMinutes: delayValue,
+    },
     create: {
       employeeId,
       rideId: ride.id,
       rideDate,
+      leg: normalizedLeg,
       status,
       arrivalTime: new Date(),
+      vendorLateStatus: normalizedVendorLateStatus,
+      delayMinutes: delayValue,
     },
     include: { employee: { select: { id: true, name: true, userId: true } } },
   });
@@ -797,10 +877,29 @@ const markAttendance = async (req, res, next) => {
     }
 
     const { id: rideId } = req.params;
-    const { employeeId, qrCode, status: explicitStatus } = req.body;
+    const {
+      employeeId,
+      qrCode,
+      status: explicitStatus,
+      vendorLateStatus,
+      delayMinutes,
+      leg,
+    } = req.body;
 
     if (explicitStatus && !ATTENDANCE_STATUSES.includes(explicitStatus)) {
       const errorResponse = badRequestResponse("Invalid attendance status.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      vendorLateStatus !== undefined &&
+      vendorLateStatus !== null &&
+      vendorLateStatus !== "" &&
+      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
+        normalizeVendorLateStatus(vendorLateStatus),
+      )
+    ) {
+      const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -820,6 +919,7 @@ const markAttendance = async (req, res, next) => {
     }
 
     const status = explicitStatus ?? computeArrivalStatus(ride.pickupTime);
+    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
 
     let resolvedEmployeeId = employeeId;
     if (!resolvedEmployeeId && qrCode) {
@@ -838,9 +938,11 @@ const markAttendance = async (req, res, next) => {
     }
 
     const rideDate = startOfDay(ride.rideDate);
-    const existingAttendance = await prisma.attendance.findUnique({
+    const existingAttendance = await prisma.attendance.findFirst({
       where: {
-        employeeId_rideDate: { employeeId: resolvedEmployeeId, rideDate },
+        employeeId: resolvedEmployeeId,
+        rideDate,
+        leg: normalizedLeg,
       },
       include: { employee: { select: { id: true, name: true, userId: true } } },
     });
@@ -856,6 +958,9 @@ const markAttendance = async (req, res, next) => {
       ride,
       employeeId: resolvedEmployeeId,
       status,
+      vendorLateStatus,
+      delayMinutes,
+      leg: normalizedLeg,
     });
     if (error) return res.status(error.status.code).json(error);
 
@@ -922,10 +1027,22 @@ const updateStopStatus = async (req, res, next) => {
     }
 
     const { id: rideId, stopId: employeeId } = req.params;
-    const { status } = req.body;
+    const { status, vendorLateStatus, delayMinutes, leg } = req.body;
 
     if (!ATTENDANCE_STATUSES.includes(status)) {
       const errorResponse = badRequestResponse("Invalid attendance status.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      vendorLateStatus !== undefined &&
+      vendorLateStatus !== null &&
+      vendorLateStatus !== "" &&
+      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
+        normalizeVendorLateStatus(vendorLateStatus),
+      )
+    ) {
+      const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -948,6 +1065,9 @@ const updateStopStatus = async (req, res, next) => {
       ride,
       employeeId,
       status,
+      vendorLateStatus,
+      delayMinutes,
+      leg,
     });
     if (error) return res.status(error.status.code).json(error);
 
@@ -972,10 +1092,22 @@ const updateAttendance = async (req, res, next) => {
     }
 
     const { id: rideId, employeeId } = req.params;
-    const { status } = req.body;
+    const { status, vendorLateStatus, delayMinutes, leg } = req.body;
 
     if (!ATTENDANCE_STATUSES.includes(status)) {
       const errorResponse = badRequestResponse("Invalid attendance status.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      vendorLateStatus !== undefined &&
+      vendorLateStatus !== null &&
+      vendorLateStatus !== "" &&
+      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
+        normalizeVendorLateStatus(vendorLateStatus),
+      )
+    ) {
+      const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -989,6 +1121,9 @@ const updateAttendance = async (req, res, next) => {
       ride,
       employeeId,
       status,
+      vendorLateStatus,
+      delayMinutes,
+      leg,
     });
     if (error) return res.status(error.status.code).json(error);
 
