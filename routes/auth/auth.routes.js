@@ -19,7 +19,13 @@ const {
 
 router.post("/login", validateRequest(userLoginSchema), login);
 
-router.post("/register", validateRequest(userRegisterSchema), registerUser);
+router.post(
+  "/register",
+  verifyUserByToken,
+  requireRole("ADMIN"),
+  validateRequest(userRegisterSchema),
+  registerUser
+);
 
 router.get("/me", verifyUserByToken, getMe);
 

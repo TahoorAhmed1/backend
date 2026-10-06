@@ -614,6 +614,39 @@ const getEmployeeComplaints = async (req, res, next) => {
   }
 };
 
+const bulkUpdateEmployeeStatus = async (req, res, next) => {
+  try {
+    const { ids, status } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      const response = badRequestResponse("ids must be a non-empty array.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const validStatuses = ["ACTIVE", "INACTIVE", "TERMINATED"];
+    if (!status || !validStatuses.includes(status)) {
+      const response = badRequestResponse(
+        `Invalid status. Must be one of: ${validStatuses.join(", ")}`
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const result = await prisma.employee.updateMany({
+      where: { id: { in: ids } },
+      data: { status },
+    });
+
+    return res.status(200).json(
+      okResponse({
+        updatedCount: result.count,
+        message: `Successfully updated ${result.count} employees to status '${status}'.`,
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createEmployee,
   getAllEmployees,
@@ -623,4 +656,5 @@ module.exports = {
   getEmployeeSchedule,
   getEmployeeAttendance,
   getEmployeeComplaints,
+  bulkUpdateEmployeeStatus,
 };

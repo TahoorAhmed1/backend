@@ -15,12 +15,14 @@ const {
   getEmployeeSchedule,
   getEmployeeAttendance,
   getEmployeeComplaints,
+  bulkUpdateEmployeeStatus,
 } = require("../../../controllers/client/employee/employee.controller");
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
 const requireRole = require("../../../utils/requirerole");
 
 router.use(verifyUserByToken, requireRole("ADMIN"));
 
+router.post("/bulk-status", bulkUpdateEmployeeStatus);
 router.post("/", validateRequest(employeeCreateSchema), createEmployee);
 
 router.get("/", getAllEmployees);

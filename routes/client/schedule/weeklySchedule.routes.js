@@ -1,6 +1,12 @@
 const express = require("express");
 const router = express.Router();
 
+const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
+const requireRole = require("../../../utils/requirerole");
+
+// Protect all schedule management endpoints
+router.use(verifyUserByToken, requireRole("ADMIN"));
+
 const {
   createWeeklySchedule,
   getAllWeeklySchedules,
