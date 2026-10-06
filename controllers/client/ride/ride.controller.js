@@ -98,25 +98,37 @@ const createRide = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
+    let driverVendorId = null;
+    let vehicleVendorId = null;
+
     // Validate driver if provided
     if (driverId) {
-      const driver = await prisma.driver.findUnique({ where: { id: driverId } });
+      const driver = await prisma.driver.findUnique({
+        where: { id: driverId },
+        select: { id: true, vendorId: true },
+      });
       if (!driver) {
         const response = badRequestResponse("Driver not found.");
         return res.status(response.status.code).json(response);
       }
+      driverVendorId = driver.vendorId;
     }
 
     // Validate vehicle if provided
     if (vehicleId) {
-      const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
+      const vehicle = await prisma.vehicle.findUnique({
+        where: { id: vehicleId },
+        select: { id: true, vendorId: true },
+      });
       if (!vehicle) {
         const response = badRequestResponse("Vehicle not found.");
         return res.status(response.status.code).json(response);
       }
+      vehicleVendorId = vehicle.vendorId;
     }
 
-    const resolvedVendorId = vendorId || route.vendorId || null;
+    const resolvedVendorId =
+      vendorId || driverVendorId || vehicleVendorId || null;
     const resolvedServiceType = serviceType || route.serviceType || "PICK_AND_DROP";
 
     const ride = await prisma.ride.create({

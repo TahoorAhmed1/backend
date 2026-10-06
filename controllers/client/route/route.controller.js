@@ -13,6 +13,8 @@ const {
   notifyEmployeeById,
 } = require("../../../services/notification.service");
 
+const OFFICE_LOCATIONS = new Set(["IBT_1", "IBT_2", "IBT_3", "SKY_TOWER"]);
+
 // ---------- helpers ----------
 
 const toSaturdayUtcMidnight = (input) => {
@@ -83,27 +85,6 @@ const findStandingConflict = async ({
     }
   }
   return null;
-};
-
-const syncRouteFromTrips = async (routeId) => {
-  const trips = await prisma.trip.findMany({
-    where: { routeId, status: "ACTIVE" },
-    include: { vehicle: true },
-    orderBy: { tripNumber: "asc" },
-  });
-
-  const maxCapacity = trips.reduce(
-    (sum, t) => sum + (t.vehicle?.capacity || 0),
-    0,
-  );
-
-  return prisma.route.update({
-    where: { id: routeId },
-    data: {
-      maxCapacity: maxCapacity || 0,
-      driverId: trips[0]?.driverId ?? null,
-    },
-  });
 };
 
 const countTripOccupancy = async (tripId, weekStartDate, excludeEmployeeId) =>
@@ -190,6 +171,11 @@ const createRoute = async (req, res, next) => {
       return res.status(response.status.code).json(response);
     }
 
+    if (officeLocation && !OFFICE_LOCATIONS.has(officeLocation)) {
+      const response = badRequestResponse("Invalid office location.");
+      return res.status(response.status.code).json(response);
+    }
+
     if (!driverId) {
       const response = badRequestResponse("Driver is required.");
       return res.status(response.status.code).json(response);
@@ -259,8 +245,6 @@ const createRoute = async (req, res, next) => {
           shiftTiming: shiftTiming || undefined,
           pickupStartTime: pickupStartTime ? new Date(pickupStartTime) : undefined,
           dropTime: dropTime ? new Date(dropTime) : undefined,
-          driverId,
-          maxCapacity: driver.vehicle.capacity,
         },
       });
 
@@ -370,8 +354,6 @@ const addTripToRoute = async (req, res, next) => {
       include: { driver: true, vehicle: true },
     });
 
-    await syncRouteFromTrips(routeId);
-
     // ---- Notify the assigned driver ----
     notifyDriverById(driverId, {
       title: "New trip assigned",
@@ -469,8 +451,6 @@ const updateTripAssignment = async (req, res, next) => {
 
       return updated;
     });
-
-    await syncRouteFromTrips(trip.routeId);
 
     // ---- Notify old/new driver and affected employees ----
     const driverChanged = trip.driverId !== nextDriverId;
@@ -837,7 +817,6 @@ const getRouteById = async (req, res, next) => {
       include: {
         area: true,
         subArea: true,
-        driver: true,
         trips: {
           include: { driver: true, vehicle: true },
           orderBy: { tripNumber: "asc" },
@@ -890,6 +869,13 @@ const updateRoute = async (req, res, next) => {
     }
 
     const updateData = await normalizeRoutePayload(req.body);
+    if (
+      updateData.officeLocation != null &&
+      !OFFICE_LOCATIONS.has(updateData.officeLocation)
+    ) {
+      const response = badRequestResponse("Invalid office location.");
+      return res.status(response.status.code).json(response);
+    }
 
     if (updateData.routeCode && updateData.routeCode !== route.routeCode) {
       const existingRoute = await prisma.route.findUnique({
@@ -907,7 +893,6 @@ const updateRoute = async (req, res, next) => {
       include: {
         area: true,
         subArea: true,
-        driver: true,
         trips: {
           include: { driver: true, vehicle: true },
           orderBy: { tripNumber: "asc" },
@@ -1223,7 +1208,7 @@ const getRouteStats = async (req, res, next) => {
       id: route.id,
       routeCode: route.routeCode,
       routeName: route.routeName,
-      maxCapacity: route.maxCapacity,
+      maxCapacity: trips.reduce((sum, trip) => sum + trip.capacity, 0),
       tripCount: trips.length,
       employeeCount: trips.reduce((sum, t) => sum + t.assignedEmployees, 0),
       totalRides: route._count.rides,
