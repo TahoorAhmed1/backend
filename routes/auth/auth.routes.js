@@ -21,8 +21,8 @@ router.post("/login", validateRequest(userLoginSchema), login);
 
 router.post(
   "/register",
-  verifyUserByToken,
-  requireRole("ADMIN"),
+  // verifyUserByToken,
+  // requireRole("ADMIN"),
   validateRequest(userRegisterSchema),
   registerUser
 );

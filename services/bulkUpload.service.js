@@ -15,12 +15,12 @@ const {
   normalizeAreaName,
   parseDriverEntries,
   scheduleDataChanged,
+  normalizeMatch,
 } = require("../utils/xlsxParsing");
 const { findOrCreateNormalizedArea } = require("./areaLookup.service");
 const {
-  findDriver,
-  findEmployee,
-  findVendor,
+  pickBestDriverCandidate,
+  splitDriverCell,
   resolveDriverIdByName,
 } = require("./driverVehicleMatch.service");
 const {
@@ -30,6 +30,266 @@ const {
 const { findOrCreateRouteAndTrip } = require("./routeTrip.service");
 const { normalizeShift } = require("../utils/shiftTime");
 const { sortTripsByOccupancy } = require("../utils/tripSelection");
+
+/**
+ * Bulk reference-data preload helpers.
+ *
+ * These intentionally mirror the matching semantics of the existing lookup
+ * services. The upload path only changes WHERE the reference records come
+ * from (one bulk read instead of one DB read per row); assignment and write
+ * semantics remain unchanged.
+ */
+const preloadReferenceData = async (allEmployeeData, caches) => {
+  const employeeCodes = new Set();
+  const vendorNames = new Set();
+  const driverRequests = [];
+  const areaNames = new Set();
+
+  for (const row of allEmployeeData) {
+    employeeCodes.add(row.employeeCode);
+
+    const get = (key) =>
+      row.colIndex[key] !== undefined
+        ? String(row.raw[row.colIndex[key]] ?? "").trim()
+        : "";
+
+    const vendorName = get("vendor");
+    if (vendorName) vendorNames.add(vendorName);
+
+    const driverEntries = parseDriverEntries(get("drivers"));
+    for (const entry of driverEntries) {
+      if (entry?.name) {
+        driverRequests.push({
+          name: entry.name,
+          vendorName,
+        });
+      }
+    }
+
+    const sheetAreaName = get("area");
+    if (sheetAreaName) {
+      const normalizedArea = normalizeAreaName(sheetAreaName);
+      if (normalizedArea) areaNames.add(normalizedArea);
+    }
+  }
+
+  const uniqueEmployeeCodes = Array.from(employeeCodes);
+  const uniqueVendorNames = Array.from(vendorNames);
+  const uniqueAreaNames = Array.from(areaNames);
+
+  const driverSearchNames = new Set();
+  for (const request of driverRequests) {
+    const parts = splitDriverCell(String(request.name || "").trim());
+    const trimmedName = parts[0] || String(request.name || "").trim();
+    const normalizedName = trimmedName.replace(/\s+/g, " ");
+    if (!normalizedName) continue;
+
+    driverSearchNames.add(normalizedName);
+    const firstWord = normalizedName.split(" ")[0];
+    if (firstWord) driverSearchNames.add(firstWord);
+  }
+
+  const driverSearchWords = Array.from(driverSearchNames);
+
+  const [employees, vendors, drivers, areas] = await Promise.all([
+    uniqueEmployeeCodes.length
+      ? prisma.employee.findMany({
+          where: { employeeCode: { in: uniqueEmployeeCodes } },
+          include: { area: true, subArea: true, block: true },
+        })
+      : [],
+    uniqueVendorNames.length
+      ? prisma.vendor.findMany({
+          where: {
+            OR: uniqueVendorNames.map((name) => ({
+              name: { equals: name.trim(), mode: "insensitive" },
+            })),
+          },
+        })
+      : [],
+    driverSearchWords.length
+      ? prisma.driver.findMany({
+          where: {
+            OR: driverSearchWords.map((name) => ({
+              name: { contains: name, mode: "insensitive" },
+            })),
+          },
+          include: {
+            vehicle: { include: { vendor: true } },
+            vendor: true,
+          },
+        })
+      : [],
+    uniqueAreaNames.length
+      ? prisma.area.findMany({
+          where: {
+            OR: uniqueAreaNames.map((name) => ({
+              name: { equals: name, mode: "insensitive" },
+            })),
+          },
+        })
+      : [],
+  ]);
+
+  for (const employee of employees) {
+    caches.employee.set(employee.employeeCode, employee);
+  }
+
+  const vendorByKey = new Map();
+  for (const vendor of vendors) {
+    vendorByKey.set(vendor.name.trim().toLowerCase(), vendor);
+    caches.vendor.set(vendor.name.trim().toLowerCase(), vendor);
+  }
+
+  const driversByExactName = new Map();
+  for (const driver of drivers) {
+    const key = String(driver.name || "")
+      .trim()
+      .replace(/\\s+/g, " ")
+      .toLowerCase();
+    if (!driversByExactName.has(key)) driversByExactName.set(key, []);
+    driversByExactName.get(key).push(driver);
+    caches.driverById.set(driver.id, driver);
+  }
+
+  const areasByKey = new Map();
+  for (const area of areas) {
+    areasByKey.set(area.name.trim().toLowerCase(), area);
+    caches.areaCache.set(`area::${area.name.trim().toLowerCase()}`, area);
+  }
+
+  return {
+    vendorByKey,
+    driversByExactName,
+    areasByKey,
+    driverRequests,
+  };
+};
+
+const resolvePreloadedVendor = (vendorName, referenceData) => {
+  const trimmed = String(vendorName || "").trim();
+  if (!trimmed) return null;
+
+  const key = trimmed.toLowerCase();
+  if (referenceData.vendorByKey.has(key)) {
+    return referenceData.vendorByKey.get(key);
+  }
+
+  return null;
+};
+
+const resolvePreloadedDriver = (
+  driverName,
+  vendorNameFromSheet,
+  cache,
+  caches,
+  referenceData,
+) => {
+  const rawInput = String(driverName || "").trim();
+  if (!rawInput) return null;
+
+  const driverParts = splitDriverCell(rawInput);
+  const hadMultipleDrivers = driverParts.length > 1;
+  const droppedDriverNames = hadMultipleDrivers ? driverParts.slice(1) : [];
+  const trimmedName = driverParts[0] || rawInput;
+
+  const normalizedName = trimmedName.replace(/\s+/g, " ");
+  const normalizedVendor = normalizeMatch(vendorNameFromSheet);
+  const firstWord = normalizedName.split(" ")[0];
+  const cacheKey = `${normalizedName.toLowerCase()}::${normalizedVendor}`;
+
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
+
+  const getCandidates = (nameKey) => {
+    const key = String(nameKey || "")
+      .trim()
+      .replace(/\\s+/g, " ")
+      .toLowerCase();
+    return referenceData.driversByExactName.get(key) || [];
+  };
+
+  const vendorMatches = (candidates) => {
+    if (!normalizedVendor) return candidates;
+    return candidates.filter((driver) => {
+      const driverVendor = normalizeMatch(driver.vendor?.name);
+      const vehicleVendor = normalizeMatch(driver.vehicle?.vendor?.name);
+      return (
+        driverVendor === normalizedVendor || vehicleVendor === normalizedVendor
+      );
+    });
+  };
+
+  let candidates = getCandidates(normalizedName);
+  let matchedLoosely = false;
+
+  if (candidates.length === 0 && firstWord && firstWord !== normalizedName) {
+    const firstWordCandidates = getCandidates(firstWord);
+    const vendorFiltered = vendorMatches(firstWordCandidates);
+
+    if (vendorFiltered.length > 0) {
+      candidates = vendorFiltered;
+      matchedLoosely = true;
+    } else if (firstWordCandidates.length > 0) {
+      candidates = firstWordCandidates;
+      matchedLoosely = true;
+    }
+  }
+
+  if (candidates.length === 0 && firstWord) {
+    const containsCandidates = [];
+    const needle = String(firstWord || "").toLowerCase();
+
+    for (const driverCandidates of referenceData.driversByExactName.values()) {
+      for (const candidate of driverCandidates) {
+        if (String(candidate.name || "").toLowerCase().includes(needle)) {
+          containsCandidates.push(candidate);
+        }
+      }
+    }
+
+    const vendorFiltered = vendorMatches(containsCandidates);
+    if (vendorFiltered.length > 0) {
+      candidates = vendorFiltered;
+      matchedLoosely = true;
+    } else if (containsCandidates.length > 0) {
+      candidates = containsCandidates;
+      matchedLoosely = true;
+    }
+  }
+
+  const result = pickBestDriverCandidate(candidates, normalizedVendor);
+
+  if (result && matchedLoosely) result.__looseNameMatch = true;
+  if (result && hadMultipleDrivers) {
+    result.__multiDriverCell = true;
+    result.__droppedDriverNames = droppedDriverNames;
+  }
+
+  cache?.set(cacheKey, result || null);
+  if (result) caches.driverById.set(result.id, result);
+
+  return result || null;
+};
+
+const resolvePreloadedArea = async (areaName, caches, referenceData) => {
+  const normalizedName = normalizeAreaName(areaName);
+  if (!normalizedName) return null;
+
+  const cacheKey = `area::${normalizedName.toLowerCase()}`;
+  if (caches.areaCache.has(cacheKey)) {
+    return caches.areaCache.get(cacheKey);
+  }
+
+  const existing = referenceData.areasByKey.get(normalizedName.toLowerCase());
+  if (existing) {
+    caches.areaCache.set(cacheKey, existing);
+    return existing;
+  }
+
+  // Preserve the existing helper's create-if-missing behavior, but only once
+  // per unique area rather than once per employee row.
+  return findOrCreateNormalizedArea(normalizedName, caches);
+};
 
 // Job creation/status is now handled by bulkUpload.producer.js, which writes
 // to the BulkUploadJob table instead of this in-memory Map. That table
@@ -418,77 +678,88 @@ const processBulkUploadJob = async (
     }
   };
 
-  const flushPendingWrites = async () => {
-    if (!pendingWrites.length) return;
-    const batch = pendingWrites.splice(0, pendingWrites.length);
-    processedRowCount += batch.length;
-    // Fire-and-forget: don't block row processing on a progress write.
-    updateJobProgress(jobId, {
-      processedRows: processedRowCount,
-      batchesCompleted: (batchesCompletedCount += 1),
-    });
-    try {
-      const saved = await prisma.$transaction(
-        batch.map((item) =>
-          prisma.weeklySchedule.upsert({
-            where: {
-              employeeId_weekStart: {
-                employeeId: item.scheduleData.employeeId,
-                weekStart: item.scheduleData.weekStart,
-              },
-            },
-            update: item.scheduleData,
-            create: item.scheduleData,
-          }),
-        ),
-        { timeout: 20000, maxWait: 10000 },
-      );
-      saved.forEach((savedSchedule, i) =>
-        applyCacheEffects(savedSchedule, batch[i]),
-      );
-    } catch (batchError) {
-      console.error(
-        `[flushPendingWrites] BATCH TRANSACTION FAILED: ${batchError.message}`,
-      );
-      for (const item of batch) {
-        try {
-          const savedSchedule = await prisma.weeklySchedule.upsert({
-            where: {
-              employeeId_weekStart: {
-                employeeId: item.scheduleData.employeeId,
-                weekStart: item.scheduleData.weekStart,
-              },
-            },
-            update: item.scheduleData,
-            create: item.scheduleData,
-          });
-          applyCacheEffects(savedSchedule, item);
-        } catch (rowError) {
-          await skipRow(
-            item.sheetName,
-            item.rowNum,
-            item.employeeCode,
-            rowError.message,
-            item.raw,
-          );
-        }
+  const FLUSH_CHUNK_SIZE = 10;
+  const TX_OPTIONS = { timeout: 60000, maxWait: 15000 };
+
+  const upsertArgs = (item) => ({
+    where: {
+      employeeId_weekStart: {
+        employeeId: item.scheduleData.employeeId,
+        weekStart: item.scheduleData.weekStart,
+      },
+    },
+    update: item.scheduleData,
+    create: item.scheduleData,
+  });
+
+  const withRetry = async (fn, retries = 3) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        // P2028 = transaction API error (expired), P2034 = write conflict/deadlock
+        const retryable = ["P2028", "P2034"].includes(err.code);
+        if (!retryable || attempt >= retries) throw err;
+        await new Promise((r) => setTimeout(r, 500 * attempt));
       }
     }
   };
 
-  try {
-    await prisma.$transaction(
-      async (tx) => {
-        const lockKey = `weekly-schedule::${weekStartDate.toISOString()}::no-area`;
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-      },
-      { maxWait: 10000, timeout: 10000 },
-    );
-  } catch (lockError) {
-    console.warn(
-      `[weeklySchedule] Skipping week/area lock (continuing without it): ${lockError.message}`,
-    );
-  }
+  const flushPendingWrites = async () => {
+    if (!pendingWrites.length) return;
+    const batch = pendingWrites.splice(0, pendingWrites.length);
+
+    // Write in small chunks so each transaction stays far below the timeout,
+    // regardless of how many rows one processing group produced.
+    for (let i = 0; i < batch.length; i += FLUSH_CHUNK_SIZE) {
+      const part = batch.slice(i, i + FLUSH_CHUNK_SIZE);
+      try {
+        const saved = await withRetry(() =>
+          prisma.$transaction(
+            part.map((item) => prisma.weeklySchedule.upsert(upsertArgs(item))),
+            TX_OPTIONS,
+          ),
+        );
+        saved.forEach((savedSchedule, j) =>
+          applyCacheEffects(savedSchedule, part[j]),
+        );
+      } catch (chunkError) {
+        console.error(
+          `[flushPendingWrites] chunk failed, falling back to row-by-row: ${chunkError.message}`,
+        );
+        for (const item of part) {
+          try {
+            const savedSchedule = await prisma.weeklySchedule.upsert(
+              upsertArgs(item),
+            );
+            applyCacheEffects(savedSchedule, item);
+          } catch (rowError) {
+            await skipRow(
+              item.sheetName,
+              item.rowNum,
+              item.employeeCode,
+              rowError.message,
+              item.raw,
+            );
+          }
+        }
+      }
+
+      processedRowCount += part.length;
+      batchesCompletedCount += 1;
+      // Awaited on purpose: also acts as a heartbeat (bumps updatedAt) so the
+      // producer's stale-job check never treats a healthy job as dead.
+      await updateJobProgress(jobId, {
+        processedRows: processedRowCount,
+        batchesCompleted: batchesCompletedCount,
+      });
+    }
+  };
+
+  // NOTE: the previous pg_advisory_xact_lock block was removed. A transaction-
+  // scoped lock is released as soon as its (empty) transaction ends, so it
+  // never protected anything. Concurrency is guarded by findConflictingJob in
+  // the producer (ideally backed by a partial unique index on the jobs table).
 
   const caches = {
     employee: new Map(),
@@ -652,27 +923,25 @@ const processBulkUploadJob = async (
     for (const row of allEmployeeData) allEmployeeCodes.add(row.employeeCode);
   }
 
+  const referenceData = await preloadReferenceData(allEmployeeData, caches);
+
   await updateJobProgress(jobId, {
     totalRows: allEmployeeData.length,
     totalBatches: batchSize ? Math.ceil(allEmployeeData.length / batchSize) : 0,
   });
 
   console.log(
-    `[weeklySchedule][job ${jobId}] Loading ${allEmployeeCodes.size} employees...`,
+    `[weeklySchedule][job ${jobId}] Preloaded reference data: ` +
+      `${caches.employee.size} employees, ${caches.vendor.size} vendors, ` +
+      `${caches.driverById.size} drivers, ${referenceData.areasByKey.size} areas`,
   );
-  if (allEmployeeCodes.size) {
-    const existingEmployees = await prisma.employee.findMany({
-      where: { employeeCode: { in: Array.from(allEmployeeCodes) } },
-      include: { area: true, subArea: true, block: true },
-    });
-    for (const emp of existingEmployees) {
-      caches.employee.set(emp.employeeCode, emp);
-    }
-  }
 
   const areaIds = new Set();
   for (const emp of caches.employee.values()) {
     if (emp.areaId) areaIds.add(emp.areaId);
+  }
+  for (const area of referenceData.areasByKey.values()) {
+    if (area?.id) areaIds.add(area.id);
   }
 
   const tripsByAreaShift = new Map();
@@ -738,7 +1007,7 @@ const processBulkUploadJob = async (
         : "";
 
     try {
-      const employee = await findEmployee(employeeCode, caches);
+      const employee = caches.employee.get(employeeCode) || null;
       if (!employee) {
         results.employeesNotFound++;
         await skipRow(
@@ -760,21 +1029,19 @@ const processBulkUploadJob = async (
         employee.shiftTiming ||
         null;
       const driverEntries = parseDriverEntries(get("drivers"));
-      const vendorRecord = vendorName
-        ? await findVendor(vendorName, caches.vendor)
-        : null;
+      const vendorRecord = resolvePreloadedVendor(vendorName, referenceData);
 
       let driverId = null;
       let driverRecord = null;
       let vehicleId = null;
 
       for (let d = 0; d < driverEntries.length; d++) {
-        const driver = await findDriver(
+        const driver = resolvePreloadedDriver(
           driverEntries[d].name,
           vendorName,
-          vehicleType,
           caches.driver,
           caches,
+          referenceData,
         );
         if (driver) {
           driverId = driver.id;
@@ -818,9 +1085,10 @@ const processBulkUploadJob = async (
       let areaRecord = null;
       const sheetAreaName = get("area");
       if (sheetAreaName) {
-        areaRecord = await findOrCreateNormalizedArea(
-          normalizeAreaName(sheetAreaName),
+        areaRecord = await resolvePreloadedArea(
+          sheetAreaName,
           caches,
+          referenceData,
         );
       }
       if (!areaRecord) {
@@ -1355,6 +1623,9 @@ const processBulkUploadJob = async (
     if (pendingWrites.length >= 25) {
       await flushPendingWrites();
     }
+
+    // Heartbeat between groups so long route/trip lookups don't look stalled.
+    await updateJobProgress(jobId, { processedRows: processedRowCount });
 
     await new Promise((resolve) => setImmediate(resolve));
   }

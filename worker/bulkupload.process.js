@@ -14,23 +14,25 @@ const envPath = path.resolve(__dirname, "..", envFile);
 const fallbackPath = path.resolve(__dirname, "..", ".env");
 
 if (fs.existsSync(envPath)) {
-  dotenv.config({ path: envPath, override: true });
+  dotenv.config({ path: envPath });
 } else if (fs.existsSync(fallbackPath)) {
-  dotenv.config({ path: fallbackPath, override: true });
+  dotenv.config({ path: fallbackPath });
 }
 
-console.log("[bulkUpload.process] environment:", {
+const {
+  jobType,
+  accountKey,
+  QUEUE_DISPLAY_NAME,
+  ensureQueueConfigured,
+} = require("../lib/queue");
+ensureQueueConfigured();
+
+console.log("[bulkUpload.process] starting account worker", {
   NODE_ENV: process.env.NODE_ENV,
-  REDIS_URL: process.env.REDIS_URL ? "SET" : "MISSING",
-  REDIS_TLS: process.env.REDIS_TLS,
-  REDIS_SSL: process.env.REDIS_SSL,
+  jobType,
+  accountKey,
+  queueName: QUEUE_DISPLAY_NAME,
 });
-
-if (!process.env.REDIS_URL) {
-  throw new Error(
-    "REDIS_URL is not configured. Set it to a valid Redis endpoint before starting the bulk upload queue.",
-  );
-}
 
 const { startBulkUploadWorker } = require("./bulkupload.worker");
 
