@@ -3,6 +3,7 @@ const XLSX = require("xlsx");
 const { Worker } = require("bullmq");
 
 const { prisma } = require("../lib/prisma");
+const { notifyAdmins } = require("../services/notification.service");
 
 const {
   jobType,
@@ -35,6 +36,82 @@ const DISPATCH_INTERVAL_MS =
     : 2000;
 
 const RECONCILE_INTERVAL_MS = 30000;
+
+const notifyScheduleRefresh = async (
+  weekStartDate,
+  jobType,
+  status,
+  jobId,
+  result = null,
+) => {
+  try {
+    const succeeded = status === "completed";
+    const resultSummary = result
+      ? {
+          created: result.created,
+          updated: result.updated,
+          tripsCreated: result.tripsCreated,
+          tripsReused: result.tripsReused,
+          totalCapacityUsed: result.totalCapacityUsed,
+          totalCapacityAvailable: result.totalCapacityAvailable,
+        }
+      : null;
+    const operation = {
+      RESYNC_PENDING_RIDES: {
+        eventPrefix: "ride-sync",
+        label: "Ride Sync",
+      },
+      UPDATE_SCHEDULE: {
+        eventPrefix: "schedule-update",
+        label: "Schedule Update",
+      },
+      BULK_UPLOAD: {
+        eventPrefix: "weekly-upload",
+        label: "Weekly Upload",
+      },
+    }[jobType] || {
+      eventPrefix: "weekly-upload",
+      label: "Weekly Upload",
+    };
+    const eventName = `${operation.eventPrefix}-${status}`;
+    const payload = {
+      title: `${operation.label} ${succeeded ? "Completed" : "Failed"}`,
+      body: succeeded
+        ? `${operation.label} completed. Refresh the weekly schedule and ride pages.`
+        : `${operation.label} failed. Refresh the weekly schedule and ride pages.`,
+      data: {
+        type: eventName.toUpperCase().replace(/-/g, "_"),
+        weekStart: new Date(weekStartDate).toISOString(),
+        jobType,
+        jobId,
+        status,
+        result: resultSummary,
+        refresh: {
+          weeklySchedule: true,
+          rides: true,
+        },
+      },
+      createdAt: new Date().toISOString(),
+    };
+
+    const notifications = await notifyAdmins({
+      ...payload,
+      event: eventName,
+    });
+    console.info("[bulkUpload.worker] admin completion notifications sent", {
+      event: eventName,
+      jobId,
+      status,
+      notificationCount: notifications.filter(Boolean).length,
+    });
+  } catch (error) {
+    console.error("[bulkUpload.worker] failed to send schedule refresh event:", {
+      name: error?.name,
+      code: error?.code,
+      message: error?.message,
+    });
+  }
+};
 
 const LIVE_QUEUE_STATES = new Set([
   "active",
@@ -149,9 +226,10 @@ const startBulkUploadWorker = () => {
             new Date(weekStartDate),
           );
 
-          await prisma.bulkUploadJob.update({
+          const completed = await prisma.bulkUploadJob.updateMany({
             where: {
               id: jobId,
+              status: "processing",
             },
             data: {
               status: "completed",
@@ -159,6 +237,15 @@ const startBulkUploadWorker = () => {
               error: null,
             },
           });
+
+          if (completed.count > 0) {
+            await notifyScheduleRefresh(
+              weekStartDate,
+              "RESYNC_PENDING_RIDES",
+              "completed",
+              jobId,
+            );
+          }
 
           console.log(
             `[bulkUpload.worker] ride resync job ${jobId} completed`,
@@ -174,9 +261,10 @@ const startBulkUploadWorker = () => {
            * connection itself is temporarily unavailable.
            */
           try {
-            await prisma.bulkUploadJob.update({
+            const failed = await prisma.bulkUploadJob.updateMany({
               where: {
                 id: jobId,
+                status: "processing",
               },
               data: {
                 status: "failed",
@@ -184,6 +272,15 @@ const startBulkUploadWorker = () => {
                 completedAt: new Date(),
               },
             });
+
+            if (failed.count > 0) {
+              await notifyScheduleRefresh(
+                weekStartDate,
+                "RESYNC_PENDING_RIDES",
+                "failed",
+                jobId,
+              );
+            }
           } catch (statusError) {
             console.error(
               `[bulkUpload.worker] failed to persist failed status for ride resync job ${jobId}:`,
@@ -272,9 +369,10 @@ const startBulkUploadWorker = () => {
           );
         }
 
-        await prisma.bulkUploadJob.update({
+        const completed = await prisma.bulkUploadJob.updateMany({
           where: {
             id: jobId,
+            status: "processing",
           },
           data: {
             status: "completed",
@@ -284,7 +382,16 @@ const startBulkUploadWorker = () => {
           },
         });
 
-        terminalStatusPersisted = true;
+        terminalStatusPersisted = completed.count > 0;
+        if (terminalStatusPersisted) {
+          await notifyScheduleRefresh(
+            weekStartDate,
+            action === "UPDATE_SCHEDULE" ? action : "BULK_UPLOAD",
+            "completed",
+            jobId,
+            results,
+          );
+        }
 
         console.log(
           `[bulkUpload.worker] job ${jobId} completed`,
@@ -296,9 +403,10 @@ const startBulkUploadWorker = () => {
         );
 
         try {
-          await prisma.bulkUploadJob.update({
+          const failed = await prisma.bulkUploadJob.updateMany({
             where: {
               id: jobId,
+              status: "processing",
             },
             data: {
               status: "failed",
@@ -307,7 +415,15 @@ const startBulkUploadWorker = () => {
             },
           });
 
-          terminalStatusPersisted = true;
+          terminalStatusPersisted = failed.count > 0;
+          if (terminalStatusPersisted) {
+            await notifyScheduleRefresh(
+              weekStartDate,
+              action === "UPDATE_SCHEDULE" ? action : "BULK_UPLOAD",
+              "failed",
+              jobId,
+            );
+          }
         } catch (statusError) {
           console.error(
             `[bulkUpload.worker] failed to persist failed status for job ${jobId}:`,
@@ -508,23 +624,33 @@ const startBulkUploadWorker = () => {
             error.message ===
             "Bulk upload job is missing its file path."
           ) {
-            await prisma.bulkUploadJob
-              .update({
+            try {
+              const failed = await prisma.bulkUploadJob.updateMany({
                 where: {
                   id: pendingJob.id,
+                  status: "pending",
                 },
                 data: {
                   status: "failed",
                   error: error.message,
                   completedAt: new Date(),
                 },
-              })
-              .catch((statusError) => {
-                console.error(
-                  `[bulkUpload.worker] failed to persist missing-file status for ${pendingJob.id}:`,
-                  statusError,
-                );
               });
+
+              if (failed.count > 0) {
+                await notifyScheduleRefresh(
+                  pendingJob.weekStart,
+                  pendingJob.action || "BULK_UPLOAD",
+                  "failed",
+                  pendingJob.id,
+                );
+              }
+            } catch (statusError) {
+              console.error(
+                `[bulkUpload.worker] failed to persist missing-file status for ${pendingJob.id}:`,
+                statusError,
+              );
+            }
           } else {
             /**
              * Queue/Redis/DB transient errors should NOT mark
@@ -625,6 +751,18 @@ const startBulkUploadWorker = () => {
                 },
                 data,
               });
+
+            if (reconciled.count > 0) {
+              await notifyScheduleRefresh(
+                pendingJob.weekStart,
+                pendingJob.jobType === "RESYNC_PENDING_RIDES"
+                  ? "RESYNC_PENDING_RIDES"
+                  : pendingJob.action || "BULK_UPLOAD",
+                data.status,
+                pendingJob.id,
+                data.result || null,
+              );
+            }
 
             if (
               reconciled.count > 0 &&

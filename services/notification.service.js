@@ -382,6 +382,39 @@ const notifyEmployeeById = async (employeeId, payload, options = {}) => {
 
 const notifyAdmins = (payload) => notifyRoles(ADMIN_NOTIFY_ROLES, payload);
 
+const triggerEventToRoles = async (roles = [], event, payload) => {
+  if (!roles.length) {
+    return [];
+  }
+
+  const users = await prisma.user.findMany({
+    where: {
+      role: { in: roles },
+      isActive: true,
+    },
+    select: { id: true },
+  });
+
+  if (users.length === 0) {
+    console.warn(
+      `[notificationService] No active users found for Pusher event "${event}" and roles: ${roles.join(", ")}`,
+    );
+    return [];
+  }
+
+  await Promise.all(
+    users.map(({ id }) =>
+      pusher.trigger(`private-user-${id}`, event, payload),
+    ),
+  );
+
+  console.info(
+    `[notificationService] Pusher event "${event}" sent to ${users.length} user(s)`,
+  );
+
+  return users.map(({ id }) => id);
+};
+
 module.exports = {
   notifyUser,
   notifyUsers,
@@ -390,4 +423,5 @@ module.exports = {
   notifyEmployeeById,
   notifyAdmins,
   ADMIN_NOTIFY_ROLES,
+  triggerEventToRoles,
 };
