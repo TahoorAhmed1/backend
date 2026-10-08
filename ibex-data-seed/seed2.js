@@ -601,15 +601,15 @@ async function main() {
   // ══════════════════════════════════════════════════════════════════════════
   // 16. AUDIT LOGS
   // ══════════════════════════════════════════════════════════════════════════
-  await prisma.auditLog.createMany({
-    data: [
-      { userId: adminUser.id,      action: "CREATE", model: "Route",   recordId: route1.id,  after:  { routeCode: "GUL-IBT1-AM", status: "ACTIVE"   },                                        ipAddress: "192.168.1.10" },
-      { userId: managerUser.id,    action: "UPDATE", model: "Driver",  recordId: driver3.id, before: { status: "AVAILABLE"  }, after: { status: "ON_RIDE"    },                              ipAddress: "192.168.1.15" },
-      { userId: dispatcherUser.id, action: "CREATE", model: "Ride",    recordId: ride1.id,   after:  { routeId: route1.id,   status: "PENDING"  },                                            ipAddress: "192.168.1.20" },
-      { userId: dispatcherUser.id, action: "UPDATE", model: "Ride",    recordId: ride1.id,   before: { status: "STARTED"    }, after: { status: "COMPLETED"  },                              ipAddress: "192.168.1.20" },
-      { userId: adminUser.id,      action: "UPDATE", model: "Vehicle", recordId: van2.id,    before: { status: "ACTIVE"     }, after: { status: "MAINTENANCE"},                              ipAddress: "192.168.1.10" },
-    ],
-  });
+  // await prisma.auditLog.createMany({
+  //   data: [
+  //     { userId: adminUser.id,      action: "CREATE", model: "Route",   recordId: route1.id,  after:  { routeCode: "GUL-IBT1-AM", status: "ACTIVE"   },                                        ipAddress: "192.168.1.10" },
+  //     { userId: managerUser.id,    action: "UPDATE", model: "Driver",  recordId: driver3.id, before: { status: "AVAILABLE"  }, after: { status: "ON_RIDE"    },                              ipAddress: "192.168.1.15" },
+  //     { userId: dispatcherUser.id, action: "CREATE", model: "Ride",    recordId: ride1.id,   after:  { routeId: route1.id,   status: "PENDING"  },                                            ipAddress: "192.168.1.20" },
+  //     { userId: dispatcherUser.id, action: "UPDATE", model: "Ride",    recordId: ride1.id,   before: { status: "STARTED"    }, after: { status: "COMPLETED"  },                              ipAddress: "192.168.1.20" },
+  //     { userId: adminUser.id,      action: "UPDATE", model: "Vehicle", recordId: van2.id,    before: { status: "ACTIVE"     }, after: { status: "MAINTENANCE"},                              ipAddress: "192.168.1.10" },
+  //   ],
+  // });
   console.log("✅ Audit Logs");
 
   // ══════════════════════════════════════════════════════════════════════════

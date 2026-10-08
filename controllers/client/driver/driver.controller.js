@@ -758,15 +758,15 @@ const cancelRide = async (req, res, next) => {
     });
     if (error) return res.status(error.status.code).json(error);
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "RIDE_CANCELLED_BY_DRIVER",
-        model: "Ride",
-        recordId: req.params.id,
-        after: { reason: String(reason).trim() },
-      },
-    });
+    // await prisma.auditLog.create({
+    //   data: {
+    //     userId: req.user?.userId ?? null,
+    //     action: "RIDE_CANCELLED_BY_DRIVER",
+    //     model: "Ride",
+    //     recordId: req.params.id,
+    //     after: { reason: String(reason).trim() },
+    //   },
+    // });
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1717,15 +1717,15 @@ const verifyLicense = async (req, res, next) => {
       console.error("[driver_controller] notifyRoles failed:", err),
     );
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "DRIVER_LICENSE_VERIFICATION_SUBMITTED",
-        model: "Driver",
-        recordId: driver.id,
-        after: { licenseNumber: licenseNumber?.trim() ?? driver.licenseNumber },
-      },
-    });
+    // await prisma.auditLog.create({
+    //   data: {
+    //     userId: req.user?.userId ?? null,
+    //     action: "DRIVER_LICENSE_VERIFICATION_SUBMITTED",
+    //     model: "Driver",
+    //     recordId: driver.id,
+    //     after: { licenseNumber: licenseNumber?.trim() ?? driver.licenseNumber },
+    //   },
+    // });
 
     const response = okResponse(
       { driverId: driver.id, status: "PENDING_REVIEW" },

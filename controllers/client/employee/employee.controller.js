@@ -482,15 +482,15 @@ const confirmTodayRide = async (req, res, next) => {
       );
     }
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "RIDE_PICKUP_CONFIRMATION",
-        model: "Ride",
-        recordId: ridePassenger.rideId,
-        after: { employeeId: employee.id, confirmed },
-      },
-    });
+    // await prisma.auditLog.create({
+    //   data: {
+    //     userId: req.user?.userId ?? null,
+    //     action: "RIDE_PICKUP_CONFIRMATION",
+    //     model: "Ride",
+    //     recordId: ridePassenger.rideId,
+    //     after: { employeeId: employee.id, confirmed },
+    //   },
+    // });
 
     const response = okResponse(
       {
@@ -687,20 +687,20 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
       );
     }
 
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: confirmed
-          ? "RIDE_ACCEPTED_BY_EMPLOYEE"
-          : "RIDE_REJECTED_BY_EMPLOYEE",
-        model: "Ride",
-        recordId: rideId,
-        after: {
-          employeeId: employee.id,
-          ...(trimmedReason && { reason: trimmedReason }),
-        },
-      },
-    });
+    // await prisma.auditLog.create({
+    //   data: {
+    //     userId: req.user?.userId ?? null,
+    //     action: confirmed
+    //       ? "RIDE_ACCEPTED_BY_EMPLOYEE"
+    //       : "RIDE_REJECTED_BY_EMPLOYEE",
+    //     model: "Ride",
+    //     recordId: rideId,
+    //     after: {
+    //       employeeId: employee.id,
+    //       ...(trimmedReason && { reason: trimmedReason }),
+    //     },
+    //   },
+    // });
 
     const response = okResponse(
       { rideId, confirmed, confirmationStatus },
