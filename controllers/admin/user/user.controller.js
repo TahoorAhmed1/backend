@@ -6,7 +6,6 @@ const {
   serverErrorResponse,
 } = require("../../../constants/responses");
 const { hashPassword } = require("../../../services/auth.service");
-const crypto = require("crypto");
 
 const getAllUsers = async (req, res, next) => {
   try {
@@ -215,10 +214,16 @@ const updateUserStatus = async (req, res, next) => {
 const resetUserPassword = async (req, res, next) => {
   try {
     const { id } = req.params;
+    const { password } = req.body;
 
-    // Generate a secure 12-character temporary password
-    const tempPassword = crypto.randomBytes(6).toString("hex");
-    const passwordHash = await hashPassword(tempPassword);
+    if (typeof password !== "string" || password.length < 6) {
+      const response = badRequestResponse(
+        "Password must be a string with at least 6 characters."
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const passwordHash = await hashPassword(password);
 
     const updatedUser = await prisma.user.update({
       where: { id },
@@ -235,9 +240,8 @@ const resetUserPassword = async (req, res, next) => {
         {
           userId: updatedUser.id,
           email: updatedUser.email,
-          tempPassword,
         },
-        "Password reset successfully. Please share the temporary password with the user."
+        "Password updated successfully."
       )
     );
   } catch (error) {
