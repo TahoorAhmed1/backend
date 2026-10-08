@@ -30,8 +30,8 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 app.use("/api", require("./routes/auth"));
-app.use("/api/client", require("./routes/client"));
-app.use("/api/mobile", require("./routes/admin"));
+app.use("/api/admin", require("./routes/admin"));
+app.use("/api/mobile", require("./routes/client"));
 
 app.post("/pusher/auth", verifyUserByToken, (req, res) => {
   try {

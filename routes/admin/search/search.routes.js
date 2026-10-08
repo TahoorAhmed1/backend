@@ -4,13 +4,11 @@ const router = express.Router();
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
 const requireRole = require("../../../utils/requirerole");
 const {
-  registerDeviceToken,
-  unregisterDeviceToken,
-} = require("../../../controllers/client/deviceToken/deviceToken.controller");
+  globalSearch,
+} = require("../../../controllers/admin/search/search.controller");
 
 router.use(verifyUserByToken, requireRole("ADMIN"));
 
-router.post("/", registerDeviceToken);
-router.delete("/", unregisterDeviceToken);
+router.get("/", globalSearch);
 
 module.exports = router;

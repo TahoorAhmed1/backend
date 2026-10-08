@@ -1,456 +1,685 @@
 const { prisma } = require("../../../lib/prisma");
-const QRCode = require("qrcode");
-const {
-  createRecord,
-  getRecordById,
-  updateRecord,
-} = require("../../../utils/crudHelper");
 const {
   badRequestResponse,
   okResponse,
+  createSuccessResponse,
 } = require("../../../constants/responses");
-const {
-  notifyUser,
-  notifyUsers,
-  notifyRoles,
-  ADMIN_NOTIFY_ROLES,
-} = require("../../../services/notification.service");
-const {
-  normalizeVendorLateStatus,
-} = require("../../../utils/vendorLateStatus");
+const { hashPassword } = require("../../../services/auth.service");
+const QRCode = require("qrcode");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
-// Roles that should be told about complaints, license submissions,
-// account deactivations, etc. — anything without one obvious recipient.
-// Sourced from the notification service so this can't silently drift
-// out of sync with the role set the service itself uses for notifyAdmins.
+const QR_DIR = path.join(__dirname, "..", "..","..", "qrcodes", "drivers");
+const DRIVER_EMAIL_DOMAIN = "ibex.com";
+const DEFAULT_DRIVER_PASSWORD = "12345678";
 
-const parsePagination = (query) => {
-  const skip = parseInt(query.skip, 10) || 0;
-  const take = parseInt(query.take, 10) || 10;
+// Ensure QR directory exists
+fs.mkdirSync(QR_DIR, { recursive: true });
 
-  return {
-    skip: Math.max(0, skip),
-    take: Math.max(1, Math.min(take, 100)),
-  };
-};
-
-const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
-
-const getDriverFromReq = async (req) => {
-  const userId = req.user?.userId;
-  if (!userId) return null;
-  return prisma.driver.findUnique({ where: { userId } });
-};
-
-const toKarachiDateParts = (date = new Date()) => {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Karachi",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
-  const parts = formatter.formatToParts(new Date(date));
-  const lookup = Object.fromEntries(
-    parts
-      .filter((part) => part.type !== "literal")
-      .map((part) => [part.type, part.value]),
-  );
-
-  return {
-    year: Number(lookup.year),
-    month: Number(lookup.month),
-    day: Number(lookup.day),
-  };
-};
-
-const startOfDay = (date = new Date()) => {
-  const { year, month, day } = toKarachiDateParts(date);
-  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+05:00`);
-};
-
-const endOfDay = (date = new Date()) => {
-  const { year, month, day } = toKarachiDateParts(date);
-  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T23:59:59.999+05:00`);
-};
-
-const getMyProfile = async (req, res, next) => {
+const createDriver = async (req, res, next) => {
   try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
+    const {
+      name,
+      phone,
+      licenseNumber,
+      cnic,
+      vendorId,
+      vehicleId,
+      shiftType,
+      shiftLabel,
+      status,
+      notes,
+    } = req.body;
+
+    // Validate required fields
+    if (!name || !name.trim()) {
+      const response = badRequestResponse("Driver name is required.");
+      return res.status(response.status.code).json(response);
     }
 
-    const response = await getRecordById(prisma.driver, driver.id, {
-      vendor: {
-        select: { id: true, name: true, shortName: true },
+    if (cnic) {
+      const existingDriver = await prisma.driver.findUnique({
+        where: { cnic },
+      });
+      if (existingDriver) {
+        const response = badRequestResponse(
+          "Driver with this CNIC already exists.",
+        );
+        return res.status(response.status.code).json(response);
+      }
+    }
+
+    if (licenseNumber) {
+      const existingLicense = await prisma.driver.findUnique({
+        where: { licenseNumber },
+      });
+      if (existingLicense) {
+        const response = badRequestResponse(
+          "Driver with this license number already exists.",
+        );
+        return res.status(response.status.code).json(response);
+      }
+    }
+
+    const driver = await prisma.$transaction(async (tx) => {
+      // Create driver
+      const newDriver = await tx.driver.create({
+        data: {
+          name: name.trim(),
+          phone,
+          licenseNumber,
+          cnic,
+          vendorId,
+          vehicle:{
+            connect: vehicleId ? { id: vehicleId } : undefined,
+          },
+          shiftType: shiftType || "TWELVE_HOUR",
+          shiftLabel,
+          status: status || "AVAILABLE",
+          notes,
+        },
+      });
+
+      // Generate QR token
+      const qrToken = crypto.randomBytes(32).toString("hex");
+
+      // Create user account with QR code
+      const email = cnic
+        ? `${cnic.replace(/[^0-9]/g, "")}@${DRIVER_EMAIL_DOMAIN}`
+        : `${newDriver.id}@${DRIVER_EMAIL_DOMAIN}`;
+
+      const hashedPassword = await hashPassword(DEFAULT_DRIVER_PASSWORD);
+
+      const user = await tx.user.create({
+        data: {
+          email,
+          name: newDriver.name,
+          passwordHash: hashedPassword,
+          role: "DRIVER",
+          qrCode: qrToken,
+          isActive: true,
+        },
+      });
+
+      // Link user to driver
+      const updatedDriver = await tx.driver.update({
+        where: { id: newDriver.id },
+        data: { userId: user.id },
+        include: {
+          vendor: { select: { id: true, name: true } },
+          vehicle: { select: { id: true, vehicleNumber: true } },
+          user: { select: { id: true, email: true, role: true, qrCode: true } },
+        },
+      });
+
+      return {
+        driver: updatedDriver,
+        qrToken,
+        defaultPassword: DEFAULT_DRIVER_PASSWORD,
+      };
+    });
+
+    // Generate QR code image after transaction succeeds
+    let qrImagePath = null;
+    let qrImageUrl = null;
+
+    try {
+      const safeName = driver.driver.name
+        .replace(/\s+/g, "")
+        .replace(/[\\/:*?"<>|]/g, "");
+      const qrFileName = `${safeName}-${driver.driver.id}.png`;
+      qrImagePath = path.join(QR_DIR, qrFileName);
+
+      // Generate QR code with structured data
+      const qrData = JSON.stringify({
+        type: "DRIVER_AUTH",
+        token: driver.qrToken,
+        userId: driver.driver.userId,
+        driverId: driver.driver.id,
+        version: 1,
+      });
+
+      await QRCode.toFile(qrImagePath, qrData, {
+        width: 400,
+        margin: 2,
+        errorCorrectionLevel: "H",
+      });
+
+      qrImageUrl = `/qrcodes/drivers/${qrFileName}`;
+    } catch (qrError) {
+      console.error("QR code generation failed:", qrError);
+      // Don't fail the whole request if QR generation fails
+      // The token is still in the database and can be regenerated
+    }
+
+    const response = createSuccessResponse(
+      {
+        ...driver.driver,
+        qrCode: driver.qrToken,
+        qrImageUrl,
+        defaultPassword: DEFAULT_DRIVER_PASSWORD,
+        loginEmail: driver.driver.user.email,
       },
-      vehicle: {
-        select: {
-          id: true,
-          vehicleNumber: true,
-          make: true,
-          model: true,
-          type: true,
-          capacity: true,
+      "Driver created successfully with QR code.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log("error", error);
+    next(error);
+  }
+};
+
+const getAllDrivers = async (req, res, next) => {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      status,
+      search,
+      vendorId,
+      sortBy = "createdAt",
+      sortOrder = "desc",
+      // New parameters
+      unassignedOnly = false,
+      all = false, // For dropdown - return all matching drivers without pagination
+    } = req.query;
+
+    // For dropdown (all=true), use a smaller limit
+    const take = all ? Math.min(parseInt(limit) || 100, 100) : parseInt(limit);
+    const skip = all ? 0 : (parseInt(page) - 1) * take;
+
+    const where = {};
+
+    if (status) where.status = status;
+    if (vendorId) where.vendorId = vendorId;
+
+    if (unassignedOnly === "true") {
+      where.vehicle = null;
+    }
+
+    if (search && String(search).trim().length >= 2) {
+      const searchTerm = String(search).trim();
+      where.OR = [
+        { name: { contains: searchTerm, mode: "insensitive" } },
+        { phone: { contains: searchTerm, mode: "insensitive" } },
+        { cnic: { contains: searchTerm, mode: "insensitive" } },
+        { licenseNumber: { contains: searchTerm, mode: "insensitive" } },
+        { shiftLabel: { contains: searchTerm, mode: "insensitive" } },
+      ];
+    }
+
+    const [drivers, total] = await Promise.all([
+      prisma.driver.findMany({
+        where,
+        skip,
+        take,
+        include: {
+          vendor: { select: { id: true, name: true } },
+          vehicle: { select: { id: true, vehicleNumber: true, type: true } },
+          user: {
+            select: {
+              id: true,
+              email: true,
+              role: true,
+              isActive: true,
+              qrCode: true,
+            },
+          },
+          _count: {
+            select: {
+              rides: true,
+              complaints: true,
+              weeklySchedules: true,
+            },
+          },
+        },
+        orderBy: { [sortBy]: sortOrder },
+      }),
+      prisma.driver.count({ where }),
+    ]);
+
+    // Map drivers to include counts and QR info
+    const driversWithCounts = drivers.map((driver) => ({
+      ...driver,
+      rideCount: driver._count.rides,
+      complaintCount: driver._count.complaints,
+      scheduleCount: driver._count.weeklySchedules,
+      hasQRCode: Boolean(driver.user?.qrCode),
+      assignedVehicle: driver.vehicle
+        ? {
+            id: driver.vehicle.id,
+            vehicleNumber: driver.vehicle.vehicleNumber,
+            type: driver.vehicle.type,
+          }
+        : null,
+      _count: undefined,
+    }));
+
+    // For dropdown (all=true), return simplified response
+    if (all) {
+      const response = okResponse(
+        {
+          drivers: driversWithCounts,
+          total,
+        },
+        "Drivers retrieved successfully.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    // Full response with pagination
+    const response = okResponse(
+      {
+        drivers: driversWithCounts,
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
+        filters: {
+          search: search || null,
+          status: status || null,
+          vendorId: vendorId || null,
+          unassignedOnly: unassignedOnly === "true",
+        },
+      },
+      "Drivers retrieved successfully.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log("error", error);
+    next(error);
+  }
+};
+const getDriverById = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const driver = await prisma.driver.findUnique({
+      where: { id },
+      include: {
+        vendor: true,
+        vehicle: true,
+        user: {
+          select: {
+            id: true,
+            email: true,
+            role: true,
+            isActive: true,
+            qrCode: true,
+            createdAt: true,
+          },
+        },
+        rides: {
+          take: 10,
+          orderBy: { rideDate: "desc" },
+          include: {
+            route: { select: { id: true, routeName: true, routeCode: true } },
+          },
+        },
+        trips: {
+          take: 10,
+          orderBy: { createdAt: "desc" },
+        },
+        complaints: {
+          take: 10,
+          orderBy: { createdAt: "desc" },
+        },
+        weeklySchedules: {
+          take: 10,
+          orderBy: { weekStart: "desc" },
+        },
+        _count: {
+          select: {
+            rides: true,
+            complaints: true,
+            weeklySchedules: true,
+          },
         },
       },
     });
 
-    if (!response) {
+    if (!driver) {
       const errorResponse = badRequestResponse("Driver not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const updateMyProfile = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { name, phone } = req.body;
-
-    const response = await updateRecord(prisma.driver, driver.id, {
-      ...(name !== undefined && { name }),
-      ...(phone !== undefined && { phone }),
-    });
-
-    notifyRoles(STAFF_ROLES, {
-      title: "Driver profile updated",
-      body: `${name ?? driver.name} updated their profile.`,
-      data: { driverId: driver.id, type: "DRIVER_PROFILE_UPDATED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getMyQrCode = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (!driver.userId) {
-      const errorResponse = badRequestResponse(
-        "No login is linked to this driver yet.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { id: driver.userId },
-      select: { qrCode: true },
-    });
-
-    if (!user?.qrCode) {
-      const errorResponse = badRequestResponse(
-        "No QR code has been generated for this driver yet.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (req.query.format === "base64") {
-      const dataUrl = await QRCode.toDataURL(user.qrCode, {
-        width: 400,
-        margin: 2,
-        errorCorrectionLevel: "M",
-      });
-      const response = okResponse(
-        { qrCode: dataUrl },
-        "QR code retrieved successfully.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    const pngBuffer = await QRCode.toBuffer(user.qrCode, {
-      width: 400,
-      margin: 2,
-      errorCorrectionLevel: "M",
-    });
-    res.set("Content-Type", "image/png");
-    return res.send(pngBuffer);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getTodayRide = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const rides = await prisma.ride.findMany({
-      where: {
-        driverId: driver.id,
-        rideDate: { gte: startOfDay(), lte: endOfDay() },
-      },
-      include: {
-        route: {
-          select: {
-            id: true,
-            routeName: true,
-            routeCode: true,
-            officeLocation: true,
-          },
-        },
-        vehicle: {
-          select: { id: true, vehicleNumber: true, make: true, model: true },
-        },
-        passengers: { select: { id: true } },
-      },
-      orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
-    });
+    const driverWithCounts = {
+      ...driver,
+      rideCount: driver._count.rides,
+      complaintCount: driver._count.complaints,
+      scheduleCount: driver._count.weeklySchedules,
+      hasQRCode: Boolean(driver.user?.qrCode),
+      qrImageUrl: driver.user?.qrCode
+        ? `/qrcodes/drivers/${driver.name.replace(/\s+/g, "")}-${driver.id}.png`
+        : null,
+      _count: undefined,
+    };
 
     const response = okResponse(
-      rides.map((ride) => ({
-        ...ride,
-        passengerCount: ride.passengers?.length,
-        source: "RIDE",
-      })),
-      rides.length
-        ? "Today's rides retrieved successfully."
-        : "No ride scheduled for today.",
+      driverWithCounts,
+      "Driver retrieved successfully.",
     );
+
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log("error", error);
     next(error);
   }
 };
 
-const getMyRides = async (req, res, next) => {
+const updateDriver = async (req, res, next) => {
   try {
-    const driver = await getDriverFromReq(req);
+    const { id } = req.params;
+    const { vehicleId, resetPassword, regenerateQR, ...updateData } = req.body;
+
+    const driver = await prisma.driver.findUnique({
+      where: { id },
+      include: { user: true },
+    });
+
     if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
+      const errorResponse = badRequestResponse("Driver not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const skip = parseInt(req.query.skip) || 0;
-    const take = parseInt(req.query.take) || 10;
-    const { status } = req.query;
+    // Check CNIC uniqueness
+    if (updateData.cnic && updateData.cnic !== driver.cnic) {
+      const existingCnic = await prisma.driver.findUnique({
+        where: { cnic: updateData.cnic },
+      });
+      if (existingCnic) {
+        const errorResponse = badRequestResponse(
+          "Driver with this CNIC already exists.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+    }
 
-    const options = {
-      where: {
-        driverId: driver.id,
-        ...(status && { status }),
-      },
+    // Check license number uniqueness
+    if (
+      updateData.licenseNumber &&
+      updateData.licenseNumber !== driver.licenseNumber
+    ) {
+      const existingLicense = await prisma.driver.findUnique({
+        where: { licenseNumber: updateData.licenseNumber },
+      });
+      if (existingLicense) {
+        const errorResponse = badRequestResponse(
+          "Driver with this license number already exists.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      // Handle vehicle assignment
+      if (vehicleId !== undefined) {
+        await tx.vehicle.updateMany({
+          where: { driverId: id },
+          data: { driverId: null },
+        });
+
+        if (vehicleId) {
+          const targetVehicle = await tx.vehicle.findUnique({
+            where: { id: vehicleId },
+          });
+          if (!targetVehicle) {
+            const err = new Error("Vehicle not found.");
+            err.isBadRequest = true;
+            throw err;
+          }
+
+          if (targetVehicle.driverId && targetVehicle.driverId !== id) {
+            const err = new Error(
+              "Vehicle is already assigned to another driver.",
+            );
+            err.isBadRequest = true;
+            throw err;
+          }
+
+          await tx.vehicle.update({
+            where: { id: vehicleId },
+            data: { driverId: id },
+          });
+        }
+      }
+
+      const updatedDriver = await tx.driver.update({
+        where: { id },
+        data: updateData,
+        include: {
+          vendor: true,
+          vehicle: true,
+          user: { select: { id: true, email: true, role: true, qrCode: true } },
+        },
+      });
+
+      // Update user account
+      if (driver.userId) {
+        const userUpdateData = {};
+
+        if (updateData.name) userUpdateData.name = updateData.name;
+
+        // Reset password if requested
+        if (resetPassword) {
+          userUpdateData.passwordHash = await hashPassword(
+            DEFAULT_DRIVER_PASSWORD,
+          );
+        }
+
+        // Regenerate QR code if requested
+        if (regenerateQR) {
+          userUpdateData.qrCode = crypto.randomBytes(32).toString("hex");
+        }
+
+        if (Object.keys(userUpdateData).length > 0) {
+          await tx.user.update({
+            where: { id: driver.userId },
+            data: userUpdateData,
+          });
+        }
+      }
+
+      return updatedDriver;
+    });
+
+    // Regenerate QR image if requested
+    if (regenerateQR && result.user?.qrCode) {
+      try {
+        const safeName = result.name
+          .replace(/\s+/g, "")
+          .replace(/[\\/:*?"<>|]/g, "");
+        const qrPath = path.join(QR_DIR, `${safeName}-${result.id}.png`);
+
+        const qrData = JSON.stringify({
+          type: "DRIVER_AUTH",
+          token: result.user.qrCode,
+          userId: result.user.id,
+          driverId: result.id,
+          version: 1,
+        });
+
+        await QRCode.toFile(qrPath, qrData, {
+          width: 400,
+          margin: 2,
+          errorCorrectionLevel: "H",
+        });
+      } catch (qrError) {
+        console.error("QR code regeneration failed:", qrError);
+      }
+    }
+
+    const response = okResponse(result, "Driver updated successfully.");
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    if (error.isBadRequest) {
+      const errorResponse = badRequestResponse(error.message);
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+    console.log("error", error);
+    next(error);
+  }
+};
+
+const deleteDriver = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const driver = await prisma.driver.findUnique({
+      where: { id },
       include: {
-        route: { select: { id: true, routeName: true } },
-        vehicle: { select: { id: true, vehicleNumber: true } },
-        passengers: { select: { id: true } },
-
-        _count: { select: { passengers: true } },
+        user: true,
+        vehicle: true,
+        _count: {
+          select: {
+            rides: true,
+            trips: true,
+            complaints: true,
+            weeklySchedules: true,
+          },
+        },
       },
-      orderBy: { rideDate: "desc" },
-      skip,
-      take,
-    };
+    });
+
+    if (!driver) {
+      const errorResponse = badRequestResponse("Driver not found.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Check for dependent records
+    const blocking = [];
+    if (driver._count.rides > 0)
+      blocking.push(`${driver._count.rides} ride(s)`);
+    if (driver._count.trips > 0)
+      blocking.push(`${driver._count.trips} trip(s)`);
+    if (driver._count.complaints > 0)
+      blocking.push(`${driver._count.complaints} complaint(s)`);
+    if (driver._count.weeklySchedules > 0)
+      blocking.push(`${driver._count.weeklySchedules} schedule(s)`);
+
+    if (blocking.length > 0) {
+      const errorResponse = badRequestResponse(
+        `Cannot delete driver: referenced by ${blocking.join(", ")}. Remove related records first.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      // Unassign vehicle if assigned
+      if (driver.vehicle) {
+        await tx.vehicle.update({
+          where: { id: driver.vehicle.id },
+          data: { driverId: null },
+        });
+      }
+
+      // Delete user account
+      if (driver.userId) {
+        // Delete device tokens
+        await tx.deviceToken.deleteMany({
+          where: { userId: driver.userId },
+        });
+
+        // Delete notifications
+        await tx.notification.deleteMany({
+          where: { userId: driver.userId },
+        });
+
+        // Delete user
+        await tx.user.delete({ where: { id: driver.userId } });
+      }
+
+      // Delete driver
+      await tx.driver.delete({ where: { id } });
+
+      return driver;
+    });
+
+    // Delete QR code image file if exists
+    try {
+      const safeName = result.name
+        .replace(/\s+/g, "")
+        .replace(/[\\/:*?"<>|]/g, "");
+      const qrPath = path.join(QR_DIR, `${safeName}-${result.id}.png`);
+      if (fs.existsSync(qrPath)) {
+        fs.unlinkSync(qrPath);
+      }
+    } catch (fileError) {
+      console.error("Failed to delete QR code file:", fileError);
+    }
+
+    const response = okResponse(
+      { id: result.id, name: result.name },
+      "Driver and associated user deleted successfully.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.log("error", error);
+    next(error);
+  }
+};
+
+const getDriverRides = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { page = 1, limit = 10, status, fromDate, toDate } = req.query;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
+
+    const where = { driverId: id };
+    if (status) where.status = status;
+
+    if (fromDate || toDate) {
+      where.rideDate = {};
+      if (fromDate) where.rideDate.gte = new Date(fromDate);
+      if (toDate) where.rideDate.lte = new Date(toDate);
+    }
 
     const [rides, total] = await Promise.all([
-      prisma.ride.findMany(options),
-      prisma.ride.count({ where: options.where }),
+      prisma.ride.findMany({
+        where,
+        skip,
+        take,
+        include: {
+          route: { select: { id: true, routeName: true, routeCode: true } },
+          vehicle: { select: { id: true, vehicleNumber: true } },
+          _count: {
+            select: { passengers: true },
+          },
+        },
+        orderBy: { rideDate: "desc" },
+      }),
+      prisma.ride.count({ where }),
     ]);
 
+    const ridesWithCounts = rides.map((ride) => ({
+      ...ride,
+      passengerCount: ride._count.passengers,
+      _count: undefined,
+    }));
+
     const response = okResponse(
-      { data: rides, total, skip, take },
-      "Rides retrieved successfully.",
+      {
+        driverId: id,
+        rides: ridesWithCounts,
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
+      },
+      "Driver rides retrieved successfully.",
     );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const RIDE_STATUS_TRANSITIONS = {
-  PENDING: ["STARTED", "CANCELLED"],
-  STARTED: ["ARRIVED", "COMPLETED"],
-  ARRIVED: ["COMPLETED"],
-  COMPLETED: [],
-  CANCELLED: [],
-};
-
-const ACTIVE_RIDE_STATUSES = ["STARTED", "ARRIVED"];
-
-const applyRideStatusTransition = async ({
-  driver,
-  rideId,
-  nextStatus,
-  extraData = {},
-}) => {
-  const ride = await prisma.ride.findUnique({
-    where: { id: rideId },
-    include: { route: { select: { routeName: true } } },
-  });
-  if (!ride || ride.driverId !== driver.id) {
-    return { error: badRequestResponse("Ride not found.") };
-  }
-
-  const allowedNext = RIDE_STATUS_TRANSITIONS[ride.status] || [];
-  if (!allowedNext.includes(nextStatus)) {
-    return {
-      error: badRequestResponse(
-        `Cannot move ride from ${ride.status} to ${nextStatus}.`,
-      ),
-    };
-  }
-
-  if (nextStatus === "STARTED") {
-    const otherActiveRide = await prisma.ride.findFirst({
-      where: {
-        driverId: driver.id,
-        id: { not: rideId },
-        status: { in: ACTIVE_RIDE_STATUSES },
-      },
-      select: { id: true, route: { select: { routeName: true } } },
-    });
-    if (otherActiveRide) {
-      return {
-        error: badRequestResponse(
-          `You already have a ride in progress (${otherActiveRide?.route?.routeName ?? "another route"}). Complete it before starting a new one.`,
-        ),
-      };
-    }
-  }
-
-  const driverStatus =
-    nextStatus === "STARTED" || nextStatus === "ARRIVED"
-      ? "ON_RIDE"
-      : "AVAILABLE";
-
-  const [updatedRide, updatedDriver] = await prisma.$transaction([
-    prisma.ride.update({
-      where: { id: rideId },
-      data: {
-        status: nextStatus,
-        ...extraData,
-      },
-    }),
-    prisma.driver.update({
-      where: { id: driver.id },
-      data: { status: driverStatus },
-    }),
-  ]);
-
-  notifyPassengersOfRideStatus({ ride, nextStatus }).catch((err) =>
-    console.error(
-      "[driver_controller] notifyPassengersOfRideStatus failed:",
-      err,
-    ),
-  );
-
-  return {
-    response: okResponse(
-      { ...updatedRide, driverStatus: updatedDriver.status },
-      `Ride status updated to ${nextStatus}`,
-    ),
-  };
-};
-
-const RIDE_STATUS_NOTIFICATIONS = {
-  STARTED: {
-    title: "Ride started",
-    body: (routeName) => `Your driver is on the way for ${routeName}.`,
-  },
-  ARRIVED: {
-    title: "Driver has arrived",
-    body: (routeName) => `Your driver has arrived for ${routeName}.`,
-  },
-  COMPLETED: {
-    title: "Ride completed",
-    body: (routeName) => `Your ride on ${routeName} has been completed.`,
-  },
-  CANCELLED: {
-    title: "Ride cancelled",
-    body: (routeName) => `Your ride on ${routeName} has been cancelled.`,
-  },
-};
-
-// Fire-and-forget: notify every passenger on the ride in real-time (Pusher)
-// and via push (Expo) whenever the driver moves the ride to a new status.
-const notifyPassengersOfRideStatus = async ({ ride, nextStatus }) => {
-  const notification = RIDE_STATUS_NOTIFICATIONS[nextStatus];
-  if (!notification) return;
-
-  const passengers = await prisma.ridePassenger.findMany({
-    where: { rideId: ride.id },
-    select: { employee: { select: { userId: true } } },
-  });
-  const userIds = passengers.map((p) => p.employee?.userId).filter(Boolean);
-  if (userIds.length === 0) return;
-
-  const routeName = ride.route?.routeName ?? "your route";
-  await notifyUsers(userIds, {
-    title: notification.title,
-    body: notification.body(routeName),
-    data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
-    event: "ride-status-updated",
-  });
-};
-
-const updateRideStatus = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id } = req.params;
-    const { status } = req.body;
-
-    if (!status || !RIDE_STATUS_TRANSITIONS[status]) {
-      const errorResponse = badRequestResponse("Invalid ride status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, response } = await applyRideStatusTransition({
-      driver,
-      rideId: id,
-      nextStatus: status,
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const startRide = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, response } = await applyRideStatusTransition({
-      driver,
-      rideId: req.params.id,
-      nextStatus: "STARTED",
-    });
-    console.log("error", error);
-    if (error) return res.status(error.status.code).json(error);
 
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -459,1024 +688,86 @@ const startRide = async (req, res, next) => {
   }
 };
 
-const startTodayRide = async (req, res, next) => {
+const getDriverComplaints = async (req, res, next) => {
   try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const todaysRides = await prisma.ride.findMany({
-      where: {
-        driverId: driver.id,
-        rideDate: { gte: startOfDay(), lte: endOfDay() },
-      },
-      include: {
-        route: {
-          select: {
-            id: true,
-            routeName: true,
-            routeCode: true,
-            officeLocation: true,
-          },
-        },
-        vehicle: {
-          select: { id: true, vehicleNumber: true, make: true, model: true },
-        },
-        passengers: { select: { id: true } },
-      },
-      orderBy: [{ pickupTime: "asc" }, { createdAt: "asc" }],
-    });
-
-    if (todaysRides.length === 0) {
-      const errorResponse = badRequestResponse(
-        "No ride has been assigned for today yet. Contact dispatch.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (todaysRides.length > 1) {
-      const errorResponse = badRequestResponse(
-        "You have multiple rides today — start the specific ride from your ride list instead.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const existingRide = todaysRides[0];
-
-    if (existingRide.status !== "PENDING") {
-      const response = okResponse(
-        {
-          ...existingRide,
-          passengerCount: existingRide.passengers.length,
-          source: "RIDE",
-        },
-        existingRide.status === "STARTED"
-          ? "Today's ride is already in progress."
-          : "Today's ride is no longer pending.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    const { error, response } = await applyRideStatusTransition({
-      driver,
-      rideId: existingRide.id,
-      nextStatus: "STARTED",
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    console.log("error", error);
-    next(error);
-  }
-};
-
-const completeRide = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const rideId = req.params.id;
-
-    const ride = await prisma.ride.findUnique({
-      where: { id: rideId },
-      include: {
-        passengers: {
-          include: { employee: { select: { id: true, name: true } } },
-        },
-        attendances: { select: { employeeId: true, leg: true } },
-      },
-    });
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const resolvedAttendanceKeys = new Set(
-      ride.attendances.map((a) => `${a.employeeId}:${a.leg || "PICKUP"}`),
-    );
-    const pendingPassengers = ride.passengers.filter(
-      (p) => !resolvedAttendanceKeys.has(`${p.employeeId}:${p.leg || "PICKUP"}`),
-    );
-
-    if (pendingPassengers.length > 0) {
-      const names = pendingPassengers.map((p) => p.employee.name).join(", ");
-      const errorResponse = badRequestResponse(
-        `${pendingPassengers.length} passenger(s) still need attendance recorded before this ride can be completed: ${names}. Mark any no-shows as Absent, then complete the ride.`,
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, response } = await applyRideStatusTransition({
-      driver,
-      rideId,
-      nextStatus: "COMPLETED",
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const cancelRide = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { reason } = req.body;
-    if (!reason || !String(reason).trim()) {
-      const errorResponse = badRequestResponse(
-        "A cancellation reason is required.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, response } = await applyRideStatusTransition({
-      driver,
-      rideId: req.params.id,
-      nextStatus: "CANCELLED",
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "RIDE_CANCELLED_BY_DRIVER",
-        model: "Ride",
-        recordId: req.params.id,
-        after: { reason: String(reason).trim() },
-      },
-    });
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getRideDetails = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
     const { id } = req.params;
+    const { page = 1, limit = 10, status } = req.query;
 
-    const ride = await prisma.ride.findUnique({
-      where: { id },
-      include: {
-        route: {
-          select: {
-            id: true,
-            routeName: true,
-            routeCode: true,
-            officeLocation: true,
-          },
-        },
-        vehicle: {
-          select: { id: true, vehicleNumber: true, make: true, model: true },
-        },
-        passengers: { select: { id: true } },
-        attendances: { select: { employeeId: true, status: true } },
-      },
-    });
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
 
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const response = okResponse(
-      { ...ride, passengerCount: ride.passengers.length },
-      "Ride details retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getRideStops = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id } = req.params;
-
-    const ride = await prisma.ride.findUnique({
-      where: { id },
-      include: {
-        passengers: {
-          include: {
-            employee: {
-              select: {
-                id: true,
-                name: true,
-                contactNumber: true,
-                address: true,
-                area: { select: { id: true, name: true } },
-              },
-            },
-          },
-        },
-        attendances: {
-          select: {
-            employeeId: true,
-            leg: true,
-            status: true,
-            vendorLateStatus: true,
-            delayMinutes: true,
-          },
-        },
-      },
-    });
-
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const attendanceByEmployeeLeg = Object.fromEntries(
-      ride.attendances.map((a) => [`${a.employeeId}:${a.leg || "PICKUP"}`, a]),
-    );
-
-    const passengerStops = ride.passengers.map((p) => {
-      const leg = p.leg || "PICKUP";
-      const attendance = attendanceByEmployeeLeg[`${p.employeeId}:${leg}`];
-
-      return {
-        kind: "passenger",
-        employeeId: p.employee.id,
-        employeeName: p.employee.name,
-        leg,
-        contact: p.contact || p.employee.contactNumber,
-        address: p.address || p.employee.address,
-        areaName: p.employee.area?.name ?? null,
-        status: attendance?.status || "PENDING",
-        vendorLateStatus: attendance?.vendorLateStatus || "UNCLASSIFIED",
-        delayMinutes: attendance?.delayMinutes ?? null,
-      };
-    });
-
-    const response = okResponse(
-      { rideId: ride.id, stops: passengerStops },
-      "Ride stops retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const ATTENDANCE_STATUSES = ["PRESENT", "LATE", "ABSENT", "NO_SHOW"];
-const LATE_GRACE_MINUTES = 10;
-
-function parsePickupTimeToMinutes(raw) {
-  if (!raw) return null;
-  const s = String(raw).replace(/\s+/g, "").toUpperCase();
-  const match = s.match(/^(\d{1,2}):?(\d{2})?:?(AM|PM)?$/);
-  if (!match) return null;
-  let hour = parseInt(match[1], 10);
-  const minute = match[2] ? parseInt(match[2], 10) : 0;
-  const meridiem = match[3];
-  if (Number.isNaN(hour) || Number.isNaN(minute) || hour > 23 || minute > 59)
-    return null;
-  if (meridiem === "PM" && hour !== 12) hour += 12;
-  if (meridiem === "AM" && hour === 12) hour = 0;
-  return hour * 60 + minute;
-}
-
-function computeArrivalStatus(pickupTime, scannedAt = new Date()) {
-  const scheduledMinutes = parsePickupTimeToMinutes(pickupTime);
-  if (scheduledMinutes === null) return "PRESENT";
-  const scannedMinutes = scannedAt.getHours() * 60 + scannedAt.getMinutes();
-  return scannedMinutes > scheduledMinutes + LATE_GRACE_MINUTES
-    ? "LATE"
-    : "PRESENT";
-}
-
-const upsertAttendanceForEmployee = async ({
-  ride,
-  employeeId,
-  status,
-  vendorLateStatus,
-  delayMinutes,
-  leg = "PICKUP",
-}) => {
-  const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
-
-  const passenger = await prisma.ridePassenger.findUnique({
-    where: {
-      rideId_employeeId_leg: {
-        rideId: ride.id,
-        employeeId,
-        leg: normalizedLeg,
-      },
-    },
-  });
-  if (!passenger) {
-    return { error: badRequestResponse("This passenger is not on this ride.") };
-  }
-
-  const delayValue =
-    delayMinutes === "" || delayMinutes === null || delayMinutes === undefined
-      ? null
-      : Number(delayMinutes);
-
-  if (delayValue !== null && Number.isNaN(delayValue)) {
-    return {
-      error: badRequestResponse("Delay minutes must be a valid number."),
-    };
-  }
-
-  if (delayValue !== null && delayValue < 0) {
-    return {
-      error: badRequestResponse("Delay minutes cannot be negative."),
-    };
-  }
-
-  const normalizedVendorLateStatus =
-    vendorLateStatus === undefined || vendorLateStatus === null || vendorLateStatus === ""
-      ? "UNCLASSIFIED"
-      : normalizeVendorLateStatus(vendorLateStatus);
-
-  const rideDate = startOfDay(ride.rideDate);
-
-  const attendance = await prisma.attendance.upsert({
-    where: {
-      employeeId_rideDate_leg: {
-        employeeId,
-        rideDate,
-        leg: normalizedLeg,
-      },
-    },
-    update: {
-      status,
-      rideId: ride.id,
-      arrivalTime: new Date(),
-      leg: normalizedLeg,
-      vendorLateStatus: normalizedVendorLateStatus,
-      delayMinutes: delayValue,
-    },
-    create: {
-      employeeId,
-      rideId: ride.id,
-      rideDate,
-      leg: normalizedLeg,
-      status,
-      arrivalTime: new Date(),
-      vendorLateStatus: normalizedVendorLateStatus,
-      delayMinutes: delayValue,
-    },
-    include: { employee: { select: { id: true, name: true, userId: true } } },
-  });
-
-  return { attendance };
-};
-
-// Fire-and-forget: let the employee know their attendance status changed,
-// in real-time (Pusher) and via push (Expo).
-const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
-  const employeeUserId = attendance?.employee?.userId;
-  if (!employeeUserId) return;
-
-  const status = attendance.status;
-  notifyUser(employeeUserId, {
-    title: ["ABSENT", "NO_SHOW"].includes(status)
-      ? "Marked absent"
-      : "Attendance marked",
-    body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
-    data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
-    event: "attendance-updated",
-  }).catch((err) =>
-    console.error("[driver_controller] notifyUser failed:", err),
-  );
-};
-
-const markAttendance = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id: rideId } = req.params;
-    const {
-      employeeId,
-      qrCode,
-      status: explicitStatus,
-      vendorLateStatus,
-      delayMinutes,
-      leg,
-    } = req.body;
-
-    if (explicitStatus && !ATTENDANCE_STATUSES.includes(explicitStatus)) {
-      const errorResponse = badRequestResponse("Invalid attendance status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      vendorLateStatus !== undefined &&
-      vendorLateStatus !== null &&
-      vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
-    ) {
-      const errorResponse = badRequestResponse("Invalid vendor late status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
-      const errorResponse = badRequestResponse(
-        ride.status === "PENDING"
-          ? "Start this ride before scanning attendance for it."
-          : `This ride is already ${ride.status.toLowerCase()} — attendance can no longer be scanned for it.`,
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const status = explicitStatus ?? computeArrivalStatus(ride.pickupTime);
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
-
-    let resolvedEmployeeId = employeeId;
-    if (!resolvedEmployeeId && qrCode) {
-      const user = await prisma.user.findUnique({
-        where: { qrCode },
-        include: { employee: { select: { id: true } } },
-      });
-      resolvedEmployeeId = user?.employee?.id;
-    }
-
-    if (!resolvedEmployeeId) {
-      const errorResponse = badRequestResponse(
-        "Could not resolve a passenger from the scanned code.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const rideDate = startOfDay(ride.rideDate);
-    const existingAttendance = await prisma.attendance.findFirst({
-      where: {
-        employeeId: resolvedEmployeeId,
-        rideDate,
-        leg: normalizedLeg,
-      },
-      include: { employee: { select: { id: true, name: true, userId: true } } },
-    });
-    if (existingAttendance?.rideId === ride.id) {
-      const response = okResponse(
-        existingAttendance,
-        "Attendance was already marked for this passenger.",
-      );
-      return res.status(response.status.code).json(response);
-    }
-
-    const { error, attendance } = await upsertAttendanceForEmployee({
-      ride,
-      employeeId: resolvedEmployeeId,
-      status,
-      vendorLateStatus,
-      delayMinutes,
-      leg: normalizedLeg,
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
-
-    const response = okResponse(attendance, "Attendance marked successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getActiveRide = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const activeRide = await prisma.ride.findFirst({
-      where: {
-        driverId: driver.id,
-        status: { in: ACTIVE_RIDE_STATUSES },
-        rideDate: { gte: startOfDay(), lte: endOfDay() },
-      },
-      orderBy: { rideDate: "desc" },
-      include: {
-        route: {
-          select: {
-            id: true,
-            routeName: true,
-            routeCode: true,
-            officeLocation: true,
-          },
-        },
-        vehicle: {
-          select: { id: true, vehicleNumber: true, make: true, model: true },
-        },
-        passengers: { select: { id: true } },
-      },
-    });
-
-    const response = okResponse(
-      activeRide
-        ? { ...activeRide, passengerCount: activeRide.passengers.length }
-        : null,
-      activeRide
-        ? "Active ride retrieved successfully."
-        : "No active ride right now.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const updateStopStatus = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id: rideId, stopId: employeeId } = req.params;
-    const { status, vendorLateStatus, delayMinutes, leg } = req.body;
-
-    if (!ATTENDANCE_STATUSES.includes(status)) {
-      const errorResponse = badRequestResponse("Invalid attendance status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      vendorLateStatus !== undefined &&
-      vendorLateStatus !== null &&
-      vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
-    ) {
-      const errorResponse = badRequestResponse("Invalid vendor late status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
-      const errorResponse = badRequestResponse(
-        ride.status === "PENDING"
-          ? "Start this ride before updating stop status."
-          : `This ride is already ${ride.status.toLowerCase()} — stops can no longer be updated.`,
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, attendance } = await upsertAttendanceForEmployee({
-      ride,
-      employeeId,
-      status,
-      vendorLateStatus,
-      delayMinutes,
-      leg,
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
-
-    const response = okResponse(
-      attendance,
-      "Stop status updated successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const updateAttendance = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id: rideId, employeeId } = req.params;
-    const { status, vendorLateStatus, delayMinutes, leg } = req.body;
-
-    if (!ATTENDANCE_STATUSES.includes(status)) {
-      const errorResponse = badRequestResponse("Invalid attendance status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      vendorLateStatus !== undefined &&
-      vendorLateStatus !== null &&
-      vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
-    ) {
-      const errorResponse = badRequestResponse("Invalid vendor late status.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { error, attendance } = await upsertAttendanceForEmployee({
-      ride,
-      employeeId,
-      status,
-      vendorLateStatus,
-      delayMinutes,
-      leg,
-    });
-    if (error) return res.status(error.status.code).json(error);
-
-    notifyEmployeeOfAttendance({ attendance, driverName: driver.name });
-
-    const response = okResponse(attendance, "Attendance updated successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getRideAttendance = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { id: rideId } = req.params;
-
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (!ride || ride.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Ride not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const attendances = await prisma.attendance.findMany({
-      where: { rideId },
-      include: { employee: { select: { id: true, name: true } } },
-      orderBy: { arrivalTime: "desc" },
-    });
-
-    const response = okResponse(
-      attendances,
-      "Ride attendance retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const createComplaint = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { category, title, description, rideId, vehicleId } = req.body;
-
-    if (!title || !title.trim()) {
-      const errorResponse = badRequestResponse("Title is required.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const response = await createRecord(prisma.complaint, {
-      driverId: driver.id,
-      category: category || "OTHER",
-      title: title.trim(),
-      description: description?.trim() || null,
-      ...(rideId && { rideId }),
-      ...(vehicleId && { vehicleId }),
-    });
-
-    const complaint = response?.data;
-    notifyRoles(STAFF_ROLES, {
-      title: "New complaint filed",
-      body: `${driver.name} filed a complaint: ${title.trim()}`,
-      data: { complaintId: complaint?.id, type: "COMPLAINT_CREATED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
-
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getMyComplaints = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const skip = parseInt(req.query.skip) || 0;
-    const take = parseInt(req.query.take) || 10;
-    const { status } = req.query;
-
-    const where = {
-      driverId: driver.id,
-      ...(status && { status }),
-    };
+    const where = { driverId: id };
+    if (status) where.status = status;
 
     const [complaints, total] = await Promise.all([
       prisma.complaint.findMany({
         where,
-        orderBy: { createdAt: "desc" },
         skip,
         take,
+        include: {
+          employee: { select: { id: true, name: true, employeeCode: true } },
+          ride: { select: { id: true, rideDate: true } },
+          vehicle: { select: { id: true, vehicleNumber: true } },
+        },
+        orderBy: { createdAt: "desc" },
       }),
       prisma.complaint.count({ where }),
     ]);
 
     const response = okResponse(
-      { data: complaints, total, skip, take },
-      "Complaints retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getComplaintDetails = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const complaint = await prisma.complaint.findUnique({
-      where: { id: req.params.id },
-    });
-    if (!complaint || complaint.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Complaint not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const response = okResponse(complaint, "Complaint retrieved successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const updateComplaint = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const complaint = await prisma.complaint.findUnique({
-      where: { id: req.params.id },
-    });
-    if (!complaint || complaint.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Complaint not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-    if (complaint.status !== "OPEN") {
-      const errorResponse = badRequestResponse(
-        "Only complaints that are still open can be edited.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { title, description, status } = req.body;
-    if (status && status !== "DISMISSED") {
-      const errorResponse = badRequestResponse(
-        "You can only withdraw (dismiss) your own complaint.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const response = await updateRecord(prisma.complaint, req.params.id, {
-      ...(title !== undefined && { title: title.trim() }),
-      ...(description !== undefined && {
-        description: description?.trim() || null,
-      }),
-      ...(status && { status }),
-    });
-
-    notifyRoles(STAFF_ROLES, {
-      title: status === "DISMISSED" ? "Complaint withdrawn" : "Complaint updated",
-      body:
-        status === "DISMISSED"
-          ? `${driver.name} withdrew their complaint: ${complaint.title}`
-          : `${driver.name} updated their complaint: ${title?.trim() ?? complaint.title}`,
-      data: {
-        complaintId: complaint.id,
-        type: status === "DISMISSED" ? "COMPLAINT_DISMISSED" : "COMPLAINT_UPDATED",
+      {
+        driverId: id,
+        complaints,
+        pagination: {
+          page: parseInt(page),
+          limit: take,
+          total,
+          totalPages: Math.ceil(total / take),
+          hasNextPage: parseInt(page) < Math.ceil(total / take),
+          hasPrevPage: parseInt(page) > 1,
+        },
       },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
+      "Driver complaints retrieved successfully.",
     );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log("error", error);
     next(error);
   }
 };
 
-const deleteComplaint = async (req, res, next) => {
+const updateDriverStatus = async (req, res, next) => {
   try {
-    const driver = await getDriverFromReq(req);
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ["AVAILABLE", "ON_RIDE", "OFFLINE", "INACTIVE"];
+    if (!validStatuses.includes(status)) {
+      const response = badRequestResponse("Invalid driver status.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const driver = await prisma.driver.findUnique({ where: { id } });
     if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
+      const errorResponse = badRequestResponse("Driver not found.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const complaint = await prisma.complaint.findUnique({
-      where: { id: req.params.id },
+    const updatedDriver = await prisma.driver.update({
+      where: { id },
+      data: { status },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        updatedAt: true,
+      },
     });
-    if (!complaint || complaint.driverId !== driver.id) {
-      const errorResponse = badRequestResponse("Complaint not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-    if (complaint.status !== "OPEN") {
-      const errorResponse = badRequestResponse(
-        "Only complaints that are still open can be deleted.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    await prisma.complaint.delete({ where: { id: req.params.id } });
-
-    notifyRoles(STAFF_ROLES, {
-      title: "Complaint deleted",
-      body: `${driver.name} deleted their complaint: ${complaint.title}`,
-      data: { complaintId: complaint.id, type: "COMPLAINT_DELETED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
-
-    const response = okResponse(null, "Complaint deleted successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getNotifications = async (req, res, next) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      const errorResponse = badRequestResponse("User not authenticated.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { skip, take } = parsePagination(req.query);
-    const { status } = req.query;
-
-    const where = {
-      userId,
-      ...(status && { status }),
-    };
-
-    const [notifications, total] = await Promise.all([
-      prisma.notification.findMany({
-        where,
-        orderBy: { createdAt: "desc" },
-        skip,
-        take,
-      }),
-      prisma.notification.count({ where }),
-    ]);
 
     const response = okResponse(
-      { data: notifications, total, skip, take },
-      "Notifications retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const markNotificationAsRead = async (req, res, next) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      const errorResponse = badRequestResponse("User not authenticated.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const notification = await prisma.notification.findUnique({
-      where: { id: req.params.id },
-    });
-    if (!notification || notification.userId !== userId) {
-      const errorResponse = badRequestResponse("Notification not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const updated = await prisma.notification.update({
-      where: { id: req.params.id },
-      data: { status: "READ" },
-    });
-
-    // ✅ NO Pusher events - just return success
-    const response = okResponse(updated, "Notification marked as read.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const deleteNotification = async (req, res, next) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      const errorResponse = badRequestResponse("User not authenticated.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const notification = await prisma.notification.findUnique({
-      where: { id: req.params.id },
-    });
-    if (!notification || notification.userId !== userId) {
-      const errorResponse = badRequestResponse("Notification not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    await prisma.notification.delete({ where: { id: req.params.id } });
-
-    const response = okResponse(null, "Notification deleted successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const markAllNotificationsAsRead = async (req, res, next) => {
-  try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      const errorResponse = badRequestResponse("User not authenticated.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { count } = await prisma.notification.updateMany({
-      where: {
-        userId,
-        status: "UNREAD",
-      },
-      data: { status: "READ" },
-    });
-
-    // ✅ NO Pusher events - just return success
-    const response = okResponse(
-      { markedCount: count },
-      `${count} notification(s) marked as read.`,
+      updatedDriver,
+      "Driver status updated successfully.",
     );
     return res.status(response.status.code).json(response);
   } catch (error) {
@@ -1485,227 +776,13 @@ const markAllNotificationsAsRead = async (req, res, next) => {
   }
 };
 
-const deleteAccount = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    await prisma.$transaction([
-      prisma.driver.update({
-        where: { id: driver.id },
-        data: { status: "INACTIVE" },
-      }),
-      ...(driver.userId
-        ? [
-            prisma.user.update({
-              where: { id: driver.userId },
-              data: { isActive: false },
-            }),
-          ]
-        : []),
-    ]);
-
-    notifyRoles(STAFF_ROLES, {
-      title: "Driver account deactivated",
-      body: `${driver.name} deactivated their account.`,
-      data: { driverId: driver.id, type: "DRIVER_ACCOUNT_DEACTIVATED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
-
-    const response = okResponse(null, "Account deactivated successfully.");
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const verifyLicense = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { licenseNumber } = req.body;
-
-    if (licenseNumber && licenseNumber.trim()) {
-      await prisma.driver.update({
-        where: { id: driver.id },
-        data: { licenseNumber: licenseNumber.trim() },
-      });
-    }
-
-    notifyRoles(STAFF_ROLES, {
-      title: "License verification submitted",
-      body: `${driver.name} submitted a license for verification.`,
-      data: { driverId: driver.id, type: "DRIVER_LICENSE_SUBMITTED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
-
-    await prisma.auditLog.create({
-      data: {
-        userId: req.user?.userId ?? null,
-        action: "DRIVER_LICENSE_VERIFICATION_SUBMITTED",
-        model: "Driver",
-        recordId: driver.id,
-        after: { licenseNumber: licenseNumber?.trim() ?? driver.licenseNumber },
-      },
-    });
-
-    const response = okResponse(
-      { driverId: driver.id, status: "PENDING_REVIEW" },
-      "License submitted for verification.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getDashboardSummary = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const startOfToday = startOfDay();
-    const endOfToday = endOfDay();
-
-    const [totalRides, pendingRides, completedRides] = await Promise.all([
-      prisma.ride.count({
-        where: {
-          driverId: driver.id,
-          rideDate: { gte: startOfToday, lte: endOfToday },
-        },
-      }),
-      prisma.ride.count({
-        where: {
-          driverId: driver.id,
-          rideDate: { gte: startOfToday, lte: endOfToday },
-          status: { in: ["PENDING", "STARTED", "ARRIVED"] },
-        },
-      }),
-      prisma.ride.count({
-        where: {
-          driverId: driver.id,
-          rideDate: { gte: startOfToday, lte: endOfToday },
-          status: "COMPLETED",
-        },
-      }),
-    ]);
-
-    const response = okResponse(
-      { totalRides, pendingRides, completedRides },
-      "Dashboard summary retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
-const getDriverStats = async (req, res, next) => {
-  try {
-    const driver = await getDriverFromReq(req);
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const { startDate, endDate } = req.query;
-
-    let rangeEnd = endOfDay();
-    if (endDate) {
-      const parsedEnd = new Date(endDate);
-      if (!isNaN(parsedEnd.getTime())) {
-        rangeEnd = endOfDay(parsedEnd);
-      }
-    }
-
-    let rangeStart = startOfDay(
-      new Date(rangeEnd.getTime() - 30 * 24 * 60 * 60 * 1000),
-    );
-    if (startDate) {
-      const parsedStart = new Date(startDate);
-      if (!isNaN(parsedStart.getTime())) {
-        rangeStart = startOfDay(parsedStart);
-      }
-    }
-
-    const rides = await prisma.ride.findMany({
-      where: {
-        driverId: driver.id,
-        rideDate: { gte: rangeStart, lte: rangeEnd },
-      },
-      select: { status: true },
-    });
-
-    const byStatus = rides.reduce(
-      (acc, r) => {
-        acc[r.status] = (acc[r.status] || 0) + 1;
-        return acc;
-      },
-      { PENDING: 0, STARTED: 0, ARRIVED: 0, COMPLETED: 0, CANCELLED: 0 },
-    );
-
-    const response = okResponse(
-      {
-        startDate: rangeStart,
-        endDate: rangeEnd,
-        totalRides: rides.length,
-        byStatus,
-        completionRate:
-          rides.length > 0
-            ? `${Math.round((byStatus.COMPLETED / rides.length) * 100)}%`
-            : "N/A",
-      },
-      "Driver stats retrieved successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    next(error);
-  }
-};
-
 module.exports = {
-  getMyProfile,
-  updateMyProfile,
-  getMyQrCode,
-  deleteAccount,
-  verifyLicense,
-  getTodayRide,
-  getMyRides,
-  getRideDetails,
-  updateRideStatus,
-  startRide,
-  startTodayRide,
-  completeRide,
-  cancelRide,
-  getRideStops,
-  updateStopStatus,
-  markAttendance,
-  getActiveRide,
-  getRideAttendance,
-  updateAttendance,
-  createComplaint,
-  getMyComplaints,
-  getComplaintDetails,
-  updateComplaint,
-  deleteComplaint,
-  getNotifications,
-  markNotificationAsRead,
-  deleteNotification,
-  getDashboardSummary,
-  getDriverStats,
-  markAllNotificationsAsRead,
+  createDriver,
+  getAllDrivers,
+  getDriverById,
+  updateDriver,
+  deleteDriver,
+  getDriverRides,
+  getDriverComplaints,
+  updateDriverStatus,
 };

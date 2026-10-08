@@ -1,91 +1,42 @@
-const express = require("express");
-const router = express.Router();
-
+const { Router } = require("express");
+const router = Router();
+const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
+const {
+  employeeCreateSchema,
+  employeeUpdateSchema,
+  employeeIdSchema,
+} = require("../../../validations/common");
+const {
+  createEmployee,
+  getAllEmployees,
+  getEmployeeById,
+  updateEmployee,
+  deleteEmployee,
+  getEmployeeSchedule,
+  getEmployeeAttendance,
+  getEmployeeComplaints,
+  bulkUpdateEmployeeStatus,
+} = require("../../../controllers/admin/employee/employee.controller");
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
 const requireRole = require("../../../utils/requirerole");
 
-const {
-  getMyProfile,
-  updateMyProfile,
-  getTodayRide,
-  confirmTodayRide,
-  getWeeklySchedule,
-  getWeekSummary,
-  markMyAttendance,
-  createComplaint,
-  getMyComplaints,
-  getRecentRides,
-  getNotifications,
-  markAttendanceByQr,
-  markNotificationAsRead,
-  deleteNotification,
-  markAllNotificationsAsRead,
-  getAllWeeklySchedules,
-} = require("../../../controllers/admin/employee/employee.controller.js");
-const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
-const { updateEmployeeProfileSchema, confirmRideSchema, weeklyScheduleQuerySchema, markMyAttendanceSchema, listQuerySchema, employeeComplaintSchema, recentRidesQuerySchema } = require("../../../validations/common");
+router.use(verifyUserByToken, requireRole("ADMIN"));
 
-// Every route below requires a valid token AND the EMPLOYEE role.
-router.use(verifyUserByToken, requireRole("EMPLOYEE"));
+router.post("/bulk-status", bulkUpdateEmployeeStatus);
+router.post("/", validateRequest(employeeCreateSchema), createEmployee);
 
-router.get("/profile", getMyProfile);
-router.patch(
-  "/profile",
-  validateRequest(updateEmployeeProfileSchema),
-  updateMyProfile,
-);
+router.get("/", getAllEmployees);
 
-router.get("/rides/today", getTodayRide);
-router.post(
-  "/rides/today/confirm",
-  validateRequest(confirmRideSchema),
-  confirmTodayRide,
-);
-router.post(
-  "/me/attendance/scan",
-  markAttendanceByQr,
-);
+router.get("/:id/schedule", validateRequest(employeeIdSchema), getEmployeeSchedule);
 
-router.get(
-  "/schedule",
-  validateRequest(weeklyScheduleQuerySchema),
-  getWeeklySchedule,
-);
-router.get(
-  "/schedule/all",
-  getAllWeeklySchedules,
-);
-router.get("/schedule/summary", getWeekSummary);
+router.get("/:id/attendance", validateRequest(employeeIdSchema), getEmployeeAttendance);
 
-router.post(
-  "/attendance/scan",
-  validateRequest(markMyAttendanceSchema),
-  markMyAttendance,
-);
+router.get("/:id/complaints", validateRequest(employeeIdSchema), getEmployeeComplaints);
 
-router.get(
-  "/complaints",
-  validateRequest(listQuerySchema),
-  getMyComplaints,
-);
-router.post(
-  "/complaints",
-  validateRequest(employeeComplaintSchema),
-  createComplaint,
-);
-router.get(
-  "/complaints/recent-rides",
-  validateRequest(recentRidesQuerySchema),
-  getRecentRides,
-);
+router.get("/:id", validateRequest(employeeIdSchema), getEmployeeById);
 
-router.get(
-  "/notifications",
-  validateRequest(listQuerySchema),
-  getNotifications,
-);
-router.patch("/notifications/read-all", markAllNotificationsAsRead);
-router.patch("/notifications/:id/read", markNotificationAsRead);
-router.delete("/notifications/:id", deleteNotification);
+router.put("/:id", validateRequest(employeeUpdateSchema), updateEmployee);
+
+router.delete("/:id", validateRequest(employeeIdSchema), deleteEmployee);
 
 module.exports = router;

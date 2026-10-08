@@ -4,13 +4,15 @@ const router = express.Router();
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
 const requireRole = require("../../../utils/requirerole");
 const {
-  registerDeviceToken,
-  unregisterDeviceToken,
-} = require("../../../controllers/client/deviceToken/deviceToken.controller");
+  getAllExceptions,
+  resolveException,
+  deleteException,
+} = require("../../../controllers/admin/exception/exception.controller");
 
 router.use(verifyUserByToken, requireRole("ADMIN"));
 
-router.post("/", registerDeviceToken);
-router.delete("/", unregisterDeviceToken);
+router.get("/", getAllExceptions);
+router.patch("/:id/resolve", resolveException);
+router.delete("/:id", deleteException);
 
 module.exports = router;

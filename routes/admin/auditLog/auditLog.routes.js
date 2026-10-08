@@ -4,13 +4,11 @@ const router = express.Router();
 const verifyUserByToken = require("../../../middlewares/verifyUserByToken");
 const requireRole = require("../../../utils/requirerole");
 const {
-  registerDeviceToken,
-  unregisterDeviceToken,
-} = require("../../../controllers/client/deviceToken/deviceToken.controller");
+  getAllAuditLogs,
+} = require("../../../controllers/admin/auditLog/auditLog.controller");
 
 router.use(verifyUserByToken, requireRole("ADMIN"));
 
-router.post("/", registerDeviceToken);
-router.delete("/", unregisterDeviceToken);
+router.get("/", getAllAuditLogs);
 
 module.exports = router;
