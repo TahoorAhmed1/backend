@@ -4,6 +4,7 @@ const {
   createSuccessResponse,
   okResponse,
   unauthorizedResponse,
+  updateSuccessResponse,
 } = require("../../constants/responses");
 const { comparePasswords, createToken, hashPassword } = require("../../services/auth.service");
 
@@ -79,6 +80,57 @@ const login = async (req, res, next) => {
   }
 };
 
+const resetPassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { id: true, passwordHash: true },
+    });
+
+    if (!user || !user.passwordHash) {
+      const response = badRequestResponse(
+        "Password reset is unavailable for this account.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const currentPasswordMatches = await comparePasswords(
+      currentPassword,
+      user.passwordHash,
+    );
+    if (!currentPasswordMatches) {
+      const response = badRequestResponse("Current password is incorrect.");
+      return res.status(response.status.code).json(response);
+    }
+
+    const newPasswordMatches = await comparePasswords(
+      newPassword,
+      user.passwordHash,
+    );
+    if (newPasswordMatches) {
+      const response = badRequestResponse(
+        "New password must be different from the current password.",
+      );
+      return res.status(response.status.code).json(response);
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash },
+    });
+
+    const response = updateSuccessResponse(
+      null,
+      "Password reset successfully.",
+    );
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 const getMe = async (req, res, next) => {
   try {
     const { userId } = req.user;
@@ -118,5 +170,6 @@ module.exports = {
   login,
   getMe,
   userList,
-  registerUser
+  registerUser,
+  resetPassword,
 };

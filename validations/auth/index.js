@@ -19,7 +19,17 @@ const userLoginSchema = Joi.object({
   }),
 });
 
+const changePasswordSchema = Joi.object({
+  query: Joi.object({}),
+  params: Joi.object({}),
+  body: Joi.object({
+    currentPassword: Joi.string().required(),
+    newPassword: Joi.string().min(6).required(),
+  }),
+});
+
 module.exports = {
   userRegisterSchema,
   userLoginSchema,
+  changePasswordSchema,
 };

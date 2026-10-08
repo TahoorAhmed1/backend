@@ -8,6 +8,7 @@ const requireRole = require("../../utils/requirerole");
 const {
   userLoginSchema,
   userRegisterSchema,
+  changePasswordSchema,
 } = require("../../validations/auth");
 
 const {
@@ -15,9 +16,17 @@ const {
   getMe,
   userList,
   registerUser,
+  resetPassword,
 } = require("../../controllers/auth/auth.controllers");
 
 router.post("/login", validateRequest(userLoginSchema), login);
+router.patch(
+  "/reset-password",
+  verifyUserByToken,
+  requireRole("DRIVER", "EMPLOYEE"),
+  validateRequest(changePasswordSchema),
+  resetPassword,
+);
 
 router.post(
   "/register",
