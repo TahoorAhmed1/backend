@@ -16,6 +16,11 @@ const {
 // out of sync with the role set the service itself uses for notifyAdmins.
 const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
 
+const notifyStaffOfChange = (payload) =>
+  notifyRoles(STAFF_ROLES, payload).catch((err) =>
+    console.error("[employee_controller] notifyRoles failed:", err),
+  );
+
 // ─────────────────────────────────────────────────────────────
 // Enum value lists (mirrors schema.prisma). Query/body values are
 // validated against these so a bad client value returns a 400
@@ -468,8 +473,8 @@ const confirmTodayRide = async (req, res, next) => {
     });
 
     const driverUserId = ridePassenger.ride?.driver?.userId;
+    const routeName = ridePassenger.ride?.route?.routeName ?? "today's ride";
     if (driverUserId) {
-      const routeName = ridePassenger.ride?.route?.routeName ?? "today's ride";
       notifyUser(driverUserId, {
         title: confirmed ? "Pickup confirmed" : "Pickup declined",
         body: `${employee.name} ${confirmed ? "confirmed" : "declined"} pickup for ${routeName}.`,
@@ -478,10 +483,20 @@ const confirmTodayRide = async (req, res, next) => {
           type: confirmed ? "PICKUP_CONFIRMED" : "PICKUP_DECLINED",
         },
         event: "ride-response",
-      }).catch((err) =>
+      }, { notifyAdmins: false }).catch((err) =>
         console.error("[employee_controller] notifyUser failed:", err),
       );
     }
+    notifyStaffOfChange({
+      title: confirmed ? "Pickup confirmed" : "Pickup declined",
+      body: `${employee.name} ${confirmed ? "confirmed" : "declined"} pickup for ${routeName}.`,
+      data: {
+        rideId: ridePassenger.rideId,
+        employeeId: employee.id,
+        type: confirmed ? "PICKUP_CONFIRMED" : "PICKUP_DECLINED",
+      },
+      event: "ride-response",
+    });
 
     // await prisma.auditLog.create({
     //   data: {
@@ -674,8 +689,8 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
     });
 
     const driverUserId = ridePassenger.ride?.driver?.userId;
+    const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
     if (driverUserId) {
-      const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
       notifyUser(driverUserId, {
         title: confirmed ? "Ride accepted" : "Ride rejected",
         body: confirmed
@@ -683,10 +698,22 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
           : `${employee.name} rejected the ride for ${routeName}: ${trimmedReason}`,
         data: { rideId, type: confirmed ? "RIDE_ACCEPTED" : "RIDE_REJECTED" },
         event: "ride-response",
-      }).catch((err) =>
+      }, { notifyAdmins: false }).catch((err) =>
         console.error("[employee_controller] notifyUser failed:", err),
       );
     }
+    notifyStaffOfChange({
+      title: confirmed ? "Ride accepted" : "Ride rejected",
+      body: confirmed
+        ? `${employee.name} accepted the ride for ${routeName}.`
+        : `${employee.name} rejected the ride for ${routeName}: ${trimmedReason}`,
+      data: {
+        rideId,
+        employeeId: employee.id,
+        type: confirmed ? "RIDE_ACCEPTED" : "RIDE_REJECTED",
+      },
+      event: "ride-response",
+    });
 
     // await prisma.auditLog.create({
     //   data: {
@@ -1033,9 +1060,20 @@ const markAttendanceByQr = async (req, res, next) => {
             status,
           },
           event: "attendance-updated",
-        }).catch((err) =>
+        }, { notifyAdmins: false }).catch((err) =>
           console.error("[employee_controller] notifyUser failed:", err),
         );
+        notifyStaffOfChange({
+          title: "Passenger checked in",
+          body: `${employee.name} checked in for ${selectedRide.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+          data: {
+            rideId: selectedRide.id,
+            employeeId: employee.id,
+            type: "ATTENDANCE_UPDATED",
+            status,
+          },
+          event: "attendance-updated",
+        });
 
         const response = okResponse(
           {
@@ -1150,9 +1188,20 @@ const markAttendanceByQr = async (req, res, next) => {
       body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
       data: { rideId: ride.id, type: "ATTENDANCE_UPDATED", status },
       event: "attendance-updated",
-    }).catch((err) =>
+    }, { notifyAdmins: false }).catch((err) =>
       console.error("[employee_controller] notifyUser failed:", err),
     );
+    notifyStaffOfChange({
+      title: "Passenger checked in",
+      body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+      data: {
+        rideId: ride.id,
+        employeeId: employee.id,
+        type: "ATTENDANCE_UPDATED",
+        status,
+      },
+      event: "attendance-updated",
+    });
 
     const response = okResponse(
       {
@@ -1353,13 +1402,24 @@ const markMyAttendance = async (req, res, next) => {
         },
 
         event: "attendance-updated",
-      }).catch((err) => {
+      }, { notifyAdmins: false }).catch((err) => {
         console.error(
           "[employee_controller] notifyUser failed:",
           err
         );
       });
     }
+    notifyStaffOfChange({
+      title: "Passenger checked in",
+      body: `${employee.name} checked in for ${ridePassenger.ride?.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+      data: {
+        rideId: ridePassenger.rideId,
+        employeeId: employee.id,
+        type: "ATTENDANCE_UPDATED",
+        status,
+      },
+      event: "attendance-updated",
+    });
 
     // 13. Return success response
     const response = okResponse(

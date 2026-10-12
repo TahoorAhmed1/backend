@@ -36,6 +36,11 @@ const parsePagination = (query) => {
 
 const STAFF_ROLES = ADMIN_NOTIFY_ROLES;
 
+const notifyStaffOfChange = (payload) =>
+  notifyRoles(STAFF_ROLES, payload).catch((err) =>
+    console.error("[driver_controller] notifyRoles failed:", err),
+  );
+
 const getDriverFromReq = async (req) => {
   const userId = req.user?.userId;
   if (!userId) return null;
@@ -470,6 +475,13 @@ const applyRideStatusTransition = async ({
       err,
     ),
   );
+  const rideStatusNotification = RIDE_STATUS_NOTIFICATIONS[nextStatus];
+  notifyStaffOfChange({
+    title: rideStatusNotification?.title ?? "Ride updated",
+    body: `Ride ${ride.id} status changed to ${nextStatus}.`,
+    data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
+    event: "ride-status-updated",
+  });
 
   return {
     response: okResponse(
@@ -517,7 +529,7 @@ const notifyPassengersOfRideStatus = async ({ ride, nextStatus }) => {
     body: notification.body(routeName),
     data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
     event: "ride-status-updated",
-  });
+  }, { notifyAdmins: false });
 };
 
 const updateRideStatus = async (req, res, next) => {
@@ -1004,10 +1016,24 @@ const upsertAttendanceForEmployee = async ({
 // Fire-and-forget: let the employee know their attendance status changed,
 // in real-time (Pusher) and via push (Expo).
 const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
-  const employeeUserId = attendance?.employee?.userId;
-  if (!employeeUserId) return;
+  if (!attendance) return;
 
   const status = attendance.status;
+  notifyStaffOfChange({
+    title: "Pickup attendance updated",
+    body: `${driverName} marked ${attendance.employee?.name ?? "a passenger"} as ${status.toLowerCase().replace("_", " ")}.`,
+    data: {
+      rideId: attendance.rideId,
+      employeeId: attendance.employeeId,
+      type: "ATTENDANCE_UPDATED",
+      status,
+    },
+    event: "attendance-updated",
+  });
+
+  const employeeUserId = attendance.employee?.userId;
+  if (!employeeUserId) return;
+
   notifyUser(employeeUserId, {
     title: ["ABSENT", "NO_SHOW"].includes(status)
       ? "Marked absent"
@@ -1015,7 +1041,7 @@ const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
     body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
     data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
     event: "attendance-updated",
-  }).catch((err) =>
+  }, { notifyAdmins: false }).catch((err) =>
     console.error("[driver_controller] notifyUser failed:", err),
   );
 };
@@ -1444,6 +1470,7 @@ const createComplaint = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    console.log('error', error)
     next(error);
   }
 };
