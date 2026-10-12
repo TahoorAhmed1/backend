@@ -31,6 +31,7 @@ const RIDE_STATUSES = [
 const COMPLAINT_STATUSES = ["OPEN", "IN_PROGRESS", "RESOLVED", "DISMISSED"];
 const COMPLAINT_CATEGORIES = [
   "DRIVER_BEHAVIOUR",
+  "EMPLOYEE_BEHAVIOUR",
   "VEHICLE_CONDITION",
   "ROUTE_ISSUE",
   "TIMING_DELAY",
@@ -910,7 +911,14 @@ const markAttendanceByQr = async (req, res, next) => {
       return fail(res, `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`);
     }
 
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    if (leg === "DROP") {
+      return fail(
+        res,
+        "QR attendance is only for pickup/boarding. Drop-off is completed with the ride.",
+      );
+    }
+
+    const normalizedLeg = "PICKUP";
 
     const scannedUser = await prisma.user.findUnique({
       where: { qrCode },
@@ -944,8 +952,8 @@ const markAttendanceByQr = async (req, res, next) => {
           pickupTime: true,
           route: { select: { routeName: true } },
           passengers: {
-            where: { employeeId: employee.id, leg: normalizedLeg },
-            select: { scheduledTime: true },
+            where: { employeeId: employee.id },
+            select: { scheduledTime: true, leg: true },
           },
         },
       });
@@ -959,7 +967,7 @@ const markAttendanceByQr = async (req, res, next) => {
       } else if (selectedRide.passengers.length === 0) {
         return fail(
           res,
-          `${employee.name} is not listed on the selected ${selectedRide.route?.routeName ?? "ride"} for this ${normalizedLeg.toLowerCase()} leg.`,
+          `${employee.name} is not listed on the selected ${selectedRide.route?.routeName ?? "ride"} for pickup.`,
         );
       } else {
         const rideDate = startOfDay(selectedRide.rideDate);
@@ -985,12 +993,10 @@ const markAttendanceByQr = async (req, res, next) => {
 
         const now = new Date();
         const scheduledTime =
-          selectedRide.passengers[0]?.scheduledTime ?? selectedRide.pickupTime;
+          selectedRide.passengers.find((passenger) => passenger.leg === "PICKUP")
+            ?.scheduledTime ?? selectedRide.pickupTime;
 
-        const status =
-          normalizedLeg === "PICKUP"
-            ? computeArrivalStatus(scheduledTime, now)
-            : "PRESENT";
+        const status = computeArrivalStatus(scheduledTime, now);
 
         let attendance;
 
@@ -1055,7 +1061,6 @@ const markAttendanceByQr = async (req, res, next) => {
         passengers: {
           some: {
             employeeId: employee.id,
-            leg: normalizedLeg,
           },
         },
       },
@@ -1066,8 +1071,8 @@ const markAttendanceByQr = async (req, res, next) => {
         pickupTime: true,
         route: { select: { routeName: true } },
         passengers: {
-          where: { employeeId: employee.id, leg: normalizedLeg },
-          select: { scheduledTime: true },
+          where: { employeeId: employee.id },
+          select: { scheduledTime: true, leg: true },
         },
       },
     });
@@ -1075,7 +1080,7 @@ const markAttendanceByQr = async (req, res, next) => {
     if (activeRides.length === 0) {
       return fail(
         res,
-        `${scannedUser.driver.name} doesn't have a ride in progress that you're listed on for this ${normalizedLeg === "DROP" ? "drop" : "pickup"}. Contact dispatch if this looks wrong.`,
+        `${scannedUser.driver.name} doesn't have a ride in progress that you're listed on for pickup. Contact dispatch if this looks wrong.`,
       );
     }
 
@@ -1109,11 +1114,10 @@ const markAttendanceByQr = async (req, res, next) => {
     }
 
     const now = new Date();
-    const scheduledTime = ride.passengers[0]?.scheduledTime ?? ride.pickupTime;
-    const status =
-      normalizedLeg === "PICKUP"
-        ? computeArrivalStatus(scheduledTime, now)
-        : "PRESENT";
+    const scheduledTime =
+      ride.passengers.find((passenger) => passenger.leg === "PICKUP")
+        ?.scheduledTime ?? ride.pickupTime;
+    const status = computeArrivalStatus(scheduledTime, now);
 
     let attendance;
 
@@ -1168,59 +1172,103 @@ const markAttendanceByQr = async (req, res, next) => {
 };
 const markMyAttendance = async (req, res, next) => {
   try {
+    // 1. Get the logged-in employee
     const employee = await getEmployeeFromReq(req);
-    if (!employee) return fail(res, "Employee profile not found.");
 
-    const { status = "PRESENT", leg } = req.body ?? {};
+    if (!employee) {
+      return fail(res, "Employee profile not found.");
+    }
+
+    // 2. Get request data
+    const {
+      status = "PRESENT",
+      leg,
+      rideId,
+    } = req.body ?? {};
+
+    // 3. Validate attendance status
     if (!["PRESENT", "LATE"].includes(status)) {
       return fail(res, "Invalid attendance status.");
     }
 
-    if (leg !== undefined && leg !== null && !RIDE_LEGS.includes(leg)) {
-      return fail(res, `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`);
+    // 4. Validate ride leg
+    if (
+      leg !== undefined &&
+      leg !== null &&
+      !RIDE_LEGS.includes(leg)
+    ) {
+      return fail(
+        res,
+        `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`
+      );
     }
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
 
-    const ridePassengers = await prisma.ridePassenger.findMany({
+    if (leg === "DROP") {
+      return fail(
+        res,
+        "Attendance is only recorded for pickup/boarding, not drop-off.",
+      );
+    }
+
+    const normalizedLeg = "PICKUP";
+
+    // 5. Require the selected ride ID
+    if (!rideId) {
+      return fail(
+        res,
+        "Ride ID is required. Please select a ride and try again."
+      );
+    }
+
+    // 6. Find this employee on the selected ride and leg
+    // Do not filter by today's date here.
+    // This supports overnight rides that start on one date
+    // and finish on the following date.
+    const ridePassenger = await prisma.ridePassenger.findFirst({
       where: {
         employeeId: employee.id,
-        leg: normalizedLeg,
+        rideId: rideId,
         ride: {
-          rideDate: { gte: startOfDay(), lte: endOfDay() },
-          status: { in: ["STARTED", "ARRIVED"] },
+          status: {
+            in: ["STARTED", "ARRIVED"],
+          },
         },
       },
       select: {
         rideId: true,
-        leg: true,
         ride: {
           select: {
             rideDate: true,
-            driver: { select: { userId: true } },
-            route: { select: { routeName: true } },
+            status: true,
+            driver: {
+              select: {
+                userId: true,
+              },
+            },
+            route: {
+              select: {
+                routeName: true,
+              },
+            },
           },
         },
       },
     });
 
-    if (ridePassengers.length === 0) {
+    // 7. Ensure the employee is assigned to this exact ride
+    if (!ridePassenger) {
       return fail(
         res,
-        "No ride is currently in progress for you — attendance can only be scanned once your driver has started the ride.",
+        `You are not listed on the selected ride for this ${normalizedLeg} leg, or the ride has not started yet. Please verify the passenger assignment with dispatch.`
       );
     }
 
-    if (ridePassengers.length > 1) {
-      return fail(
-        res,
-        "You're listed on more than one active ride right now — this is a scheduling conflict. Please contact dispatch before marking attendance.",
-      );
-    }
+    // 8. Use the selected ride's date for attendance
+    const rideDate = startOfDay(
+      ridePassenger.ride?.rideDate ?? new Date()
+    );
 
-    const ridePassenger = ridePassengers[0];
-    const rideDate = startOfDay(ridePassenger.ride?.rideDate ?? new Date());
-
-    // Idempotent: don't overwrite an existing PRESENT/LATE record.
+    // 9. Check for an existing attendance record
     const existing = await prisma.attendance.findUnique({
       where: {
         employeeId_rideDate_leg: {
@@ -1230,12 +1278,34 @@ const markMyAttendance = async (req, res, next) => {
         },
       },
     });
-    if (existing && ["PRESENT", "LATE"].includes(existing.status)) {
-      const response = okResponse(existing, "Attendance was already marked.");
-      return res.status(response.status.code).json(response);
+
+    // 10. Preserve existing attendance records
+    if (
+      existing &&
+      ["PRESENT", "LATE"].includes(existing.status)
+    ) {
+      // Prevent attendance for one ride from being mistaken
+      // for attendance on a different selected ride.
+      if (existing.rideId !== ridePassenger.rideId) {
+        return fail(
+          res,
+          "Attendance is already recorded for another ride on this date and leg. Please contact dispatch."
+        );
+      }
+
+      const response = okResponse(
+        existing,
+        "Attendance was already marked."
+      );
+
+      return res
+        .status(response.status.code)
+        .json(response);
     }
 
+    // 11. Record the current arrival time
     const arrivalTime = new Date();
+
     const attendance = await prisma.attendance.upsert({
       where: {
         employeeId_rideDate_leg: {
@@ -1244,10 +1314,17 @@ const markMyAttendance = async (req, res, next) => {
           leg: normalizedLeg,
         },
       },
-      update: { status, rideId: ridePassenger.rideId, arrivalTime },
+
+      update: {
+        status,
+        rideId: ridePassenger.rideId,
+        arrivalTime,
+      },
+
       create: {
         employeeId: employee.id,
         rideId: ridePassenger.rideId,
+        employeeId: employee.id,
         rideDate,
         leg: normalizedLeg,
         status,
@@ -1255,29 +1332,51 @@ const markMyAttendance = async (req, res, next) => {
       },
     });
 
+    // 12. Notify the assigned driver
     const driverUserId = ridePassenger.ride?.driver?.userId;
+
     if (driverUserId) {
-      const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
+      const routeName =
+        ridePassenger.ride?.route?.routeName ?? "the ride";
+
       notifyUser(driverUserId, {
         title: "Passenger checked in",
-        body: `${employee.name} checked in for ${routeName}${status === "LATE" ? " (late)" : ""}.`,
-        // type aligned with driver_controller's attendance notifications
-        // (ATTENDANCE_UPDATED) — both represent the same underlying
-        // Attendance-record change, just triggered by different actors.
+
+        body: `${employee.name} checked in for ${routeName}${
+          status === "LATE" ? " (late)" : ""
+        }.`,
+
         data: {
           rideId: ridePassenger.rideId,
           type: "ATTENDANCE_UPDATED",
           status,
         },
+
         event: "attendance-updated",
-      }).catch((err) =>
-        console.error("[employee_controller] notifyUser failed:", err),
-      );
+      }).catch((err) => {
+        console.error(
+          "[employee_controller] notifyUser failed:",
+          err
+        );
+      });
     }
 
-    const response = okResponse(attendance, "Attendance marked successfully.");
-    return res.status(response.status.code).json(response);
+    // 13. Return success response
+    const response = okResponse(
+      attendance,
+      "Attendance marked successfully."
+    );
+
+    return res
+      .status(response.status.code)
+      .json(response);
+
   } catch (error) {
+    console.error(
+      "[employee_controller] markMyAttendance error:",
+      error
+    );
+
     next(error);
   }
 };
@@ -1288,74 +1387,61 @@ const createComplaint = async (req, res, next) => {
     if (!employee) return fail(res, "Employee profile not found.");
 
     const { category, title, description, rideId } = req.body ?? {};
-    const resolvedCategory = category || "OTHER";
 
-    if (!COMPLAINT_CATEGORIES.includes(resolvedCategory)) {
+    if (!COMPLAINT_CATEGORIES.includes(category)) {
       return fail(
         res,
         `Invalid category. Must be one of: ${COMPLAINT_CATEGORIES.join(", ")}.`,
       );
     }
 
-    // typeof check first: `.trim()` on a non-string would throw a TypeError (500).
     if (typeof title !== "string" || !title.trim()) {
       return fail(res, "Title is required.");
     }
 
-    if (
-      description !== undefined &&
-      description !== null &&
-      typeof description !== "string"
-    ) {
-      return fail(res, "Description must be text.");
+    if (typeof description !== "string" || !description.trim()) {
+      return fail(res, "Description is required.");
     }
 
-    if (rideId !== undefined && rideId !== null && typeof rideId !== "string") {
-      return fail(res, "Invalid rideId.");
+    if (typeof rideId !== "string" || !rideId.trim()) {
+      return fail(res, "Please select the related ride.");
     }
 
-    if (
-      ["DRIVER_BEHAVIOUR", "VEHICLE_CONDITION"].includes(resolvedCategory) &&
-      !rideId
-    ) {
-      return fail(
-        res,
-        resolvedCategory === "DRIVER_BEHAVIOUR"
-          ? "Please select the related ride so we know which driver this is about."
-          : "Please select the related ride so we know which vehicle this is about.",
-      );
-    }
-
-    let driverId;
-    let vehicleId;
-
-    if (rideId) {
-      // Any leg counts — DROP_ONLY employees have no PICKUP row.
-      const ridePassenger = await findEmployeePassengerForRide(
-        rideId,
-        employee.id,
-        {
-          include: { ride: { select: { driverId: true, vehicleId: true } } },
+    // The ride must belong to the authenticated employee.
+    // This also lets us safely derive driverId and vehicleId.
+    const ridePassenger = await findEmployeePassengerForRide(
+      rideId.trim(),
+      employee.id,
+      {
+        include: {
+          ride: {
+            select: {
+              id: true,
+              driverId: true,
+              vehicleId: true,
+            },
+          },
         },
-      );
-      if (!ridePassenger) {
-        return fail(res, "That ride isn't associated with your account.");
-      }
-      driverId = ridePassenger.ride.driverId ?? undefined;
-      vehicleId = ridePassenger.ride.vehicleId ?? undefined;
+      },
+    );
+
+    if (!ridePassenger) {
+      return fail(res, "That ride isn't associated with your account.");
     }
+
+    const driverId = ridePassenger.ride.driverId ?? undefined;
+    const vehicleId = ridePassenger.ride.vehicleId ?? undefined;
 
     const response = await createRecord(prisma.complaint, {
       employeeId: employee.id,
-      category: resolvedCategory,
+      rideId: ridePassenger.ride.id,
+      category,
       title: title.trim(),
-      description: description?.trim() || null,
-      ...(rideId && { rideId }),
+      description: description.trim(),
       ...(driverId && { driverId }),
       ...(vehicleId && { vehicleId }),
     });
 
-    // Only notify staff if the complaint was actually created.
     const complaint = response?.data;
     if (complaint?.id) {
       notifyRoles(STAFF_ROLES, {

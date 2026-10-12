@@ -213,13 +213,11 @@ const createAttendance = async (req, res, next) => {
       );
     }
 
-    if (
-      leg !== undefined &&
-      leg !== null &&
-      leg !== "" &&
-      !RIDE_LEGS.includes(leg)
-    ) {
-      return fail(res, `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`);
+    if (leg !== undefined && leg !== null && leg !== "" && leg !== "PICKUP") {
+      return fail(
+        res,
+        "Attendance is only recorded for pickup/boarding, not drop-off.",
+      );
     }
 
     let parsedArrival = null;
@@ -246,7 +244,7 @@ const createAttendance = async (req, res, next) => {
       if (!ride) return fail(res, "Ride not found.");
     }
 
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    const normalizedLeg = "PICKUP";
     const attendanceDate = startOfDay(parsedRideDate);
 
     const existingRecord = await prisma.attendance.findUnique({
@@ -348,13 +346,11 @@ const scanAttendanceByQrCode = async (req, res, next) => {
       );
     }
 
-    if (
-      leg !== undefined &&
-      leg !== null &&
-      leg !== "" &&
-      !RIDE_LEGS.includes(leg)
-    ) {
-      return fail(res, `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`);
+    if (leg !== undefined && leg !== null && leg !== "" && leg !== "PICKUP") {
+      return fail(
+        res,
+        "QR attendance is only for pickup/boarding. Drop-off is completed with the ride.",
+      );
     }
 
     let parsedArrival = new Date();
@@ -381,7 +377,7 @@ const scanAttendanceByQrCode = async (req, res, next) => {
     });
     if (!employee) return fail(res, "Employee not found.");
 
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    const normalizedLeg = "PICKUP";
     const attendanceDate = startOfDay(parsedRideDate);
 
     // Tie the scan to a real ride of the scanned driver so the QR actually
@@ -408,7 +404,7 @@ const scanAttendanceByQrCode = async (req, res, next) => {
             lte: endOfDay(attendanceDate),
           },
           status: { not: "CANCELLED" },
-          passengers: { some: { employeeId, leg: normalizedLeg } },
+          passengers: { some: { employeeId } },
         },
         orderBy: { rideDate: "desc" },
         select: { id: true },
@@ -800,10 +796,10 @@ const updateAttendance = async (req, res, next) => {
     }
 
     if (leg !== undefined && leg !== null && leg !== "") {
-      if (!RIDE_LEGS.includes(leg)) {
+      if (leg !== "PICKUP") {
         return fail(
           res,
-          `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`,
+          "Attendance is only recorded for pickup/boarding, not drop-off.",
         );
       }
       if (leg !== attendance.leg) {

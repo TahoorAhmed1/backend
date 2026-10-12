@@ -670,54 +670,36 @@ const completeRide = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    /*
-     * A Ride is a complete round trip:
-     *   PICKUP: Home -> Office
-     *   DROP:   Office -> Home
-     *
-     * Therefore the ride can only become COMPLETED after both attendance
-     * legs are resolved for every passenger.
-     *
-     * A resolved attendance can be PRESENT, LATE, ABSENT or NO_SHOW.
-     */
+    // Only boarding is attendance-tracked. Ride completion represents the
+    // drop-off and must not require a separate DROP attendance record.
     const resolvedAttendanceKeys = new Set(
-      ride.attendances.map(
-        (attendance) =>
-          `${attendance.employeeId}:${attendance.leg || "PICKUP"}`,
-      ),
+      ride.attendances
+        .filter((attendance) => attendance.leg === "PICKUP" || !attendance.leg)
+        .map((attendance) => attendance.employeeId),
     );
 
     const pendingPassengers = [];
+    const checkedEmployees = new Set();
 
     for (const passenger of ride.passengers) {
-      const pickupKey = `${passenger.employeeId}:PICKUP`;
-      const dropKey = `${passenger.employeeId}:DROP`;
-
-      if (!resolvedAttendanceKeys.has(pickupKey)) {
-        pendingPassengers.push({
-          employee: passenger.employee,
-          leg: "PICKUP",
-        });
+      if (
+        checkedEmployees.has(passenger.employeeId) ||
+        resolvedAttendanceKeys.has(passenger.employeeId)
+      ) {
+        continue;
       }
 
-      if (!resolvedAttendanceKeys.has(dropKey)) {
-        pendingPassengers.push({
-          employee: passenger.employee,
-          leg: "DROP",
-        });
-      }
+      checkedEmployees.add(passenger.employeeId);
+      pendingPassengers.push(passenger.employee);
     }
 
     if (pendingPassengers.length > 0) {
       const pendingLabels = pendingPassengers
-        .map(
-          ({ employee, leg }) =>
-            `${employee.name} (${leg === "PICKUP" ? "pickup" : "drop"})`,
-        )
+        .map((employee) => employee.name)
         .join(", ");
 
       const errorResponse = badRequestResponse(
-        `${pendingPassengers.length} attendance leg(s) still need to be resolved before this ride can be completed: ${pendingLabels}. Mark any no-shows as Absent, then complete the ride.`,
+        `${pendingPassengers.length} passenger pickup attendance record(s) still need to be resolved before this ride can be completed: ${pendingLabels}. Mark any no-shows as Absent, then complete the ride.`,
       );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
@@ -861,13 +843,15 @@ const getRideStops = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const attendanceByEmployeeLeg = Object.fromEntries(
-      ride.attendances.map((a) => [`${a.employeeId}:${a.leg || "PICKUP"}`, a]),
+    const attendanceByEmployee = Object.fromEntries(
+      ride.attendances
+        .filter((attendance) => attendance.leg === "PICKUP" || !attendance.leg)
+        .map((attendance) => [attendance.employeeId, attendance]),
     );
 
     const passengerStops = ride.passengers.map((p) => {
       const leg = p.leg || "PICKUP";
-      const attendance = attendanceByEmployeeLeg[`${p.employeeId}:${leg}`];
+      const attendance = attendanceByEmployee[p.employeeId];
 
       return {
         kind: "passenger",
@@ -928,16 +912,17 @@ const upsertAttendanceForEmployee = async ({
   delayMinutes,
   leg = "PICKUP",
 }) => {
-  const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+  if (leg !== undefined && leg !== null && leg !== "" && leg !== "PICKUP") {
+    return {
+      error: badRequestResponse(
+        "Attendance is only recorded for pickup/boarding, not drop-off.",
+      ),
+    };
+  }
+  const normalizedLeg = "PICKUP";
 
-  const passenger = await prisma.ridePassenger.findUnique({
-    where: {
-      rideId_employeeId_leg: {
-        rideId: ride.id,
-        employeeId,
-        leg: normalizedLeg,
-      },
-    },
+  const passenger = await prisma.ridePassenger.findFirst({
+    where: { rideId: ride.id, employeeId },
   });
 
   if (!passenger) {
@@ -1002,7 +987,7 @@ const upsertAttendanceForEmployee = async ({
         employeeId,
         rideId: ride.id,
         rideDate,
-        leg: normalizedLeg,
+        leg: "PICKUP",
         status,
         arrivalTime: new Date(),
         vendorLateStatus: normalizedVendorLateStatus,
@@ -1053,6 +1038,13 @@ const markAttendance = async (req, res, next) => {
       leg,
     } = req.body;
 
+    if (leg !== undefined && leg !== "PICKUP") {
+      const errorResponse = badRequestResponse(
+        "Attendance is only recorded for pickup/boarding, not drop-off.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
     if (explicitStatus && !ATTENDANCE_STATUSES.includes(explicitStatus)) {
       const errorResponse = badRequestResponse("Invalid attendance status.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -1086,7 +1078,7 @@ const markAttendance = async (req, res, next) => {
     }
 
     const status = explicitStatus ?? computeArrivalStatus(ride.pickupTime);
-    const normalizedLeg = leg === "DROP" ? "DROP" : "PICKUP";
+    const normalizedLeg = "PICKUP";
 
     let resolvedEmployeeId = employeeId;
     if (!resolvedEmployeeId && qrCode) {
@@ -1343,31 +1335,112 @@ const createComplaint = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
-    const { category, title, description, rideId, vehicleId } = req.body;
+    const { category, title, description, rideId, employeeId } = req.body ?? {};
+    const validCategories = [
+      "EMPLOYEE_BEHAVIOUR",
+      "VEHICLE_CONDITION",
+      "ROUTE_ISSUE",
+      "TIMING_DELAY",
+      "SCHEDULING",
+      "OTHER",
+    ];
 
-    if (!title || !title.trim()) {
+    if (!validCategories.includes(category)) {
+      const errorResponse = badRequestResponse(
+        `Invalid category. Must be one of: ${validCategories.join(", ")}.`,
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (typeof title !== "string" || !title.trim()) {
       const errorResponse = badRequestResponse("Title is required.");
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    if (typeof description !== "string" || !description.trim()) {
+      const errorResponse = badRequestResponse("Description is required.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (typeof rideId !== "string" || !rideId.trim()) {
+      const errorResponse = badRequestResponse("Please select the related ride.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (category === "EMPLOYEE_BEHAVIOUR") {
+      if (typeof employeeId !== "string" || !employeeId.trim()) {
+        const errorResponse = badRequestResponse(
+          "Please select the employee this complaint is about.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+    } else if (employeeId !== undefined && employeeId !== null) {
+      const errorResponse = badRequestResponse(
+        "employeeId is only allowed for EMPLOYEE_BEHAVIOUR complaints.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // The authenticated driver must own the selected ride.
+    const ride = await prisma.ride.findUnique({
+      where: { id: rideId.trim() },
+      select: {
+        id: true,
+        driverId: true,
+        vehicleId: true,
+      },
+    });
+
+    if (!ride || ride.driverId !== driver.id) {
+      const errorResponse = badRequestResponse(
+        "The selected ride does not belong to your account.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    let verifiedEmployeeId;
+
+    if (category === "EMPLOYEE_BEHAVIOUR") {
+      // The employee must be a passenger on this exact ride.
+      const passenger = await prisma.ridePassenger.findFirst({
+        where: {
+          rideId: ride.id,
+          employeeId: employeeId.trim(),
+        },
+        select: { employeeId: true },
+      });
+
+      if (!passenger) {
+        const errorResponse = badRequestResponse(
+          "That employee is not assigned to the selected ride.",
+        );
+        return res.status(errorResponse.status.code).json(errorResponse);
+      }
+
+      verifiedEmployeeId = passenger.employeeId;
+    }
+
     const response = await createRecord(prisma.complaint, {
       driverId: driver.id,
-      category: category || "OTHER",
+      rideId: ride.id,
+      category,
       title: title.trim(),
-      description: description?.trim() || null,
-      ...(rideId && { rideId }),
-      ...(vehicleId && { vehicleId }),
+      description: description.trim(),
+      ...(ride.vehicleId && { vehicleId: ride.vehicleId }),
+      ...(verifiedEmployeeId && { employeeId: verifiedEmployeeId }),
     });
 
     const complaint = response?.data;
-    notifyRoles(STAFF_ROLES, {
-      title: "New complaint filed",
-      body: `${driver.name} filed a complaint: ${title.trim()}`,
-      data: { complaintId: complaint?.id, type: "COMPLAINT_CREATED" },
-      event: "notification-created",
-    }).catch((err) =>
-      console.error("[driver_controller] notifyRoles failed:", err),
-    );
+    if (complaint?.id) {
+      notifyRoles(STAFF_ROLES, {
+        title: "New complaint filed",
+        body: `${driver.name} filed a complaint: ${title.trim()}`,
+        data: { complaintId: complaint.id, type: "COMPLAINT_CREATED" },
+        event: "notification-created",
+      }).catch((err) =>
+        console.error("[driver_controller] notifyRoles failed:", err),
+      );
+    }
 
     return res.status(response.status.code).json(response);
   } catch (error) {

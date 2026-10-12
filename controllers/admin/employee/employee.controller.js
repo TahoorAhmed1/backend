@@ -6,7 +6,6 @@ const {
   createSuccessResponse,
 } = require("../../../constants/responses");
 const { hashPassword } = require("../../../services/auth.service");
-const { info } = require("winston");
 
 const EMAIL_DOMAIN = "ibex.com";
 const DEFAULT_PASSWORD = "12345678";

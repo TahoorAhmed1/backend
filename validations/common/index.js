@@ -437,7 +437,7 @@ const attendanceCreateSchema = Joi.object({
     rideDate: Joi.date().required(),
     employeeId: Joi.string().uuid().required(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
-    leg: Joi.string().optional().valid("PICKUP", "DROP").default("PICKUP"),
+    leg: Joi.string().optional().valid("PICKUP").default("PICKUP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
@@ -458,7 +458,7 @@ const attendanceScanSchema = Joi.object({
     driverQrCode: Joi.string().required(),
     rideDate: Joi.date().required(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
-    leg: Joi.string().optional().valid("PICKUP", "DROP").default("PICKUP"),
+    leg: Joi.string().optional().valid("PICKUP").default("PICKUP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
@@ -479,7 +479,7 @@ const attendanceUpdateSchema = Joi.object({
     rideDate: Joi.date().optional(),
     employeeId: Joi.string().uuid().optional(),
     rideId: Joi.string().uuid().optional().allow(null, ""),
-    leg: Joi.string().optional().valid("PICKUP", "DROP"),
+    leg: Joi.string().optional().valid("PICKUP"),
     arrivalTime: Joi.date().optional().allow(null, ""),
     delayMinutes: Joi.number().optional().allow(null, ""),
     status: Joi.string()
@@ -682,7 +682,7 @@ const markAttendanceSchema = Joi.object({
       .valid("ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED")
       .allow(null, ""),
     delayMinutes: Joi.number().integer().min(0).allow(null, ""),
-    leg: Joi.string().valid("PICKUP", "DROP").default("PICKUP"),
+    leg: Joi.string().valid("PICKUP").default("PICKUP"),
   })
     .or("employeeId", "qrCode")
     .messages({
@@ -697,6 +697,7 @@ const driverComplaintSchema = Joi.object({
     category: Joi.string()
       .valid(
         "DRIVER_BEHAVIOUR",
+        "EMPLOYEE_BEHAVIOUR",
         "VEHICLE_CONDITION",
         "ROUTE_ISSUE",
         "TIMING_DELAY",
@@ -704,6 +705,7 @@ const driverComplaintSchema = Joi.object({
         "OTHER",
       )
       .default("OTHER"),
+      employeeId:Joi.string().optional().allow(null, ""),
     title: Joi.string().trim().min(3).max(150).required(),
     description: Joi.string().trim().max(2000).allow("", null),
     rideId: uuid(),
