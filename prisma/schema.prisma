@@ -268,11 +268,26 @@ model Driver {
   trips           Trip[]
   complaints      Complaint[]
   weeklySchedules WeeklySchedule[]
+  locations       DriverLocation[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([cnic, licenseNumber, userId])
+}
+
+model Office {
+  id       String         @id @default(uuid())
+  name     OfficeLocation @unique
+  location String
+
+  latitude  Float?
+  longitude Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  routes Route[]
 }
 
 model Route {
@@ -282,7 +297,8 @@ model Route {
   areaId         String?
   subAreaId      String?
   officeLocation OfficeLocation?
-  serviceType    ServiceType     @default(PICK_AND_DROP)
+
+  serviceType ServiceType @default(PICK_AND_DROP)
 
   status RouteStatus @default(ACTIVE)
 
@@ -300,6 +316,8 @@ model Route {
   weeklySchedules WeeklySchedule[]
   rides           Ride[]
   trips           Trip[]
+  office          Office?          @relation(fields: [officeId], references: [id])
+  officeId        String?
 
   @@index([areaId])
   @@index([subAreaId])
@@ -316,7 +334,7 @@ model Trip {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  routeId     String
+  routeId         String
   route           Route            @relation(fields: [routeId], references: [id], onDelete: Cascade)
   driver          Driver?          @relation(fields: [driverId], references: [id])
   vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id])
@@ -330,23 +348,25 @@ model Trip {
 }
 
 model Employee {
-  id             String          @id @default(uuid())
-  employeeCode   String          @unique
-  name           String
-  contactNumber  String?
-  cnic           String?         @unique
-  gender         Gender?
-  designation    String?
-  entity         Entity?
-  officeLocation OfficeLocation?
-  departmentId   String?
-  areaId         String?
-  subAreaId      String?
-  blockId        String?
-  address        String?
-  serviceType    ServiceType     @default(PICK_AND_DROP)
-  shiftTiming    String?
-  status         EmployeeStatus  @default(ACTIVE)
+  id              String          @id @default(uuid())
+  employeeCode    String          @unique
+  name            String
+  contactNumber   String?
+  cnic            String?         @unique
+  gender          Gender?
+  designation     String?
+  entity          Entity?
+  officeLocation  OfficeLocation?
+  departmentId    String?
+  areaId          String?
+  subAreaId       String?
+  blockId         String?
+  address         String?
+  pickupLatitude  Float?
+  pickupLongitude Float?
+  serviceType     ServiceType     @default(PICK_AND_DROP)
+  shiftTiming     String?
+  status          EmployeeStatus  @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -435,36 +455,57 @@ model Ride {
   tripId    String?
   trip      Trip?    @relation(fields: [tripId], references: [id])
 
-  areaId            String?
-  subAreaId         String?
-  serviceType       ServiceType @default(PICK_AND_DROP)
-  serviceTypeBackfilled Boolean @default(false)
+  areaId                String?
+  subAreaId             String?
+  serviceType           ServiceType @default(PICK_AND_DROP)
+  serviceTypeBackfilled Boolean     @default(false)
   // Were `String?` — migrated to DateTime for the same reason as
   // WeeklySchedule's equivalents. rideplaing.js (not in this repo snapshot)
   // populates these from the WeeklySchedule template and needs updating to
   // pass Date objects through rather than copying strings.
-  pickupTime        DateTime?
-  officeArrivalTime DateTime?
-  dropTime          DateTime?
-  status            RideStatus @default(PENDING)
+  pickupTime            DateTime?
+  officeArrivalTime     DateTime?
+  dropTime              DateTime?
+  status                RideStatus  @default(PENDING)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  route       Route           @relation(fields: [routeId], references: [id])
-  driver      Driver?         @relation(fields: [driverId], references: [id])
-  vehicle     Vehicle?        @relation(fields: [vehicleId], references: [id])
-  vendor      Vendor?         @relation(fields: [vendorId], references: [id])
-  area        Area?           @relation(fields: [areaId], references: [id])
-  subArea     SubArea?        @relation(fields: [subAreaId], references: [id])
+  route       Route            @relation(fields: [routeId], references: [id])
+  driver      Driver?          @relation(fields: [driverId], references: [id])
+  vehicle     Vehicle?         @relation(fields: [vehicleId], references: [id])
+  vendor      Vendor?          @relation(fields: [vendorId], references: [id])
+  area        Area?            @relation(fields: [areaId], references: [id])
+  subArea     SubArea?         @relation(fields: [subAreaId], references: [id])
   passengers  RidePassenger[]
   attendances Attendance[]
   complaints  Complaint[]
+  locations   DriverLocation[]
 
   @@unique([driverId, tripId, rideDate], name: "ride_driver_trip_date_unique")
   @@index([routeId, rideDate])
   @@index([rideDate])
   @@index([vendorId, rideDate])
+}
+
+model DriverLocation {
+  id       String  @id @default(uuid())
+  driverId String
+  rideId   String?
+
+  latitude  Float
+  longitude Float
+  accuracy  Float?
+  speed     Float?
+  heading   Float?
+
+  recordedAt DateTime @default(now())
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  ride   Ride?  @relation(fields: [rideId], references: [id], onDelete: Cascade)
+
+  @@index([driverId, recordedAt])
+  @@index([rideId, recordedAt])
 }
 
 enum RideConfirmationStatus {
@@ -474,11 +515,11 @@ enum RideConfirmationStatus {
 }
 
 model RidePassenger {
-  id         String @id @default(uuid())
-  rideId     String
-  employeeId String
-  leg        RideLeg @default(PICKUP)
-  serviceType ServiceType @default(PICK_AND_DROP)
+  id            String      @id @default(uuid())
+  rideId        String
+  employeeId    String
+  leg           RideLeg     @default(PICKUP)
+  serviceType   ServiceType @default(PICK_AND_DROP)
   scheduledTime DateTime?
 
   employeeName String?
@@ -498,16 +539,16 @@ model RidePassenger {
 }
 
 model Attendance {
-  id           String           @id @default(uuid())
-  rideDate     DateTime
-  employeeId   String
-  rideId       String?
-  leg          RideLeg @default(PICKUP)
-  arrivalTime  DateTime?
-  delayMinutes Int?
-  status       AttendanceStatus @default(PRESENT)
+  id               String           @id @default(uuid())
+  rideDate         DateTime
+  employeeId       String
+  rideId           String?
+  leg              RideLeg          @default(PICKUP)
+  arrivalTime      DateTime?
+  delayMinutes     Int?
+  status           AttendanceStatus @default(PRESENT)
   vendorLateStatus VendorLateStatus @default(UNCLASSIFIED)
-  backfilled Boolean @default(false)
+  backfilled       Boolean          @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -585,33 +626,32 @@ model ScheduleException {
 }
 
 model BulkUploadJob {
-  id               String    @id @default(cuid())
-  accountKey       String?
-  weekStart        DateTime
-  status           String    @default("processing") // processing | completed | failed
-  filePath         String?
-  jobType          String    @default("BULK_UPLOAD")
-  action           String    @default("BULK_UPLOAD")
+  id                 String    @id @default(cuid())
+  accountKey         String?
+  weekStart          DateTime
+  status             String    @default("processing") // processing | completed | failed
+  filePath           String?
+  jobType            String    @default("BULK_UPLOAD")
+  action             String    @default("BULK_UPLOAD")
   employeeCodeFilter Json?
-  dispatchedAt     DateTime?
-  dedupeKey        String?   
-  totalRows        Int       @default(0)
-  processedRows    Int       @default(0)
-  batchSize        Int       @default(100)
-  totalBatches     Int       @default(0)
-  batchesCompleted Int       @default(0)
-  result           Json?
-  error            String?
-  startedAt        DateTime  @default(now())
-  completedAt      DateTime?
+  dispatchedAt       DateTime?
+  dedupeKey          String?
+  totalRows          Int       @default(0)
+  processedRows      Int       @default(0)
+  batchSize          Int       @default(100)
+  totalBatches       Int       @default(0)
+  batchesCompleted   Int       @default(0)
+  result             Json?
+  error              String?
+  startedAt          DateTime  @default(now())
+  completedAt        DateTime?
 
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
-  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([weekStart, status])
   @@index([accountKey, status, dispatchedAt, createdAt])
 }
-
 
 model Notification {
   id        String             @id @default(uuid())

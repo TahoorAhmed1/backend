@@ -20,6 +20,36 @@ const ADMIN_NOTIFY_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
  * Pusher/Expo failures do not prevent the DB notification
  * from being created or returned.
  */
+
+const triggerRideLocation = async (rideId, payload) => {
+  if (!rideId) return null;
+
+  const channel = `ride-${rideId}`;
+
+  try {
+    await pusher.trigger(
+      channel,
+      "driver-location-updated",
+      payload,
+    );
+
+    console.info("[Pusher] Driver location triggered:", {
+      channel,
+      event: "driver-location-updated",
+      rideId,
+    });
+
+    return true;
+  } catch (error) {
+    console.error(
+      "[notificationService] Driver location Pusher failed:",
+      error,
+    );
+
+    return false;
+  }
+};
+
 const sendNotificationToUser = async (
   userId,
   { title, body, data = {}, event = "notification-created" },
@@ -424,4 +454,5 @@ module.exports = {
   notifyAdmins,
   ADMIN_NOTIFY_ROLES,
   triggerEventToRoles,
+  triggerRideLocation,
 };

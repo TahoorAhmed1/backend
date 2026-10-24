@@ -1520,6 +1520,206 @@ const createComplaint = async (req, res, next) => {
   }
 };
 
+
+const getRideLocation = async (req, res, next) => {
+  try {
+    const employee = await getEmployeeFromReq(req);
+
+    if (!employee) {
+      return fail(res, "Employee profile not found.");
+    }
+
+    const { id: rideId } = req.params;
+
+    // Security: an employee can only see rides they are a passenger on.
+    // An employee can have two rows on one ride (PICKUP + DROP), so fetch all.
+    const passengerRows = await prisma.ridePassenger.findMany({
+      where: { employeeId: employee.id, rideId },
+      orderBy: { leg: "asc" }, // PICKUP first, then DROP
+      select: {
+        leg: true,
+        scheduledTime: true,
+        confirmationStatus: true,
+        address: true,
+        employee: {
+          select: {
+            pickupLatitude: true,
+            pickupLongitude: true,
+            address: true,
+            area: { select: { name: true } },
+            subArea: { select: { name: true } },
+          },
+        },
+        ride: {
+          select: {
+            id: true,
+            driverId: true,
+            status: true,
+            rideDate: true,
+            pickupTime: true,
+            officeArrivalTime: true,
+            dropTime: true,
+            driver: {
+              select: {
+                id: true,
+                name: true,
+                phone: true,
+                // fallback if the ride has no vehicleId set
+                vehicle: {
+                  select: {
+                    vehicleNumber: true,
+                    type: true,
+                    make: true,
+                    model: true,
+                    capacity: true,
+                  },
+                },
+              },
+            },
+            vehicle: {
+              select: {
+                vehicleNumber: true,
+                type: true,
+                make: true,
+                model: true,
+                capacity: true,
+              },
+            },
+            route: {
+              select: {
+                routeCode: true,
+                routeName: true,
+                officeLocation: true,
+                office: {
+                  select: {
+                    name: true,
+                    location: true,
+                    latitude: true,
+                    longitude: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (passengerRows.length === 0) {
+      return fail(res, "Ride not found or not assigned to you.");
+    }
+
+    const primary = passengerRows[0];
+    const ride = primary.ride;
+
+    if (!ride.driverId) {
+      return fail(res, "No driver is assigned to this ride.");
+    }
+
+    // Latest GPS point for this exact ride.
+    const location = await prisma.driverLocation.findFirst({
+      where: { rideId: ride.id, driverId: ride.driverId },
+      orderBy: { recordedAt: "desc" },
+      select: {
+        id: true,
+        rideId: true,
+        driverId: true,
+        latitude: true,
+        longitude: true,
+        accuracy: true,
+        speed: true,
+        heading: true,
+        recordedAt: true,
+      },
+    });
+
+    const vehicle = ride.vehicle ?? ride.driver?.vehicle ?? null;
+    const office = ride.route?.office ?? null;
+    const home = primary.employee;
+
+    const homeLabel =
+      primary.address ||
+      home.address ||
+      [home.subArea?.name, home.area?.name].filter(Boolean).join(", ") ||
+      "My Pickup";
+
+    const hasOfficeCoords =
+      office?.latitude != null && office?.longitude != null;
+
+    // Where the employee is heading on this ride:
+    // PICKUP leg -> office, DROP leg -> home.
+    const dropoff =
+      primary.leg === "PICKUP"
+        ? hasOfficeCoords
+          ? {
+              latitude: office.latitude,
+              longitude: office.longitude,
+              label: office.location || office.name,
+            }
+          : null
+        : home.pickupLatitude != null && home.pickupLongitude != null
+          ? {
+              latitude: home.pickupLatitude,
+              longitude: home.pickupLongitude,
+              label: homeLabel,
+            }
+          : null;
+
+    const response = okResponse(
+      {
+        rideId: ride.id,
+        driverId: ride.driverId,
+        rideStatus: ride.status,
+        rideDate: ride.rideDate,
+
+        // Employee's own pickup point (names match the app's parser)
+        pickupLatitude: home.pickupLatitude,
+        pickupLongitude: home.pickupLongitude,
+        pickupLabel: homeLabel,
+
+        // Destination for ETA/route once the employee is on board
+        dropoffLatitude: dropoff?.latitude ?? null,
+        dropoffLongitude: dropoff?.longitude ?? null,
+        dropoffLabel: dropoff?.label ?? null,
+
+        // Employee's leg on this ride
+        leg: primary.leg,
+        legs: passengerRows.map((row) => row.leg),
+        scheduledTime: primary.scheduledTime,
+        confirmationStatus: primary.confirmationStatus,
+
+        // Driver
+        driverName: ride.driver?.name ?? null,
+        driverPhone: ride.driver?.phone ?? null,
+
+        // Vehicle
+        vehicleNumber: vehicle?.vehicleNumber ?? null,
+        vehicleType: vehicle?.type ?? null,
+        vehicleMake: vehicle?.make ?? null,
+        vehicleModel: vehicle?.model ?? null,
+        vehicleCapacity: vehicle?.capacity ?? null,
+
+        // Route and timings
+        routeCode: ride.route?.routeCode ?? null,
+        routeName: ride.route?.routeName ?? null,
+        pickupTime: ride.pickupTime,
+        officeArrivalTime: ride.officeArrivalTime,
+        dropTime: ride.dropTime,
+
+        location,
+      },
+      location
+        ? "Driver location retrieved successfully."
+        : "Driver location is not available yet.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
+
 const getMyComplaints = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -1681,6 +1881,7 @@ module.exports = {
   acceptRide,
   rejectRide,
   getRideDetails,
+  getRideLocation,
   getMyRides,
   markNotificationAsRead,
   deleteNotification,

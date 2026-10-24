@@ -35,13 +35,19 @@ CREATE TYPE "RideStatus" AS ENUM ('PENDING', 'STARTED', 'ARRIVED', 'COMPLETED', 
 CREATE TYPE "VendorStatus" AS ENUM ('ACTIVE', 'INACTIVE');
 
 -- CreateEnum
-CREATE TYPE "ComplaintCategory" AS ENUM ('DRIVER_BEHAVIOUR', 'VEHICLE_CONDITION', 'ROUTE_ISSUE', 'TIMING_DELAY', 'SCHEDULING', 'OTHER');
+CREATE TYPE "ComplaintCategory" AS ENUM ('DRIVER_BEHAVIOUR', 'EMPLOYEE_BEHAVIOUR', 'VEHICLE_CONDITION', 'ROUTE_ISSUE', 'TIMING_DELAY', 'SCHEDULING', 'OTHER');
 
 -- CreateEnum
 CREATE TYPE "ComplaintStatus" AS ENUM ('OPEN', 'IN_PROGRESS', 'RESOLVED', 'DISMISSED');
 
 -- CreateEnum
 CREATE TYPE "AttendanceStatus" AS ENUM ('PRESENT', 'LATE', 'ABSENT', 'NO_SHOW');
+
+-- CreateEnum
+CREATE TYPE "VendorLateStatus" AS ENUM ('ON_TIME', 'ON_TIME_LATE', 'LATE', 'ONLY_DROP', 'UNCLASSIFIED');
+
+-- CreateEnum
+CREATE TYPE "RideLeg" AS ENUM ('PICKUP', 'DROP');
 
 -- CreateEnum
 CREATE TYPE "ScheduleStatus" AS ENUM ('ACTIVE', 'DRAFT', 'CANCELLED');
@@ -54,6 +60,9 @@ CREATE TYPE "UserRole" AS ENUM ('ADMIN', 'MANAGER', 'DISPATCHER', 'DRIVER', 'EMP
 
 -- CreateEnum
 CREATE TYPE "NotificationStatus" AS ENUM ('UNREAD', 'READ');
+
+-- CreateEnum
+CREATE TYPE "DevicePlatform" AS ENUM ('IOS', 'ANDROID');
 
 -- CreateEnum
 CREATE TYPE "RideConfirmationStatus" AS ENUM ('PENDING', 'CONFIRMED', 'DECLINED');
@@ -156,6 +165,19 @@ CREATE TABLE "Driver" (
 );
 
 -- CreateTable
+CREATE TABLE "Office" (
+    "id" TEXT NOT NULL,
+    "name" "OfficeLocation" NOT NULL,
+    "location" TEXT NOT NULL,
+    "latitude" DOUBLE PRECISION,
+    "longitude" DOUBLE PRECISION,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "Office_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "Route" (
     "id" TEXT NOT NULL,
     "routeCode" TEXT NOT NULL,
@@ -171,6 +193,7 @@ CREATE TABLE "Route" (
     "dropTime" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
+    "officeId" TEXT,
 
     CONSTRAINT "Route_pkey" PRIMARY KEY ("id")
 );
@@ -178,14 +201,14 @@ CREATE TABLE "Route" (
 -- CreateTable
 CREATE TABLE "Trip" (
     "id" TEXT NOT NULL,
-    "routeId" TEXT NOT NULL,
     "tripNumber" INTEGER NOT NULL DEFAULT 1,
-    "driverId" TEXT NOT NULL,
+    "driverId" TEXT,
     "vehicleId" TEXT,
     "shiftTiming" TEXT,
     "status" "RouteStatus" NOT NULL DEFAULT 'ACTIVE',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
+    "routeId" TEXT NOT NULL,
 
     CONSTRAINT "Trip_pkey" PRIMARY KEY ("id")
 );
@@ -206,6 +229,8 @@ CREATE TABLE "Employee" (
     "subAreaId" TEXT,
     "blockId" TEXT,
     "address" TEXT,
+    "pickupLatitude" DOUBLE PRECISION,
+    "pickupLongitude" DOUBLE PRECISION,
     "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "shiftTiming" TEXT,
     "status" "EmployeeStatus" NOT NULL DEFAULT 'ACTIVE',
@@ -227,11 +252,11 @@ CREATE TABLE "WeeklySchedule" (
     "driverId" TEXT,
     "vehicleId" TEXT,
     "vendorId" TEXT,
-    "vehicleEntity" TEXT,
+    "vehicleEntity" "Entity",
     "shiftTiming" TEXT,
-    "pickupTime" TEXT,
-    "officeArrivalTime" TEXT,
-    "dropTime" TEXT,
+    "pickupTime" TIMESTAMP(3),
+    "officeArrivalTime" TIMESTAMP(3),
+    "dropTime" TIMESTAMP(3),
     "offDay" TEXT,
     "monday" "DayStatus" NOT NULL DEFAULT 'BOTH',
     "tuesday" "DayStatus" NOT NULL DEFAULT 'BOTH',
@@ -259,9 +284,11 @@ CREATE TABLE "Ride" (
     "tripId" TEXT,
     "areaId" TEXT,
     "subAreaId" TEXT,
-    "pickupTime" TEXT,
-    "officeArrivalTime" TEXT,
-    "dropTime" TEXT,
+    "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
+    "serviceTypeBackfilled" BOOLEAN NOT NULL DEFAULT false,
+    "pickupTime" TIMESTAMP(3),
+    "officeArrivalTime" TIMESTAMP(3),
+    "dropTime" TIMESTAMP(3),
     "status" "RideStatus" NOT NULL DEFAULT 'PENDING',
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
@@ -270,10 +297,28 @@ CREATE TABLE "Ride" (
 );
 
 -- CreateTable
+CREATE TABLE "DriverLocation" (
+    "id" TEXT NOT NULL,
+    "driverId" TEXT NOT NULL,
+    "rideId" TEXT,
+    "latitude" DOUBLE PRECISION NOT NULL,
+    "longitude" DOUBLE PRECISION NOT NULL,
+    "accuracy" DOUBLE PRECISION,
+    "speed" DOUBLE PRECISION,
+    "heading" DOUBLE PRECISION,
+    "recordedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "DriverLocation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "RidePassenger" (
     "id" TEXT NOT NULL,
     "rideId" TEXT NOT NULL,
     "employeeId" TEXT NOT NULL,
+    "leg" "RideLeg" NOT NULL DEFAULT 'PICKUP',
+    "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
+    "scheduledTime" TIMESTAMP(3),
     "employeeName" TEXT,
     "address" TEXT,
     "contact" TEXT,
@@ -291,9 +336,12 @@ CREATE TABLE "Attendance" (
     "rideDate" TIMESTAMP(3) NOT NULL,
     "employeeId" TEXT NOT NULL,
     "rideId" TEXT,
+    "leg" "RideLeg" NOT NULL DEFAULT 'PICKUP',
     "arrivalTime" TIMESTAMP(3),
     "delayMinutes" INTEGER,
     "status" "AttendanceStatus" NOT NULL DEFAULT 'PRESENT',
+    "vendorLateStatus" "VendorLateStatus" NOT NULL DEFAULT 'UNCLASSIFIED',
+    "backfilled" BOOLEAN NOT NULL DEFAULT false,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -363,6 +411,33 @@ CREATE TABLE "ScheduleException" (
 );
 
 -- CreateTable
+CREATE TABLE "BulkUploadJob" (
+    "id" TEXT NOT NULL,
+    "accountKey" TEXT,
+    "weekStart" TIMESTAMP(3) NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'processing',
+    "filePath" TEXT,
+    "jobType" TEXT NOT NULL DEFAULT 'BULK_UPLOAD',
+    "action" TEXT NOT NULL DEFAULT 'BULK_UPLOAD',
+    "employeeCodeFilter" JSONB,
+    "dispatchedAt" TIMESTAMP(3),
+    "dedupeKey" TEXT,
+    "totalRows" INTEGER NOT NULL DEFAULT 0,
+    "processedRows" INTEGER NOT NULL DEFAULT 0,
+    "batchSize" INTEGER NOT NULL DEFAULT 100,
+    "totalBatches" INTEGER NOT NULL DEFAULT 0,
+    "batchesCompleted" INTEGER NOT NULL DEFAULT 0,
+    "result" JSONB,
+    "error" TEXT,
+    "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "completedAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "BulkUploadJob_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "Notification" (
     "id" TEXT NOT NULL,
     "userId" TEXT NOT NULL,
@@ -370,9 +445,24 @@ CREATE TABLE "Notification" (
     "body" TEXT,
     "status" "NotificationStatus" NOT NULL DEFAULT 'UNREAD',
     "link" TEXT,
+    "data" JSONB,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "Notification_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "DeviceToken" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "token" TEXT NOT NULL,
+    "platform" "DevicePlatform" NOT NULL,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "lastSeenAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "DeviceToken_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateIndex
@@ -400,13 +490,19 @@ CREATE UNIQUE INDEX "Vehicle_vehicleNumber_key" ON "Vehicle"("vehicleNumber");
 CREATE UNIQUE INDEX "Vehicle_driverId_key" ON "Vehicle"("driverId");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "Driver_licenseNumber_key" ON "Driver"("licenseNumber");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Driver_cnic_key" ON "Driver"("cnic");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Driver_userId_key" ON "Driver"("userId");
 
 -- CreateIndex
-CREATE INDEX "Driver_name_idx" ON "Driver"("name");
+CREATE INDEX "Driver_cnic_licenseNumber_userId_idx" ON "Driver"("cnic", "licenseNumber", "userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Office_name_key" ON "Office"("name");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Route_routeCode_key" ON "Route"("routeCode");
@@ -460,16 +556,31 @@ CREATE INDEX "Ride_routeId_rideDate_idx" ON "Ride"("routeId", "rideDate");
 CREATE INDEX "Ride_rideDate_idx" ON "Ride"("rideDate");
 
 -- CreateIndex
+CREATE INDEX "Ride_vendorId_rideDate_idx" ON "Ride"("vendorId", "rideDate");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Ride_driverId_tripId_rideDate_key" ON "Ride"("driverId", "tripId", "rideDate");
+
+-- CreateIndex
+CREATE INDEX "DriverLocation_driverId_recordedAt_idx" ON "DriverLocation"("driverId", "recordedAt");
+
+-- CreateIndex
+CREATE INDEX "DriverLocation_rideId_recordedAt_idx" ON "DriverLocation"("rideId", "recordedAt");
 
 -- CreateIndex
 CREATE INDEX "RidePassenger_rideId_idx" ON "RidePassenger"("rideId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "RidePassenger_rideId_employeeId_key" ON "RidePassenger"("rideId", "employeeId");
+CREATE UNIQUE INDEX "RidePassenger_rideId_employeeId_leg_key" ON "RidePassenger"("rideId", "employeeId", "leg");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "Attendance_employeeId_rideDate_key" ON "Attendance"("employeeId", "rideDate");
+CREATE INDEX "Attendance_rideDate_vendorLateStatus_idx" ON "Attendance"("rideDate", "vendorLateStatus");
+
+-- CreateIndex
+CREATE INDEX "Attendance_rideId_vendorLateStatus_idx" ON "Attendance"("rideId", "vendorLateStatus");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Attendance_employeeId_rideDate_leg_key" ON "Attendance"("employeeId", "rideDate", "leg");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
@@ -481,7 +592,22 @@ CREATE UNIQUE INDEX "User_qr_code_key" ON "User"("qr_code");
 CREATE INDEX "ScheduleException_weekStart_idx" ON "ScheduleException"("weekStart");
 
 -- CreateIndex
+CREATE INDEX "BulkUploadJob_weekStart_status_idx" ON "BulkUploadJob"("weekStart", "status");
+
+-- CreateIndex
+CREATE INDEX "BulkUploadJob_accountKey_status_dispatchedAt_createdAt_idx" ON "BulkUploadJob"("accountKey", "status", "dispatchedAt", "createdAt");
+
+-- CreateIndex
 CREATE INDEX "Notification_userId_idx" ON "Notification"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DeviceToken_token_key" ON "DeviceToken"("token");
+
+-- CreateIndex
+CREATE INDEX "DeviceToken_userId_idx" ON "DeviceToken"("userId");
+
+-- CreateIndex
+CREATE INDEX "DeviceToken_userId_isActive_idx" ON "DeviceToken"("userId", "isActive");
 
 -- AddForeignKey
 ALTER TABLE "SubArea" ADD CONSTRAINT "SubArea_areaId_fkey" FOREIGN KEY ("areaId") REFERENCES "Area"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -508,10 +634,13 @@ ALTER TABLE "Route" ADD CONSTRAINT "Route_areaId_fkey" FOREIGN KEY ("areaId") RE
 ALTER TABLE "Route" ADD CONSTRAINT "Route_subAreaId_fkey" FOREIGN KEY ("subAreaId") REFERENCES "SubArea"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "Route" ADD CONSTRAINT "Route_officeId_fkey" FOREIGN KEY ("officeId") REFERENCES "Office"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "Trip" ADD CONSTRAINT "Trip_routeId_fkey" FOREIGN KEY ("routeId") REFERENCES "Route"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "Trip" ADD CONSTRAINT "Trip_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "Trip" ADD CONSTRAINT "Trip_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Trip" ADD CONSTRAINT "Trip_vehicleId_fkey" FOREIGN KEY ("vehicleId") REFERENCES "Vehicle"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -571,6 +700,12 @@ ALTER TABLE "Ride" ADD CONSTRAINT "Ride_areaId_fkey" FOREIGN KEY ("areaId") REFE
 ALTER TABLE "Ride" ADD CONSTRAINT "Ride_subAreaId_fkey" FOREIGN KEY ("subAreaId") REFERENCES "SubArea"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "DriverLocation" ADD CONSTRAINT "DriverLocation_driverId_fkey" FOREIGN KEY ("driverId") REFERENCES "Driver"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DriverLocation" ADD CONSTRAINT "DriverLocation_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "RidePassenger" ADD CONSTRAINT "RidePassenger_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -596,3 +731,6 @@ ALTER TABLE "Complaint" ADD CONSTRAINT "Complaint_rideId_fkey" FOREIGN KEY ("rid
 
 -- AddForeignKey
 ALTER TABLE "Notification" ADD CONSTRAINT "Notification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "DeviceToken" ADD CONSTRAINT "DeviceToken_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;

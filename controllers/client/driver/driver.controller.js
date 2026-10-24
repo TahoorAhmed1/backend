@@ -14,6 +14,7 @@ const {
   notifyUsers,
   notifyRoles,
   ADMIN_NOTIFY_ROLES,
+  triggerRideLocation,
 } = require("../../../services/notification.service");
 const {
   normalizeVendorLateStatus,
@@ -71,12 +72,16 @@ const toKarachiDateParts = (date = new Date()) => {
 
 const startOfDay = (date = new Date()) => {
   const { year, month, day } = toKarachiDateParts(date);
-  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+05:00`);
+  return new Date(
+    `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+05:00`,
+  );
 };
 
 const endOfDay = (date = new Date()) => {
   const { year, month, day } = toKarachiDateParts(date);
-  return new Date(`${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T23:59:59.999+05:00`);
+  return new Date(
+    `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T23:59:59.999+05:00`,
+  );
 };
 
 const getMyProfile = async (req, res, next) => {
@@ -404,7 +409,6 @@ const getDriverQrRideContext = (qrCode) => {
   return context;
 };
 
-
 const applyRideStatusTransition = async ({
   driver,
   rideId,
@@ -458,8 +462,7 @@ const applyRideStatusTransition = async ({
       },
     });
 
-    const driverStatus =
-      remainingActiveRideCount > 0 ? "ON_RIDE" : "AVAILABLE";
+    const driverStatus = remainingActiveRideCount > 0 ? "ON_RIDE" : "AVAILABLE";
 
     const updatedDriver = await tx.driver.update({
       where: { id: driver.id },
@@ -524,12 +527,16 @@ const notifyPassengersOfRideStatus = async ({ ride, nextStatus }) => {
   if (userIds.length === 0) return;
 
   const routeName = ride.route?.routeName ?? "your route";
-  await notifyUsers(userIds, {
-    title: notification.title,
-    body: notification.body(routeName),
-    data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
-    event: "ride-status-updated",
-  }, { notifyAdmins: false });
+  await notifyUsers(
+    userIds,
+    {
+      title: notification.title,
+      body: notification.body(routeName),
+      data: { rideId: ride.id, type: `RIDE_${nextStatus}` },
+      event: "ride-status-updated",
+    },
+    { notifyAdmins: false },
+  );
 };
 
 const updateRideStatus = async (req, res, next) => {
@@ -812,6 +819,10 @@ const getRideDetails = async (req, res, next) => {
   }
 };
 
+// Replace the existing getRideStops in driver_controller.js with this version.
+// Changes: returns employee pickup coordinates, and de-duplicates employees that
+// have both a PICKUP and a DROP row on the same ride.
+
 const getRideStops = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -833,6 +844,8 @@ const getRideStops = async (req, res, next) => {
                 name: true,
                 contactNumber: true,
                 address: true,
+                pickupLatitude: true,
+                pickupLongitude: true,
                 area: { select: { id: true, name: true } },
               },
             },
@@ -861,23 +874,37 @@ const getRideStops = async (req, res, next) => {
         .map((attendance) => [attendance.employeeId, attendance]),
     );
 
-    const passengerStops = ride.passengers.map((p) => {
-      const leg = p.leg || "PICKUP";
-      const attendance = attendanceByEmployee[p.employeeId];
+    const seenEmployees = new Set();
 
-      return {
-        kind: "passenger",
-        employeeId: p.employee.id,
-        employeeName: p.employee.name,
-        leg,
-        contact: p.contact || p.employee.contactNumber,
-        address: p.address || p.employee.address,
-        areaName: p.employee.area?.name ?? null,
-        status: attendance?.status || "PENDING",
-        vendorLateStatus: attendance?.vendorLateStatus || "UNCLASSIFIED",
-        delayMinutes: attendance?.delayMinutes ?? null,
-      };
-    });
+    const passengerStops = [...ride.passengers]
+      // PICKUP rows first, so they win when an employee has both legs
+      .sort(
+        (a, b) => (a.leg === "PICKUP" ? 0 : 1) - (b.leg === "PICKUP" ? 0 : 1),
+      )
+      .filter((p) => {
+        if (seenEmployees.has(p.employeeId)) return false;
+        seenEmployees.add(p.employeeId);
+        return true;
+      })
+      .map((p) => {
+        const leg = p.leg || "PICKUP";
+        const attendance = attendanceByEmployee[p.employeeId];
+
+        return {
+          kind: "passenger",
+          employeeId: p.employee.id,
+          employeeName: p.employee.name,
+          leg,
+          contact: p.contact || p.employee.contactNumber,
+          address: p.address || p.employee.address,
+          areaName: p.employee.area?.name ?? null,
+          latitude: p.employee.pickupLatitude ?? null,
+          longitude: p.employee.pickupLongitude ?? null,
+          status: attendance?.status || "PENDING",
+          vendorLateStatus: attendance?.vendorLateStatus || "UNCLASSIFIED",
+          delayMinutes: attendance?.delayMinutes ?? null,
+        };
+      });
 
     const response = okResponse(
       { rideId: ride.id, stops: passengerStops },
@@ -1034,14 +1061,18 @@ const notifyEmployeeOfAttendance = ({ attendance, driverName }) => {
   const employeeUserId = attendance.employee?.userId;
   if (!employeeUserId) return;
 
-  notifyUser(employeeUserId, {
-    title: ["ABSENT", "NO_SHOW"].includes(status)
-      ? "Marked absent"
-      : "Attendance marked",
-    body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
-    data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
-    event: "attendance-updated",
-  }, { notifyAdmins: false }).catch((err) =>
+  notifyUser(
+    employeeUserId,
+    {
+      title: ["ABSENT", "NO_SHOW"].includes(status)
+        ? "Marked absent"
+        : "Attendance marked",
+      body: `${driverName} marked you as ${status.toLowerCase().replace("_", " ")} for today's ride.`,
+      data: { rideId: attendance.rideId, type: "ATTENDANCE_UPDATED", status },
+      event: "attendance-updated",
+    },
+    { notifyAdmins: false },
+  ).catch((err) =>
     console.error("[driver_controller] notifyUser failed:", err),
   );
 };
@@ -1080,9 +1111,13 @@ const markAttendance = async (req, res, next) => {
       vendorLateStatus !== undefined &&
       vendorLateStatus !== null &&
       vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
+      ![
+        "ON_TIME",
+        "ON_TIME_LATE",
+        "LATE",
+        "ONLY_DROP",
+        "UNCLASSIFIED",
+      ].includes(normalizeVendorLateStatus(vendorLateStatus))
     ) {
       const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -1223,9 +1258,13 @@ const updateStopStatus = async (req, res, next) => {
       vendorLateStatus !== undefined &&
       vendorLateStatus !== null &&
       vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
+      ![
+        "ON_TIME",
+        "ON_TIME_LATE",
+        "LATE",
+        "ONLY_DROP",
+        "UNCLASSIFIED",
+      ].includes(normalizeVendorLateStatus(vendorLateStatus))
     ) {
       const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -1288,9 +1327,13 @@ const updateAttendance = async (req, res, next) => {
       vendorLateStatus !== undefined &&
       vendorLateStatus !== null &&
       vendorLateStatus !== "" &&
-      !["ON_TIME", "ON_TIME_LATE", "LATE", "ONLY_DROP", "UNCLASSIFIED"].includes(
-        normalizeVendorLateStatus(vendorLateStatus),
-      )
+      ![
+        "ON_TIME",
+        "ON_TIME_LATE",
+        "LATE",
+        "ONLY_DROP",
+        "UNCLASSIFIED",
+      ].includes(normalizeVendorLateStatus(vendorLateStatus))
     ) {
       const errorResponse = badRequestResponse("Invalid vendor late status.");
       return res.status(errorResponse.status.code).json(errorResponse);
@@ -1389,7 +1432,9 @@ const createComplaint = async (req, res, next) => {
     }
 
     if (typeof rideId !== "string" || !rideId.trim()) {
-      const errorResponse = badRequestResponse("Please select the related ride.");
+      const errorResponse = badRequestResponse(
+        "Please select the related ride.",
+      );
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
@@ -1470,7 +1515,7 @@ const createComplaint = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.log('error', error)
+    console.log("error", error);
     next(error);
   }
 };
@@ -1574,14 +1619,16 @@ const updateComplaint = async (req, res, next) => {
     });
 
     notifyRoles(STAFF_ROLES, {
-      title: status === "DISMISSED" ? "Complaint withdrawn" : "Complaint updated",
+      title:
+        status === "DISMISSED" ? "Complaint withdrawn" : "Complaint updated",
       body:
         status === "DISMISSED"
           ? `${driver.name} withdrew their complaint: ${complaint.title}`
           : `${driver.name} updated their complaint: ${title?.trim() ?? complaint.title}`,
       data: {
         complaintId: complaint.id,
-        type: status === "DISMISSED" ? "COMPLAINT_DISMISSED" : "COMPLAINT_UPDATED",
+        type:
+          status === "DISMISSED" ? "COMPLAINT_DISMISSED" : "COMPLAINT_UPDATED",
       },
       event: "notification-created",
     }).catch((err) =>
@@ -1944,6 +1991,92 @@ const getDriverStats = async (req, res, next) => {
   }
 };
 
+const updateDriverLocation = async (req, res, next) => {
+  try {
+    const driver = await getDriverFromReq(req);
+
+    if (!driver) {
+      const errorResponse = badRequestResponse("Driver profile not found.");
+
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const { id: rideId } = req.params;
+
+    const { latitude, longitude, accuracy, speed, heading } = req.body;
+
+    // Make sure this ride belongs to the logged-in driver
+    const ride = await prisma.ride.findFirst({
+      where: {
+        id: rideId,
+        driverId: driver.id,
+      },
+      select: {
+        id: true,
+        status: true,
+        driverId: true,
+      },
+    });
+
+    if (!ride) {
+      const errorResponse = badRequestResponse("Ride not found.");
+
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    // Only accept location while ride is active
+    if (!["STARTED", "ARRIVED"].includes(ride.status)) {
+      const errorResponse = badRequestResponse(
+        "Driver location can only be updated for an active ride.",
+      );
+
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    const location = await prisma.driverLocation.create({
+      data: {
+        driverId: driver.id,
+        rideId: ride.id,
+        latitude,
+        longitude,
+        accuracy: accuracy ?? null,
+        speed: speed ?? null,
+        heading: heading ?? null,
+      },
+    });
+
+    await triggerRideLocation(ride.id, {
+      rideId: ride.id,
+      driverId: driver.id,
+      latitude: location.latitude,
+      longitude: location.longitude,
+      accuracy: location.accuracy,
+      speed: location.speed,
+      heading: location.heading,
+      recordedAt: location.recordedAt,
+    });
+
+    const response = okResponse(
+      {
+        id: location.id,
+        rideId: location.rideId,
+        driverId: location.driverId,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        accuracy: location.accuracy,
+        speed: location.speed,
+        heading: location.heading,
+        recordedAt: location.recordedAt,
+      },
+      "Driver location updated successfully.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getMyProfile,
   updateMyProfile,
@@ -1975,4 +2108,5 @@ module.exports = {
   getDashboardSummary,
   getDriverStats,
   markAllNotificationsAsRead,
+  updateDriverLocation,
 };

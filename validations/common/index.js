@@ -316,6 +316,8 @@ const routeCreateSchema = Joi.object({
 
     subAreaId: Joi.string().uuid().optional().allow(null, ""),
 
+    officeId: Joi.string().uuid().optional().allow(null, ""),
+
     officeLocation: Joi.string()
       .optional()
       .valid("IBT_1", "IBT_2", "IBT_3", "SKY_TOWER")
@@ -356,6 +358,7 @@ const routeUpdateSchema = Joi.object({
     routeName: Joi.string().optional().min(2).max(100),
 
     areaId: Joi.string().uuid().optional().allow(null, ""),
+    officeId: Joi.string().uuid().optional().allow(null, ""),
 
     subAreaId: Joi.string().uuid().optional().allow(null, ""),
 
@@ -690,6 +693,23 @@ const markAttendanceSchema = Joi.object({
     }),
 });
 
+const updateDriverLocationSchema = Joi.object({
+  query: empty(),
+
+  params: Joi.object({
+    id: uuid().required(),
+  }),
+
+  body: Joi.object({
+    latitude: Joi.number().min(-90).max(90).required(),
+    longitude: Joi.number().min(-180).max(180).required(),
+
+    accuracy: Joi.number().min(0).allow(null).optional(),
+    speed: Joi.number().min(0).allow(null).optional(),
+    heading: Joi.number().min(0).max(360).allow(null).optional(),
+  }),
+});
+
 const driverComplaintSchema = Joi.object({
   query: empty(),
   params: empty(),
@@ -848,4 +868,5 @@ module.exports = {
   listQuerySchema,
   employeeComplaintSchema,
   recentRidesQuerySchema,
+  updateDriverLocationSchema
 };

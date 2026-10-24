@@ -34,6 +34,7 @@ const {
   getActiveRide,
   getMyQrCode,
   markAllNotificationsAsRead,
+  updateDriverLocation,
 } = require("../../../controllers/client/driver/driver.controller");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const {
@@ -42,6 +43,7 @@ const {
   updateRideStatusSchema,
   markAttendanceSchema,
   driverComplaintSchema,
+  updateDriverLocationSchema,
 } = require("../../../validations/common");
 
 router.use(verifyUserByToken, requireRole("DRIVER"));
@@ -102,7 +104,11 @@ router.post(
 router.get("/complaints/:id", getComplaintDetails);
 router.patch("/complaints/:id", updateComplaint);
 router.delete("/complaints/:id", deleteComplaint);
-
+router.post(
+  "/rides/:id/location",
+  validateRequest(updateDriverLocationSchema),
+  updateDriverLocation,
+);
 // Notifications
 router.get(
   "/notifications",
