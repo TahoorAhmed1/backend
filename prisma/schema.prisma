@@ -287,7 +287,8 @@ model Office {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  routes Route[]
+  routes    Route[]
+  employees Employee[]
 }
 
 model Route {
@@ -348,15 +349,16 @@ model Trip {
 }
 
 model Employee {
-  id              String          @id @default(uuid())
-  employeeCode    String          @unique
-  name            String
-  contactNumber   String?
-  cnic            String?         @unique
-  gender          Gender?
-  designation     String?
-  entity          Entity?
-  officeLocation  OfficeLocation?
+  id             String          @id @default(uuid())
+  employeeCode   String          @unique
+  name           String
+  contactNumber  String?
+  cnic           String?         @unique
+  gender         Gender?
+  designation    String?
+  entity         Entity?
+  officeLocation OfficeLocation?
+
   departmentId    String?
   areaId          String?
   subAreaId       String?
@@ -364,9 +366,12 @@ model Employee {
   address         String?
   pickupLatitude  Float?
   pickupLongitude Float?
-  serviceType     ServiceType     @default(PICK_AND_DROP)
+  serviceType     ServiceType    @default(PICK_AND_DROP)
   shiftTiming     String?
-  status          EmployeeStatus  @default(ACTIVE)
+  status          EmployeeStatus @default(ACTIVE)
+
+  office   Office? @relation(fields: [officeId], references: [id])
+  officeId String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -382,6 +387,8 @@ model Employee {
   ridePassengers  RidePassenger[]
   attendances     Attendance[]
   complaints      Complaint[]
+
+  @@index([officeId])
 }
 
 model WeeklySchedule {

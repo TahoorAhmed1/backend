@@ -251,7 +251,39 @@ async function main() {
   // - Area
   // - SubArea
   // - Block
+  // - Office (resolved from officeLocation)
   //
+
+  const officeNames = [
+    ...new Set(
+      employees
+        .map((employee) => employee.officeLocation)
+        .filter(Boolean),
+    ),
+  ]
+  const offices = await prisma.office.findMany({
+    where: {
+      name: {
+        in: officeNames,
+      },
+    },
+    select: {
+      id: true,
+      name: true,
+    },
+  })
+  const officeIdsByName = new Map(
+    offices.map((office) => [office.name, office.id]),
+  )
+  const missingOfficeNames = officeNames.filter(
+    (officeName) => !officeIdsByName.has(officeName),
+  )
+
+  if (missingOfficeNames.length > 0) {
+    throw new Error(
+      `Office locations not found. Seed offices first: ${missingOfficeNames.join(', ')}`,
+    )
+  }
 
   await bulkUpsert(
     'Employee',
@@ -261,7 +293,7 @@ async function main() {
       'name',
       'contactNumber',
       'entity',
-      'officeLocation',
+      'officeId',
       'departmentId',
       'areaId',
       'subAreaId',
@@ -270,7 +302,12 @@ async function main() {
       'serviceType',
       'status',
     ],
-    employees,
+    employees.map((employee) => ({
+      ...employee,
+      officeId: employee.officeLocation
+        ? officeIdsByName.get(employee.officeLocation)
+        : null,
+    })),
     'employeeCode',
   )
 

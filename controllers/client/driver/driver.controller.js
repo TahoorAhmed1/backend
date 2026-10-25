@@ -907,7 +907,14 @@ const getRideStops = async (req, res, next) => {
       });
 
     const response = okResponse(
-      { rideId: ride.id, stops: passengerStops },
+      {
+        rideId: ride.id,
+        stops: passengerStops,
+        dropLocation: {
+          latitude: 24.85907295252155,
+          longitude: 67.05224712005923,
+        },
+      },
       "Ride stops retrieved successfully.",
     );
     return res.status(response.status.code).json(response);
