@@ -2054,7 +2054,70 @@ const updateDriverLocation = async (req, res, next) => {
 
     const { id: rideId } = req.params;
 
-    const { latitude, longitude, accuracy, speed, heading } = req.body;
+    const { latitude, longitude, accuracy, speed, heading } = req.body ?? {};
+
+    // Validate coordinates before touching the database.
+    if (
+      typeof latitude !== "number" ||
+      typeof longitude !== "number" ||
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude)
+    ) {
+      const errorResponse = badRequestResponse(
+        "Valid latitude and longitude are required.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (latitude < -90 || latitude > 90) {
+      const errorResponse = badRequestResponse(
+        "Latitude must be between -90 and 90.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (longitude < -180 || longitude > 180) {
+      const errorResponse = badRequestResponse(
+        "Longitude must be between -180 and 180.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      accuracy !== undefined &&
+      accuracy !== null &&
+      (typeof accuracy !== "number" ||
+        !Number.isFinite(accuracy) ||
+        accuracy < 0)
+    ) {
+      const errorResponse = badRequestResponse("Invalid accuracy.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      speed !== undefined &&
+      speed !== null &&
+      (typeof speed !== "number" ||
+        !Number.isFinite(speed) ||
+        speed < 0)
+    ) {
+      const errorResponse = badRequestResponse("Invalid speed.");
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
+
+    if (
+      heading !== undefined &&
+      heading !== null &&
+      (typeof heading !== "number" ||
+        !Number.isFinite(heading) ||
+        heading < 0 ||
+        heading > 360)
+    ) {
+      const errorResponse = badRequestResponse(
+        "Heading must be between 0 and 360.",
+      );
+      return res.status(errorResponse.status.code).json(errorResponse);
+    }
 
     // Make sure this ride belongs to the logged-in driver
     const ride = await prisma.ride.findFirst({

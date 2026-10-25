@@ -1633,8 +1633,7 @@ const getRideLocation = async (req, res, next) => {
       return fail(res, "No driver is assigned to this ride.");
     }
 
-    // Latest GPS point for the driver on this exact ride.
-    // `location` remains the driver GPS field for backwards compatibility.
+    // Latest GPS point for this exact ride.
     const location = await prisma.driverLocation.findFirst({
       where: { rideId: ride.id, driverId: ride.driverId },
       orderBy: { recordedAt: "desc" },
@@ -1652,8 +1651,6 @@ const getRideLocation = async (req, res, next) => {
     });
 
     // Latest GPS point for the logged-in employee on this exact ride.
-    // This is intentionally read-only here: employee GPS is written by
-    // updateEmployeeLocation and is NOT broadcast through the driver channel.
     const employeeLocation = await prisma.employeeLocation.findFirst({
       where: {
         rideId: ride.id,
