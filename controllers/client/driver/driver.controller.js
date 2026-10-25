@@ -194,7 +194,14 @@ const getMyQrCode = async (req, res, next) => {
               id: true,
               routeName: true,
               routeCode: true,
-              officeLocation: true,
+              office: {
+                select: {
+                  name: true,
+                  location: true,
+                  latitude: true,
+                  longitude: true,
+                },
+              },
             },
           },
           vehicle: {
@@ -289,7 +296,14 @@ const getTodayRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
-            officeLocation: true,
+            office: {
+              select: {
+                name: true,
+                location: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
           },
         },
         vehicle: {
@@ -610,7 +624,14 @@ const startTodayRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
-            officeLocation: true,
+            office: {
+              select: {
+                name: true,
+                location: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
           },
         },
         vehicle: {
@@ -793,7 +814,14 @@ const getRideDetails = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
-            officeLocation: true,
+            office: {
+              select: {
+                name: true,
+                location: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
           },
         },
         vehicle: {
@@ -836,6 +864,18 @@ const getRideStops = async (req, res, next) => {
     const ride = await prisma.ride.findUnique({
       where: { id },
       include: {
+        route: {
+          select: {
+            office: {
+              select: {
+                name: true,
+                location: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
+          },
+        },
         passengers: {
           include: {
             employee: {
@@ -910,10 +950,7 @@ const getRideStops = async (req, res, next) => {
       {
         rideId: ride.id,
         stops: passengerStops,
-        dropLocation: {
-          latitude: 24.85907295252155,
-          longitude: 67.05224712005923,
-        },
+        dropLocation: ride.route?.office ?? null,
       },
       "Ride stops retrieved successfully.",
     );
@@ -1221,7 +1258,14 @@ const getActiveRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
-            officeLocation: true,
+            office: {
+              select: {
+                name: true,
+                location: true,
+                latitude: true,
+                longitude: true,
+              },
+            },
           },
         },
         vehicle: {

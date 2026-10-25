@@ -393,7 +393,14 @@ const getTodayRide = async (req, res, next) => {
                 id: true,
                 routeName: true,
                 routeCode: true,
-                officeLocation: true,
+                office: {
+                  select: {
+                    name: true,
+                    location: true,
+                    latitude: true,
+                    longitude: true,
+                  },
+                },
               },
             },
             driver: { select: { id: true, name: true, phone: true } },
@@ -609,7 +616,18 @@ const getRideDetails = async (req, res, next) => {
           ride: {
             include: {
               route: {
-                select: { id: true, routeName: true, officeLocation: true },
+                select: {
+                  id: true,
+                  routeName: true,
+                  office: {
+                    select: {
+                      name: true,
+                      location: true,
+                      latitude: true,
+                      longitude: true,
+                    },
+                  },
+                },
               },
               driver: { select: { id: true, name: true, phone: true } },
               vehicle: {
@@ -1589,7 +1607,6 @@ const getRideLocation = async (req, res, next) => {
               select: {
                 routeCode: true,
                 routeName: true,
-                officeLocation: true,
                 office: {
                   select: {
                     name: true,
