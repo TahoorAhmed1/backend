@@ -378,17 +378,38 @@ model Employee {
 
   userId String? @unique
 
-  department      Department?      @relation(fields: [departmentId], references: [id])
-  area            Area?            @relation(fields: [areaId], references: [id])
-  subArea         SubArea?         @relation(fields: [subAreaId], references: [id])
-  block           Block?           @relation(fields: [blockId], references: [id])
-  user            User?            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
-  weeklySchedules WeeklySchedule[]
-  ridePassengers  RidePassenger[]
-  attendances     Attendance[]
-  complaints      Complaint[]
+  department        Department?        @relation(fields: [departmentId], references: [id])
+  area              Area?              @relation(fields: [areaId], references: [id])
+  subArea           SubArea?           @relation(fields: [subAreaId], references: [id])
+  block             Block?             @relation(fields: [blockId], references: [id])
+  user              User?              @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
+  weeklySchedules   WeeklySchedule[]
+  ridePassengers    RidePassenger[]
+  attendances       Attendance[]
+  complaints        Complaint[]
+  employeeLocations EmployeeLocation[]
 
   @@index([officeId])
+}
+
+model EmployeeLocation {
+  id         String @id @default(uuid())
+  employeeId String
+  rideId     String
+
+  latitude  Decimal
+  longitude Decimal
+  accuracy  Decimal?
+  speed     Decimal?
+  heading   Decimal?
+
+  recordedAt DateTime @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+  ride     Ride     @relation(fields: [rideId], references: [id])
+
+  @@index([employeeId, rideId, recordedAt])
+  @@index([rideId, recordedAt])
 }
 
 model WeeklySchedule {
@@ -478,16 +499,17 @@ model Ride {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  route       Route            @relation(fields: [routeId], references: [id])
-  driver      Driver?          @relation(fields: [driverId], references: [id])
-  vehicle     Vehicle?         @relation(fields: [vehicleId], references: [id])
-  vendor      Vendor?          @relation(fields: [vendorId], references: [id])
-  area        Area?            @relation(fields: [areaId], references: [id])
-  subArea     SubArea?         @relation(fields: [subAreaId], references: [id])
-  passengers  RidePassenger[]
-  attendances Attendance[]
-  complaints  Complaint[]
-  locations   DriverLocation[]
+  route             Route              @relation(fields: [routeId], references: [id])
+  driver            Driver?            @relation(fields: [driverId], references: [id])
+  vehicle           Vehicle?           @relation(fields: [vehicleId], references: [id])
+  vendor            Vendor?            @relation(fields: [vendorId], references: [id])
+  area              Area?              @relation(fields: [areaId], references: [id])
+  subArea           SubArea?           @relation(fields: [subAreaId], references: [id])
+  passengers        RidePassenger[]
+  attendances       Attendance[]
+  complaints        Complaint[]
+  locations         DriverLocation[]
+  employeeLocations EmployeeLocation[]
 
   @@unique([driverId, tripId, rideDate], name: "ride_driver_trip_date_unique")
   @@index([routeId, rideDate])

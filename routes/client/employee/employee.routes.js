@@ -22,6 +22,7 @@ const {
   markAllNotificationsAsRead,
   getAllWeeklySchedules,
   getRideLocation,
+  updateEmployeeLocation,
 } = require("../../../controllers/client/employee/employee.controller.js");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const { updateEmployeeProfileSchema, confirmRideSchema, weeklyScheduleQuerySchema, markMyAttendanceSchema, listQuerySchema, employeeComplaintSchema, recentRidesQuerySchema } = require("../../../validations/common");
@@ -63,7 +64,6 @@ router.post(
   validateRequest(markMyAttendanceSchema),
   markMyAttendance,
 );
-router.get("/rides/:id/location", getRideLocation);
 router.get(
   "/complaints",
   validateRequest(listQuerySchema),
@@ -89,4 +89,6 @@ router.patch("/notifications/read-all", markAllNotificationsAsRead);
 router.patch("/notifications/:id/read", markNotificationAsRead);
 router.delete("/notifications/:id", deleteNotification);
 
+router.get("/rides/:id/location", getRideLocation);
+router.post("/rides/:id/location", updateEmployeeLocation);
 module.exports = router;

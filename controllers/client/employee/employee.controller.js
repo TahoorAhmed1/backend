@@ -1633,7 +1633,8 @@ const getRideLocation = async (req, res, next) => {
       return fail(res, "No driver is assigned to this ride.");
     }
 
-    // Latest GPS point for this exact ride.
+    // Latest GPS point for the driver on this exact ride.
+    // `location` remains the driver GPS field for backwards compatibility.
     const location = await prisma.driverLocation.findFirst({
       where: { rideId: ride.id, driverId: ride.driverId },
       orderBy: { recordedAt: "desc" },
@@ -1641,6 +1642,28 @@ const getRideLocation = async (req, res, next) => {
         id: true,
         rideId: true,
         driverId: true,
+        latitude: true,
+        longitude: true,
+        accuracy: true,
+        speed: true,
+        heading: true,
+        recordedAt: true,
+      },
+    });
+
+    // Latest GPS point for the logged-in employee on this exact ride.
+    // This is intentionally read-only here: employee GPS is written by
+    // updateEmployeeLocation and is NOT broadcast through the driver channel.
+    const employeeLocation = await prisma.employeeLocation.findFirst({
+      where: {
+        rideId: ride.id,
+        employeeId: employee.id,
+      },
+      orderBy: { recordedAt: "desc" },
+      select: {
+        id: true,
+        employeeId: true,
+        rideId: true,
         latitude: true,
         longitude: true,
         accuracy: true,
@@ -1723,15 +1746,163 @@ const getRideLocation = async (req, res, next) => {
         officeArrivalTime: ride.officeArrivalTime,
         dropTime: ride.dropTime,
 
+        // Driver live GPS. Keep this key unchanged for the existing app.
         location,
+
+        // Logged-in employee's latest live GPS.
+        employeeLocation,
       },
       location
-        ? "Driver location retrieved successfully."
-        : "Driver location is not available yet.",
+        ? employeeLocation
+          ? "Driver and employee locations retrieved successfully."
+          : "Driver location retrieved successfully. Employee location is not available yet."
+        : employeeLocation
+          ? "Employee location retrieved successfully. Driver location is not available yet."
+          : "Driver and employee locations are not available yet.",
     );
 
     return res.status(response.status.code).json(response);
   } catch (error) {
+    next(error);
+  }
+};
+
+const updateEmployeeLocation = async (req, res, next) => {
+  try {
+    const employee = await getEmployeeFromReq(req);
+
+    if (!employee) {
+      return fail(res, "Employee profile not found.");
+    }
+
+    const { id: rideId } = req.params;
+    const {
+      latitude,
+      longitude,
+      accuracy,
+      speed,
+      heading,
+    } = req.body ?? {};
+
+    // Validate coordinates
+    if (
+      typeof latitude !== "number" ||
+      typeof longitude !== "number" ||
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude)
+    ) {
+      return fail(res, "Valid latitude and longitude are required.");
+    }
+
+    if (latitude < -90 || latitude > 90) {
+      return fail(res, "Latitude must be between -90 and 90.");
+    }
+
+    if (longitude < -180 || longitude > 180) {
+      return fail(res, "Longitude must be between -180 and 180.");
+    }
+
+    // Security:
+    // Employee can only submit location for a ride they are assigned to.
+    const ridePassenger = await prisma.ridePassenger.findFirst({
+      where: {
+        rideId,
+        employeeId: employee.id,
+      },
+      select: {
+        id: true,
+        rideId: true,
+        employeeId: true,
+        ride: {
+          select: {
+            id: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (!ridePassenger) {
+      return fail(res, "Ride not found or not assigned to you.");
+    }
+
+    const ride = ridePassenger.ride;
+
+    // Only track while the ride is active.
+    if (!["STARTED", "ARRIVED"].includes(ride.status)) {
+      return fail(
+        res,
+        `Location tracking is not available while the ride is ${ride.status.toLowerCase()}.`,
+      );
+    }
+
+    // Validate optional GPS metadata.
+    if (
+      accuracy !== undefined &&
+      accuracy !== null &&
+      (typeof accuracy !== "number" ||
+        !Number.isFinite(accuracy) ||
+        accuracy < 0)
+    ) {
+      return fail(res, "Invalid accuracy.");
+    }
+
+    if (
+      speed !== undefined &&
+      speed !== null &&
+      (typeof speed !== "number" ||
+        !Number.isFinite(speed) ||
+        speed < 0)
+    ) {
+      return fail(res, "Invalid speed.");
+    }
+
+    if (
+      heading !== undefined &&
+      heading !== null &&
+      (typeof heading !== "number" ||
+        !Number.isFinite(heading) ||
+        heading < 0 ||
+        heading > 360)
+    ) {
+      return fail(res, "Heading must be between 0 and 360.");
+    }
+
+    const location = await prisma.employeeLocation.create({
+      data: {
+        employeeId: employee.id,
+        rideId: ride.id,
+        latitude,
+        longitude,
+        accuracy: accuracy ?? null,
+        speed: speed ?? null,
+        heading: heading ?? null,
+      },
+      select: {
+        id: true,
+        employeeId: true,
+        rideId: true,
+        latitude: true,
+        longitude: true,
+        accuracy: true,
+        speed: true,
+        heading: true,
+        recordedAt: true,
+      },
+    });
+
+    const response = okResponse(
+      location,
+      "Employee location updated successfully.",
+    );
+
+    return res.status(response.status.code).json(response);
+  } catch (error) {
+    console.error(
+      "[employee_controller] updateEmployeeLocation error:",
+      error,
+    );
+
     next(error);
   }
 };
@@ -1902,4 +2073,5 @@ module.exports = {
   getMyRides,
   markNotificationAsRead,
   deleteNotification,
+  updateEmployeeLocation
 };
