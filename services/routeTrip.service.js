@@ -253,6 +253,17 @@ const findOrCreateRouteAndTrip = async (
           `(${OFFICE_LOCATION_VALUES.join(", ")}) — leaving officeLocation unset on new route.`,
       );
     }
+    const office = normalizedOfficeLocation
+      ? await prisma.office.findUnique({
+          where: { name: normalizedOfficeLocation },
+          select: { id: true },
+        })
+      : null;
+    if (normalizedOfficeLocation && !office) {
+      throw new Error(
+        `[routeTrip] Office "${normalizedOfficeLocation}" was not found. Seed office locations before creating routes.`,
+      );
+    }
 
     const routeCreateData = {
       routeName: baseName,
@@ -260,6 +271,7 @@ const findOrCreateRouteAndTrip = async (
       areaId: areaRecord?.id,
       subAreaId: subAreaId || undefined,
       officeLocation: normalizedOfficeLocation || undefined,
+      officeId: office?.id,
       serviceType: serviceType || undefined,
       pickupStartTime: pickupStartTime || undefined,
       officeArrivalTime: officeArrivalTime || undefined,
@@ -273,7 +285,7 @@ const findOrCreateRouteAndTrip = async (
       try {
         route = await prisma.route.create({
           data: { ...routeCreateData, routeCode },
-          include: { area: true },
+          include: { area: true, office: true },
         });
         lastRouteCreateError = undefined;
         break;
@@ -289,7 +301,7 @@ const findOrCreateRouteAndTrip = async (
         .slice(2, 6)}`;
       route = await prisma.route.create({
         data: { ...routeCreateData, routeCode: guaranteedCode },
-        include: { area: true },
+        include: { area: true, office: true },
       });
     }
     routeCreated = true;
