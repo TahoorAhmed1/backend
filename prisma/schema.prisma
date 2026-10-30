@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
 }
 
 datasource db {
@@ -193,6 +194,7 @@ model Block {
   employees Employee[]
 
   @@unique([name, subAreaId])
+  @@index([subAreaId])
 }
 
 model Department {
@@ -246,6 +248,8 @@ model Vehicle {
   complaints      Complaint[]
   weeklySchedules WeeklySchedule[]
   trips           Trip[]
+
+  @@index([vendorId])
 }
 
 model Driver {
@@ -273,7 +277,9 @@ model Driver {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([cnic, licenseNumber, userId])
+  // FIX: the old @@index([cnic, licenseNumber, userId]) was useless — all three are
+  // already @unique, and a composite index only helps queries that lead with `cnic`.
+  @@index([vendorId])
 }
 
 model Office {
@@ -322,6 +328,7 @@ model Route {
 
   @@index([areaId])
   @@index([subAreaId])
+  @@index([officeId])
 }
 
 model Trip {
@@ -378,18 +385,22 @@ model Employee {
 
   userId String? @unique
 
-  department      Department?      @relation(fields: [departmentId], references: [id])
-  area            Area?            @relation(fields: [areaId], references: [id])
-  subArea         SubArea?         @relation(fields: [subAreaId], references: [id])
-  block           Block?           @relation(fields: [blockId], references: [id])
-  user            User?            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
-  weeklySchedules WeeklySchedule[]
-  ridePassengers  RidePassenger[]
-  attendances     Attendance[]
-  complaints      Complaint[]
+  department        Department?        @relation(fields: [departmentId], references: [id])
+  area              Area?              @relation(fields: [areaId], references: [id])
+  subArea           SubArea?           @relation(fields: [subAreaId], references: [id])
+  block             Block?             @relation(fields: [blockId], references: [id])
+  user              User?              @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
+  weeklySchedules   WeeklySchedule[]
+  ridePassengers    RidePassenger[]
+  attendances       Attendance[]
+  complaints        Complaint[]
   employeeLocations EmployeeLocation[]
 
   @@index([officeId])
+  @@index([areaId])
+  @@index([subAreaId])
+  @@index([departmentId])
+  @@index([status])
 }
 
 model WeeklySchedule {
@@ -479,12 +490,12 @@ model Ride {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  route       Route            @relation(fields: [routeId], references: [id])
-  driver      Driver?          @relation(fields: [driverId], references: [id])
-  vehicle     Vehicle?         @relation(fields: [vehicleId], references: [id])
-  vendor      Vendor?          @relation(fields: [vendorId], references: [id])
-  area        Area?            @relation(fields: [areaId], references: [id])
-  subArea     SubArea?         @relation(fields: [subAreaId], references: [id])
+  route             Route              @relation(fields: [routeId], references: [id])
+  driver            Driver?            @relation(fields: [driverId], references: [id])
+  vehicle           Vehicle?           @relation(fields: [vehicleId], references: [id])
+  vendor            Vendor?            @relation(fields: [vendorId], references: [id])
+  area              Area?              @relation(fields: [areaId], references: [id])
+  subArea           SubArea?           @relation(fields: [subAreaId], references: [id])
   passengers        RidePassenger[]
   attendances       Attendance[]
   complaints        Complaint[]
@@ -492,9 +503,19 @@ model Ride {
   employeeLocations EmployeeLocation[]
 
   @@unique([driverId, tripId, rideDate], name: "ride_driver_trip_date_unique")
+  // List endpoint: ORDER BY rideDate DESC, id DESC LIMIT n — serves the sort straight
+  // from the index (replaces the old plain @@index([rideDate])).
+  @@index([rideDate(sort: Desc), id(sort: Desc)])
   @@index([routeId, rideDate])
-  @@index([rideDate])
   @@index([vendorId, rideDate])
+  @@index([status, rideDate])
+  // Live map: status IN (STARTED, ARRIVED) ORDER BY pickupTime
+  @@index([status, pickupTime])
+  // Filters in getAllRides / FK lookups
+  @@index([vehicleId])
+  @@index([tripId])
+  @@index([areaId])
+  @@index([subAreaId])
 }
 
 model DriverLocation {
@@ -535,6 +556,8 @@ model EmployeeLocation {
 
   @@index([employeeId, rideId, recordedAt])
   @@index([rideId, recordedAt])
+  // Matches getRideEmployeeLocations: DISTINCT ON (employeeId) ... ORDER BY employeeId, recordedAt DESC
+  @@index([rideId, employeeId, recordedAt(sort: Desc)])
 }
 
 enum RideConfirmationStatus {
@@ -565,6 +588,7 @@ model RidePassenger {
 
   @@unique([rideId, employeeId, leg])
   @@index([rideId])
+  @@index([employeeId])
 }
 
 model Attendance {
@@ -609,6 +633,11 @@ model Complaint {
   driver   Driver?   @relation(fields: [driverId], references: [id])
   vehicle  Vehicle?  @relation(fields: [vehicleId], references: [id])
   ride     Ride?     @relation(fields: [rideId], references: [id])
+
+  @@index([rideId])
+  @@index([driverId])
+  @@index([employeeId])
+  @@index([vehicleId])
 }
 
 model User {
@@ -639,6 +668,9 @@ model AuditLog {
   after     Json?
   ipAddress String?
   createdAt DateTime @default(now())
+
+  @@index([model, recordId])
+  @@index([createdAt])
 }
 
 model ScheduleException {
@@ -696,7 +728,7 @@ model Notification {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
+  @@index([userId, status, createdAt(sort: Desc)])
 }
 
 // One row per device a user has logged into. A user can have several
@@ -717,6 +749,5 @@ model DeviceToken {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
   @@index([userId, isActive])
 }
