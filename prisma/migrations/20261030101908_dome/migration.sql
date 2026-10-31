@@ -188,6 +188,10 @@ CREATE TABLE "Route" (
     "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "status" "RouteStatus" NOT NULL DEFAULT 'ACTIVE',
     "shiftTiming" TEXT,
+    "pickupPointName" TEXT,
+    "pickupLatitude" DOUBLE PRECISION,
+    "pickupLongitude" DOUBLE PRECISION,
+    "pickupPointGeocoded" BOOLEAN NOT NULL DEFAULT false,
     "pickupStartTime" TIMESTAMP(3),
     "officeArrivalTime" TIMESTAMP(3),
     "dropTime" TIMESTAMP(3),
@@ -234,6 +238,7 @@ CREATE TABLE "Employee" (
     "serviceType" "ServiceType" NOT NULL DEFAULT 'PICK_AND_DROP',
     "shiftTiming" TEXT,
     "status" "EmployeeStatus" NOT NULL DEFAULT 'ACTIVE',
+    "officeId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     "userId" TEXT,
@@ -309,6 +314,21 @@ CREATE TABLE "DriverLocation" (
     "recordedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "DriverLocation_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "EmployeeLocation" (
+    "id" TEXT NOT NULL,
+    "employeeId" TEXT NOT NULL,
+    "rideId" TEXT NOT NULL,
+    "latitude" DOUBLE PRECISION NOT NULL,
+    "longitude" DOUBLE PRECISION NOT NULL,
+    "accuracy" DOUBLE PRECISION,
+    "speed" DOUBLE PRECISION,
+    "heading" DOUBLE PRECISION,
+    "recordedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "EmployeeLocation_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -475,6 +495,9 @@ CREATE INDEX "SubArea_areaId_idx" ON "SubArea"("areaId");
 CREATE UNIQUE INDEX "SubArea_name_areaId_key" ON "SubArea"("name", "areaId");
 
 -- CreateIndex
+CREATE INDEX "Block_subAreaId_idx" ON "Block"("subAreaId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Block_name_subAreaId_key" ON "Block"("name", "subAreaId");
 
 -- CreateIndex
@@ -490,6 +513,9 @@ CREATE UNIQUE INDEX "Vehicle_vehicleNumber_key" ON "Vehicle"("vehicleNumber");
 CREATE UNIQUE INDEX "Vehicle_driverId_key" ON "Vehicle"("driverId");
 
 -- CreateIndex
+CREATE INDEX "Vehicle_vendorId_idx" ON "Vehicle"("vendorId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "Driver_licenseNumber_key" ON "Driver"("licenseNumber");
 
 -- CreateIndex
@@ -499,7 +525,7 @@ CREATE UNIQUE INDEX "Driver_cnic_key" ON "Driver"("cnic");
 CREATE UNIQUE INDEX "Driver_userId_key" ON "Driver"("userId");
 
 -- CreateIndex
-CREATE INDEX "Driver_cnic_licenseNumber_userId_idx" ON "Driver"("cnic", "licenseNumber", "userId");
+CREATE INDEX "Driver_vendorId_idx" ON "Driver"("vendorId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Office_name_key" ON "Office"("name");
@@ -512,6 +538,9 @@ CREATE INDEX "Route_areaId_idx" ON "Route"("areaId");
 
 -- CreateIndex
 CREATE INDEX "Route_subAreaId_idx" ON "Route"("subAreaId");
+
+-- CreateIndex
+CREATE INDEX "Route_officeId_idx" ON "Route"("officeId");
 
 -- CreateIndex
 CREATE INDEX "Trip_routeId_idx" ON "Trip"("routeId");
@@ -535,6 +564,21 @@ CREATE UNIQUE INDEX "Employee_cnic_key" ON "Employee"("cnic");
 CREATE UNIQUE INDEX "Employee_userId_key" ON "Employee"("userId");
 
 -- CreateIndex
+CREATE INDEX "Employee_officeId_idx" ON "Employee"("officeId");
+
+-- CreateIndex
+CREATE INDEX "Employee_areaId_idx" ON "Employee"("areaId");
+
+-- CreateIndex
+CREATE INDEX "Employee_subAreaId_idx" ON "Employee"("subAreaId");
+
+-- CreateIndex
+CREATE INDEX "Employee_departmentId_idx" ON "Employee"("departmentId");
+
+-- CreateIndex
+CREATE INDEX "Employee_status_idx" ON "Employee"("status");
+
+-- CreateIndex
 CREATE INDEX "WeeklySchedule_weekStart_idx" ON "WeeklySchedule"("weekStart");
 
 -- CreateIndex
@@ -550,13 +594,31 @@ CREATE INDEX "WeeklySchedule_weekStart_status_routeId_idx" ON "WeeklySchedule"("
 CREATE UNIQUE INDEX "WeeklySchedule_employeeId_weekStart_key" ON "WeeklySchedule"("employeeId", "weekStart");
 
 -- CreateIndex
+CREATE INDEX "Ride_rideDate_id_idx" ON "Ride"("rideDate" DESC, "id" DESC);
+
+-- CreateIndex
 CREATE INDEX "Ride_routeId_rideDate_idx" ON "Ride"("routeId", "rideDate");
 
 -- CreateIndex
-CREATE INDEX "Ride_rideDate_idx" ON "Ride"("rideDate");
+CREATE INDEX "Ride_vendorId_rideDate_idx" ON "Ride"("vendorId", "rideDate");
 
 -- CreateIndex
-CREATE INDEX "Ride_vendorId_rideDate_idx" ON "Ride"("vendorId", "rideDate");
+CREATE INDEX "Ride_status_rideDate_idx" ON "Ride"("status", "rideDate");
+
+-- CreateIndex
+CREATE INDEX "Ride_status_pickupTime_idx" ON "Ride"("status", "pickupTime");
+
+-- CreateIndex
+CREATE INDEX "Ride_vehicleId_idx" ON "Ride"("vehicleId");
+
+-- CreateIndex
+CREATE INDEX "Ride_tripId_idx" ON "Ride"("tripId");
+
+-- CreateIndex
+CREATE INDEX "Ride_areaId_idx" ON "Ride"("areaId");
+
+-- CreateIndex
+CREATE INDEX "Ride_subAreaId_idx" ON "Ride"("subAreaId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Ride_driverId_tripId_rideDate_key" ON "Ride"("driverId", "tripId", "rideDate");
@@ -568,7 +630,19 @@ CREATE INDEX "DriverLocation_driverId_recordedAt_idx" ON "DriverLocation"("drive
 CREATE INDEX "DriverLocation_rideId_recordedAt_idx" ON "DriverLocation"("rideId", "recordedAt");
 
 -- CreateIndex
+CREATE INDEX "EmployeeLocation_employeeId_rideId_recordedAt_idx" ON "EmployeeLocation"("employeeId", "rideId", "recordedAt");
+
+-- CreateIndex
+CREATE INDEX "EmployeeLocation_rideId_recordedAt_idx" ON "EmployeeLocation"("rideId", "recordedAt");
+
+-- CreateIndex
+CREATE INDEX "EmployeeLocation_rideId_employeeId_recordedAt_idx" ON "EmployeeLocation"("rideId", "employeeId", "recordedAt" DESC);
+
+-- CreateIndex
 CREATE INDEX "RidePassenger_rideId_idx" ON "RidePassenger"("rideId");
+
+-- CreateIndex
+CREATE INDEX "RidePassenger_employeeId_idx" ON "RidePassenger"("employeeId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "RidePassenger_rideId_employeeId_leg_key" ON "RidePassenger"("rideId", "employeeId", "leg");
@@ -583,10 +657,28 @@ CREATE INDEX "Attendance_rideId_vendorLateStatus_idx" ON "Attendance"("rideId", 
 CREATE UNIQUE INDEX "Attendance_employeeId_rideDate_leg_key" ON "Attendance"("employeeId", "rideDate", "leg");
 
 -- CreateIndex
+CREATE INDEX "Complaint_rideId_idx" ON "Complaint"("rideId");
+
+-- CreateIndex
+CREATE INDEX "Complaint_driverId_idx" ON "Complaint"("driverId");
+
+-- CreateIndex
+CREATE INDEX "Complaint_employeeId_idx" ON "Complaint"("employeeId");
+
+-- CreateIndex
+CREATE INDEX "Complaint_vehicleId_idx" ON "Complaint"("vehicleId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "User_qr_code_key" ON "User"("qr_code");
+
+-- CreateIndex
+CREATE INDEX "AuditLog_model_recordId_idx" ON "AuditLog"("model", "recordId");
+
+-- CreateIndex
+CREATE INDEX "AuditLog_createdAt_idx" ON "AuditLog"("createdAt");
 
 -- CreateIndex
 CREATE INDEX "ScheduleException_weekStart_idx" ON "ScheduleException"("weekStart");
@@ -598,13 +690,10 @@ CREATE INDEX "BulkUploadJob_weekStart_status_idx" ON "BulkUploadJob"("weekStart"
 CREATE INDEX "BulkUploadJob_accountKey_status_dispatchedAt_createdAt_idx" ON "BulkUploadJob"("accountKey", "status", "dispatchedAt", "createdAt");
 
 -- CreateIndex
-CREATE INDEX "Notification_userId_idx" ON "Notification"("userId");
+CREATE INDEX "Notification_userId_status_createdAt_idx" ON "Notification"("userId", "status", "createdAt" DESC);
 
 -- CreateIndex
 CREATE UNIQUE INDEX "DeviceToken_token_key" ON "DeviceToken"("token");
-
--- CreateIndex
-CREATE INDEX "DeviceToken_userId_idx" ON "DeviceToken"("userId");
 
 -- CreateIndex
 CREATE INDEX "DeviceToken_userId_isActive_idx" ON "DeviceToken"("userId", "isActive");
@@ -644,6 +733,9 @@ ALTER TABLE "Trip" ADD CONSTRAINT "Trip_driverId_fkey" FOREIGN KEY ("driverId") 
 
 -- AddForeignKey
 ALTER TABLE "Trip" ADD CONSTRAINT "Trip_vehicleId_fkey" FOREIGN KEY ("vehicleId") REFERENCES "Vehicle"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Employee" ADD CONSTRAINT "Employee_officeId_fkey" FOREIGN KEY ("officeId") REFERENCES "Office"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "Employee" ADD CONSTRAINT "Employee_departmentId_fkey" FOREIGN KEY ("departmentId") REFERENCES "Department"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -704,6 +796,12 @@ ALTER TABLE "DriverLocation" ADD CONSTRAINT "DriverLocation_driverId_fkey" FOREI
 
 -- AddForeignKey
 ALTER TABLE "DriverLocation" ADD CONSTRAINT "DriverLocation_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "EmployeeLocation" ADD CONSTRAINT "EmployeeLocation_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "Employee"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "EmployeeLocation" ADD CONSTRAINT "EmployeeLocation_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "RidePassenger" ADD CONSTRAINT "RidePassenger_rideId_fkey" FOREIGN KEY ("rideId") REFERENCES "Ride"("id") ON DELETE CASCADE ON UPDATE CASCADE;

@@ -872,6 +872,32 @@ const getRideDetails = async (req, res, next) => {
 //   dropLocation  -> the office
 //   stops         -> kept for older app builds; every passenger row carries the
 //                    SAME pickup-point coordinates, so the map collapses to one pin.
+// Office.name is an enum (IBT_1, SKY_TOWER...). Turn it into a readable name.
+const OFFICE_DISPLAY_NAMES = {
+  IBT_1: "IBT 1",
+  IBT_2: "IBT 2",
+  IBT_3: "IBT 3",
+  SKY_TOWER: "Sky Tower",
+};
+
+const formatOfficeName = (raw) => {
+  if (!raw) return null;
+  const key = String(raw).trim();
+  if (OFFICE_DISPLAY_NAMES[key]) return OFFICE_DISPLAY_NAMES[key];
+  return key
+    .split("_")
+    .filter(Boolean)
+    .map((word) =>
+      /^(IBT|HQ)$/i.test(word)
+        ? word.toUpperCase()
+        : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase(),
+    )
+    .join(" ");
+};
+
+const toFiniteOrNull = (value) =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
 const getRideStops = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -889,9 +915,12 @@ const getRideStops = async (req, res, next) => {
           select: {
             routeName: true,
             routeCode: true,
+            officeId: true,
+            officeLocation: true,
             ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
+                id: true,
                 name: true,
                 location: true,
                 latitude: true,
@@ -933,6 +962,49 @@ const getRideStops = async (req, res, next) => {
     // Auto-fills (and saves) the route's coordinates from its name if missing.
     const route = await ensureRoutePickupPoint(prisma, ride.route);
     const pickupPoint = resolveRoutePickupPoint(route);
+
+    // The office comes from Route.officeId. Many routes only have the
+    // `officeLocation` enum filled in, so fall back to looking the office up
+    // by that name instead of silently returning no office at all.
+    let office = ride.route?.office ?? null;
+    if (!office && ride.route?.officeLocation) {
+      office = await prisma.office.findUnique({
+        where: { name: ride.route.officeLocation },
+        select: {
+          id: true,
+          name: true,
+          location: true,
+          latitude: true,
+          longitude: true,
+        },
+      });
+    }
+    const officeEnum = office?.name ?? ride.route?.officeLocation ?? null;
+    const dropLocation = officeEnum
+      ? {
+          id: office?.id ?? null,
+          name: officeEnum,
+          // Proper readable name for the app (e.g. "Sky Tower")
+          displayName: formatOfficeName(officeEnum),
+          // Street address / description
+          location: office?.location ?? null,
+          latitude: toFiniteOrNull(office?.latitude),
+          longitude: toFiniteOrNull(office?.longitude),
+        }
+      : null;
+
+    // Last known driver position for this ride, so the map shows the driver
+    // right away (like the pickup point) instead of waiting for a live update.
+    const lastLocation = await prisma.driverLocation.findFirst({
+      where: { rideId: ride.id, driverId: driver.id },
+      orderBy: { recordedAt: "desc" },
+      select: {
+        latitude: true,
+        longitude: true,
+        heading: true,
+        recordedAt: true,
+      },
+    });
 
     const attendanceByEmployee = Object.fromEntries(
       ride.attendances
@@ -985,7 +1057,8 @@ const getRideStops = async (req, res, next) => {
         pickupPoint,
         passengers,
         stops,
-        dropLocation: ride.route?.office ?? null,
+        dropLocation,
+        driverLocation: lastLocation ?? null,
       },
       "Ride stops retrieved successfully.",
     );
@@ -2090,7 +2163,15 @@ const updateDriverLocation = async (req, res, next) => {
 
     const { id: rideId } = req.params;
 
-    const { latitude, longitude, accuracy, speed, heading } = req.body ?? {};
+    const body = req.body ?? {};
+    const { latitude, longitude } = body;
+    // Devices report "unknown" as a negative number (iOS sends -1 for speed, heading
+    // and accuracy). Treat that as missing instead of rejecting the whole point.
+    const unknownIfNegative = (value) =>
+      typeof value === "number" && value < 0 ? null : value;
+    const accuracy = unknownIfNegative(body.accuracy);
+    const speed = unknownIfNegative(body.speed);
+    const heading = unknownIfNegative(body.heading);
 
     // Validate coordinates before touching the database.
     if (

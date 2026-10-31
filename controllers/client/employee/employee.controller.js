@@ -488,15 +488,19 @@ const confirmTodayRide = async (req, res, next) => {
     const driverUserId = ridePassenger.ride?.driver?.userId;
     const routeName = ridePassenger.ride?.route?.routeName ?? "today's ride";
     if (driverUserId) {
-      notifyUser(driverUserId, {
-        title: confirmed ? "Pickup confirmed" : "Pickup declined",
-        body: `${employee.name} ${confirmed ? "confirmed" : "declined"} pickup for ${routeName}.`,
-        data: {
-          rideId: ridePassenger.rideId,
-          type: confirmed ? "PICKUP_CONFIRMED" : "PICKUP_DECLINED",
+      notifyUser(
+        driverUserId,
+        {
+          title: confirmed ? "Pickup confirmed" : "Pickup declined",
+          body: `${employee.name} ${confirmed ? "confirmed" : "declined"} pickup for ${routeName}.`,
+          data: {
+            rideId: ridePassenger.rideId,
+            type: confirmed ? "PICKUP_CONFIRMED" : "PICKUP_DECLINED",
+          },
+          event: "ride-response",
         },
-        event: "ride-response",
-      }, { notifyAdmins: false }).catch((err) =>
+        { notifyAdmins: false },
+      ).catch((err) =>
         console.error("[employee_controller] notifyUser failed:", err),
       );
     }
@@ -716,14 +720,18 @@ const setRideResponse = async (req, res, next, { confirmed }) => {
     const driverUserId = ridePassenger.ride?.driver?.userId;
     const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
     if (driverUserId) {
-      notifyUser(driverUserId, {
-        title: confirmed ? "Ride accepted" : "Ride rejected",
-        body: confirmed
-          ? `${employee.name} accepted the ride for ${routeName}.`
-          : `${employee.name} rejected the ride for ${routeName}: ${trimmedReason}`,
-        data: { rideId, type: confirmed ? "RIDE_ACCEPTED" : "RIDE_REJECTED" },
-        event: "ride-response",
-      }, { notifyAdmins: false }).catch((err) =>
+      notifyUser(
+        driverUserId,
+        {
+          title: confirmed ? "Ride accepted" : "Ride rejected",
+          body: confirmed
+            ? `${employee.name} accepted the ride for ${routeName}.`
+            : `${employee.name} rejected the ride for ${routeName}: ${trimmedReason}`,
+          data: { rideId, type: confirmed ? "RIDE_ACCEPTED" : "RIDE_REJECTED" },
+          event: "ride-response",
+        },
+        { notifyAdmins: false },
+      ).catch((err) =>
         console.error("[employee_controller] notifyUser failed:", err),
       );
     }
@@ -1045,8 +1053,9 @@ const markAttendanceByQr = async (req, res, next) => {
 
         const now = new Date();
         const scheduledTime =
-          selectedRide.passengers.find((passenger) => passenger.leg === "PICKUP")
-            ?.scheduledTime ?? selectedRide.pickupTime;
+          selectedRide.passengers.find(
+            (passenger) => passenger.leg === "PICKUP",
+          )?.scheduledTime ?? selectedRide.pickupTime;
 
         const status = computeArrivalStatus(scheduledTime, now);
 
@@ -1076,16 +1085,20 @@ const markAttendanceByQr = async (req, res, next) => {
           });
         }
 
-        notifyUser(scannedUser.id, {
-          title: "Passenger checked in",
-          body: `${employee.name} checked in for ${selectedRide.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
-          data: {
-            rideId: selectedRide.id,
-            type: "ATTENDANCE_UPDATED",
-            status,
+        notifyUser(
+          scannedUser.id,
+          {
+            title: "Passenger checked in",
+            body: `${employee.name} checked in for ${selectedRide.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+            data: {
+              rideId: selectedRide.id,
+              type: "ATTENDANCE_UPDATED",
+              status,
+            },
+            event: "attendance-updated",
           },
-          event: "attendance-updated",
-        }, { notifyAdmins: false }).catch((err) =>
+          { notifyAdmins: false },
+        ).catch((err) =>
           console.error("[employee_controller] notifyUser failed:", err),
         );
         notifyStaffOfChange({
@@ -1208,12 +1221,16 @@ const markAttendanceByQr = async (req, res, next) => {
       });
     }
 
-    notifyUser(scannedUser.id, {
-      title: "Passenger checked in",
-      body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
-      data: { rideId: ride.id, type: "ATTENDANCE_UPDATED", status },
-      event: "attendance-updated",
-    }, { notifyAdmins: false }).catch((err) =>
+    notifyUser(
+      scannedUser.id,
+      {
+        title: "Passenger checked in",
+        body: `${employee.name} checked in for ${ride.route?.routeName ?? "the ride"}${status === "LATE" ? " (late)" : ""}.`,
+        data: { rideId: ride.id, type: "ATTENDANCE_UPDATED", status },
+        event: "attendance-updated",
+      },
+      { notifyAdmins: false },
+    ).catch((err) =>
       console.error("[employee_controller] notifyUser failed:", err),
     );
     notifyStaffOfChange({
@@ -1254,11 +1271,7 @@ const markMyAttendance = async (req, res, next) => {
     }
 
     // 2. Get request data
-    const {
-      status = "PRESENT",
-      leg,
-      rideId,
-    } = req.body ?? {};
+    const { status = "PRESENT", leg, rideId } = req.body ?? {};
 
     // 3. Validate attendance status
     if (!["PRESENT", "LATE"].includes(status)) {
@@ -1266,15 +1279,8 @@ const markMyAttendance = async (req, res, next) => {
     }
 
     // 4. Validate ride leg
-    if (
-      leg !== undefined &&
-      leg !== null &&
-      !RIDE_LEGS.includes(leg)
-    ) {
-      return fail(
-        res,
-        `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`
-      );
+    if (leg !== undefined && leg !== null && !RIDE_LEGS.includes(leg)) {
+      return fail(res, `Invalid leg. Must be one of: ${RIDE_LEGS.join(", ")}.`);
     }
 
     if (leg === "DROP") {
@@ -1290,7 +1296,7 @@ const markMyAttendance = async (req, res, next) => {
     if (!rideId) {
       return fail(
         res,
-        "Ride ID is required. Please select a ride and try again."
+        "Ride ID is required. Please select a ride and try again.",
       );
     }
 
@@ -1333,14 +1339,12 @@ const markMyAttendance = async (req, res, next) => {
     if (!ridePassenger) {
       return fail(
         res,
-        `You are not listed on the selected ride for this ${normalizedLeg} leg, or the ride has not started yet. Please verify the passenger assignment with dispatch.`
+        `You are not listed on the selected ride for this ${normalizedLeg} leg, or the ride has not started yet. Please verify the passenger assignment with dispatch.`,
       );
     }
 
     // 8. Use the selected ride's date for attendance
-    const rideDate = startOfDay(
-      ridePassenger.ride?.rideDate ?? new Date()
-    );
+    const rideDate = startOfDay(ridePassenger.ride?.rideDate ?? new Date());
 
     // 9. Check for an existing attendance record
     const existing = await prisma.attendance.findUnique({
@@ -1354,27 +1358,19 @@ const markMyAttendance = async (req, res, next) => {
     });
 
     // 10. Preserve existing attendance records
-    if (
-      existing &&
-      ["PRESENT", "LATE"].includes(existing.status)
-    ) {
+    if (existing && ["PRESENT", "LATE"].includes(existing.status)) {
       // Prevent attendance for one ride from being mistaken
       // for attendance on a different selected ride.
       if (existing.rideId !== ridePassenger.rideId) {
         return fail(
           res,
-          "Attendance is already recorded for another ride on this date and leg. Please contact dispatch."
+          "Attendance is already recorded for another ride on this date and leg. Please contact dispatch.",
         );
       }
 
-      const response = okResponse(
-        existing,
-        "Attendance was already marked."
-      );
+      const response = okResponse(existing, "Attendance was already marked.");
 
-      return res
-        .status(response.status.code)
-        .json(response);
+      return res.status(response.status.code).json(response);
     }
 
     // 11. Record the current arrival time
@@ -1398,7 +1394,6 @@ const markMyAttendance = async (req, res, next) => {
       create: {
         employeeId: employee.id,
         rideId: ridePassenger.rideId,
-        employeeId: employee.id,
         rideDate,
         leg: normalizedLeg,
         status,
@@ -1410,28 +1405,28 @@ const markMyAttendance = async (req, res, next) => {
     const driverUserId = ridePassenger.ride?.driver?.userId;
 
     if (driverUserId) {
-      const routeName =
-        ridePassenger.ride?.route?.routeName ?? "the ride";
+      const routeName = ridePassenger.ride?.route?.routeName ?? "the ride";
 
-      notifyUser(driverUserId, {
-        title: "Passenger checked in",
+      notifyUser(
+        driverUserId,
+        {
+          title: "Passenger checked in",
 
-        body: `${employee.name} checked in for ${routeName}${
-          status === "LATE" ? " (late)" : ""
-        }.`,
+          body: `${employee.name} checked in for ${routeName}${
+            status === "LATE" ? " (late)" : ""
+          }.`,
 
-        data: {
-          rideId: ridePassenger.rideId,
-          type: "ATTENDANCE_UPDATED",
-          status,
+          data: {
+            rideId: ridePassenger.rideId,
+            type: "ATTENDANCE_UPDATED",
+            status,
+          },
+
+          event: "attendance-updated",
         },
-
-        event: "attendance-updated",
-      }, { notifyAdmins: false }).catch((err) => {
-        console.error(
-          "[employee_controller] notifyUser failed:",
-          err
-        );
+        { notifyAdmins: false },
+      ).catch((err) => {
+        console.error("[employee_controller] notifyUser failed:", err);
       });
     }
     notifyStaffOfChange({
@@ -1447,20 +1442,11 @@ const markMyAttendance = async (req, res, next) => {
     });
 
     // 13. Return success response
-    const response = okResponse(
-      attendance,
-      "Attendance marked successfully."
-    );
+    const response = okResponse(attendance, "Attendance marked successfully.");
 
-    return res
-      .status(response.status.code)
-      .json(response);
-
+    return res.status(response.status.code).json(response);
   } catch (error) {
-    console.error(
-      "[employee_controller] markMyAttendance error:",
-      error
-    );
+    console.error("[employee_controller] markMyAttendance error:", error);
 
     next(error);
   }
@@ -1545,6 +1531,77 @@ const createComplaint = async (req, res, next) => {
   }
 };
 
+const OFFICE_SELECT = {
+  name: true,
+  location: true,
+  latitude: true,
+  longitude: true,
+};
+
+const hasCoords = (point) =>
+  point != null &&
+  Number.isFinite(point.latitude) &&
+  Number.isFinite(point.longitude);
+
+const EMPTY_PICKUP_POINT = {
+  name: null,
+  latitude: null,
+  longitude: null,
+  source: null,
+};
+
+// Route.officeId is optional and often unset (the route only carries the
+// `officeLocation` enum). Resolve the office in this order so the map always gets
+// coordinates when they exist anywhere:
+//   1. route.office / employee.office relation (when it has coordinates)
+//   2. Office row looked up by the route's / employee's officeLocation enum
+//   3. whatever partial office we found (label only, no coordinates)
+const resolveOfficeForRide = async (route, employee) => {
+  const linked = [route?.office, employee?.office].find(hasCoords);
+  if (linked) return linked;
+
+  const officeName = route?.officeLocation ?? employee?.officeLocation ?? null;
+  if (officeName) {
+    const byName = await prisma.office.findUnique({
+      where: { name: officeName },
+      select: OFFICE_SELECT,
+    });
+    if (byName) return byName;
+  }
+
+  return route?.office ?? employee?.office ?? null;
+};
+
+// Geocoding / persistence of the route pickup point must never take the whole
+// endpoint down: fall back to whatever is already stored on the route.
+const loadRoutePickupPoint = async (route) => {
+  try {
+    return resolveRoutePickupPoint(await ensureRoutePickupPoint(prisma, route));
+  } catch (err) {
+    console.error("[employee_controller] ensureRoutePickupPoint failed:", err);
+    try {
+      return resolveRoutePickupPoint(route);
+    } catch {
+      return EMPTY_PICKUP_POINT;
+    }
+  }
+};
+
+// A driver app that posts GPS without a rideId would never match the exact-ride
+// query, so fall back to the driver's most recent point, but only if it is fresh.
+const DRIVER_LOCATION_FALLBACK_MS = 15 * 60 * 1000;
+
+const LOCATION_SELECT = {
+  id: true,
+  rideId: true,
+  driverId: true,
+  latitude: true,
+  longitude: true,
+  accuracy: true,
+  speed: true,
+  heading: true,
+  recordedAt: true,
+};
 
 const getRideLocation = async (req, res, next) => {
   try {
@@ -1571,6 +1628,8 @@ const getRideLocation = async (req, res, next) => {
             pickupLatitude: true,
             pickupLongitude: true,
             address: true,
+            officeLocation: true,
+            office: { select: OFFICE_SELECT },
             area: { select: { name: true } },
             subArea: { select: { name: true } },
           },
@@ -1612,17 +1671,13 @@ const getRideLocation = async (req, res, next) => {
             },
             route: {
               select: {
+                // `id` is needed by ensureRoutePickupPoint to persist a geocoded point.
+                id: true,
                 routeCode: true,
                 routeName: true,
+                officeLocation: true,
                 ...ROUTE_PICKUP_SELECT,
-                office: {
-                  select: {
-                    name: true,
-                    location: true,
-                    latitude: true,
-                    longitude: true,
-                  },
-                },
+                office: { select: OFFICE_SELECT },
               },
             },
           },
@@ -1641,45 +1696,67 @@ const getRideLocation = async (req, res, next) => {
       return fail(res, "No driver is assigned to this ride.");
     }
 
-    // Latest GPS point for this exact ride.
-    const location = await prisma.driverLocation.findFirst({
-      where: { rideId: ride.id, driverId: ride.driverId },
-      orderBy: { recordedAt: "desc" },
-      select: {
-        id: true,
-        rideId: true,
-        driverId: true,
-        latitude: true,
-        longitude: true,
-        accuracy: true,
-        speed: true,
-        heading: true,
-        recordedAt: true,
-      },
-    });
+    const [location, employeeLocation, boardedAttendance, office, routePoint] =
+      await Promise.all([
+        // Latest GPS point for this exact ride, else the driver's recent point.
+        prisma.driverLocation
+          .findFirst({
+            where: { rideId: ride.id, driverId: ride.driverId },
+            orderBy: { recordedAt: "desc" },
+            select: LOCATION_SELECT,
+          })
+          .then(
+            (exact) =>
+              exact ??
+              prisma.driverLocation.findFirst({
+                where: {
+                  driverId: ride.driverId,
+                  recordedAt: {
+                    gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
+                  },
+                },
+                orderBy: { recordedAt: "desc" },
+                select: LOCATION_SELECT,
+              }),
+          ),
 
-    // Latest GPS point for the logged-in employee on this exact ride.
-    const employeeLocation = await prisma.employeeLocation.findFirst({
-      where: {
-        rideId: ride.id,
-        employeeId: employee.id,
-      },
-      orderBy: { recordedAt: "desc" },
-      select: {
-        id: true,
-        employeeId: true,
-        rideId: true,
-        latitude: true,
-        longitude: true,
-        accuracy: true,
-        speed: true,
-        heading: true,
-        recordedAt: true,
-      },
-    });
+        // Latest GPS point for the logged-in employee on this exact ride.
+        prisma.employeeLocation.findFirst({
+          where: { rideId: ride.id, employeeId: employee.id },
+          orderBy: { recordedAt: "desc" },
+          select: {
+            id: true,
+            employeeId: true,
+            rideId: true,
+            latitude: true,
+            longitude: true,
+            accuracy: true,
+            speed: true,
+            heading: true,
+            recordedAt: true,
+          },
+        }),
+
+        // Has the employee checked in (QR / manual)? Drives "driver -> pickup"
+        // vs "driver -> office" on the employee's map.
+        prisma.attendance.findFirst({
+          where: {
+            rideId: ride.id,
+            employeeId: employee.id,
+            leg: "PICKUP",
+            status: { in: ["PRESENT", "LATE"] },
+          },
+          select: { id: true },
+        }),
+
+        resolveOfficeForRide(ride.route, primary.employee),
+
+        // ONE common pickup point per route. Employees walk to this point and the
+        // driver comes here.
+        loadRoutePickupPoint(ride.route),
+      ]);
 
     const vehicle = ride.vehicle ?? ride.driver?.vehicle ?? null;
-    const office = ride.route?.office ?? null;
     const home = primary.employee;
 
     const homeLabel =
@@ -1688,18 +1765,13 @@ const getRideLocation = async (req, res, next) => {
       [home.subArea?.name, home.area?.name].filter(Boolean).join(", ") ||
       "My Pickup";
 
-    const hasOfficeCoords =
-      office?.latitude != null && office?.longitude != null;
+    const hasOffice = hasCoords(office);
+    const officeLabel = office?.location || office?.name || null;
 
-    // ONE common pickup point per route. Employees walk to this point and the
-    // driver comes here. Falls back to the employee's own coordinates only if the
-    // route has no pickup point configured yet.
-    const routePoint = resolveRoutePickupPoint(
-      await ensureRoutePickupPoint(prisma, ride.route),
-    );
-
+    // Falls back to the employee's own coordinates only if the route has no
+    // pickup point configured yet.
     const pickupPoint =
-      routePoint.latitude != null
+      routePoint.latitude != null && routePoint.longitude != null
         ? routePoint
         : home.pickupLatitude != null && home.pickupLongitude != null
           ? {
@@ -1714,11 +1786,11 @@ const getRideLocation = async (req, res, next) => {
     // PICKUP leg -> office, DROP leg -> the route's common point.
     const dropoff =
       primary.leg === "PICKUP"
-        ? hasOfficeCoords
+        ? hasOffice
           ? {
               latitude: office.latitude,
               longitude: office.longitude,
-              label: office.location || office.name,
+              label: officeLabel,
             }
           : null
         : pickupPoint.latitude != null
@@ -1737,15 +1809,23 @@ const getRideLocation = async (req, res, next) => {
         rideDate: ride.rideDate,
 
         // The route's common pickup point (names match the app's parser)
-        pickupLatitude: pickupPoint.latitude,
-        pickupLongitude: pickupPoint.longitude,
+        pickupLatitude: pickupPoint.latitude ?? null,
+        pickupLongitude: pickupPoint.longitude ?? null,
         pickupLabel: pickupPoint.name || homeLabel,
-        pickupPointSource: pickupPoint.source,
+        pickupPointSource: pickupPoint.source ?? null,
 
-        // Destination for ETA/route once the employee is on board
+        // Office, always sent on its own so the map can show it on every leg
+        officeLatitude: hasOffice ? office.latitude : null,
+        officeLongitude: hasOffice ? office.longitude : null,
+        officeLabel,
+
+        // Destination of the employee's own leg (kept for the existing app)
         dropoffLatitude: dropoff?.latitude ?? null,
         dropoffLongitude: dropoff?.longitude ?? null,
         dropoffLabel: dropoff?.label ?? null,
+
+        // true once the employee has checked in with the driver
+        hasBoarded: Boolean(boardedAttendance),
 
         // Employee's leg on this ride
         leg: primary.leg,
@@ -1801,13 +1881,7 @@ const updateEmployeeLocation = async (req, res, next) => {
     }
 
     const { id: rideId } = req.params;
-    const {
-      latitude,
-      longitude,
-      accuracy,
-      speed,
-      heading,
-    } = req.body ?? {};
+    const { latitude, longitude, accuracy, speed, heading } = req.body ?? {};
 
     // Validate coordinates
     if (
@@ -1875,9 +1949,7 @@ const updateEmployeeLocation = async (req, res, next) => {
     if (
       speed !== undefined &&
       speed !== null &&
-      (typeof speed !== "number" ||
-        !Number.isFinite(speed) ||
-        speed < 0)
+      (typeof speed !== "number" || !Number.isFinite(speed) || speed < 0)
     ) {
       return fail(res, "Invalid speed.");
     }
@@ -1923,15 +1995,11 @@ const updateEmployeeLocation = async (req, res, next) => {
 
     return res.status(response.status.code).json(response);
   } catch (error) {
-    console.error(
-      "[employee_controller] updateEmployeeLocation error:",
-      error,
-    );
+    console.error("[employee_controller] updateEmployeeLocation error:", error);
 
     next(error);
   }
 };
-
 
 const getMyComplaints = async (req, res, next) => {
   try {
@@ -2098,5 +2166,5 @@ module.exports = {
   getMyRides,
   markNotificationAsRead,
   deleteNotification,
-  updateEmployeeLocation
+  updateEmployeeLocation,
 };

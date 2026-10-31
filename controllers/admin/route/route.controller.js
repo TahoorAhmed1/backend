@@ -12,6 +12,11 @@ const {
   notifyDriverById,
   notifyEmployeeById,
 } = require("../../../services/notification.service");
+const {
+  withGeocodedPickupPoint,
+  ensureRoutePickupPoint,
+  isValidCoord,
+} = require("../../../utils/routePickupPoint");
 
 const OFFICE_LOCATIONS = new Set(["IBT_1", "IBT_2", "IBT_3", "SKY_TOWER"]);
 
@@ -50,6 +55,21 @@ const shapeTripOccupancy = (trip) => {
 
 const cleanString = (v) =>
   v === undefined || v === null ? "" : String(v).trim();
+
+// Office coordinates travel with every route response so the admin map can draw
+// the pickup point and the destination together.
+const ROUTE_OFFICE_SELECT = {
+  select: { id: true, name: true, location: true, latitude: true, longitude: true },
+};
+
+// Form inputs arrive as numbers, numeric strings, "" or null.
+//   undefined -> undefined (field not sent)   ""/null -> null (cleared)   "24.86" -> 24.86
+//   garbage   -> NaN (rejected as a 400 by withGeocodedPickupPoint)
+const toCoordinate = (v) => {
+  if (v === undefined) return undefined;
+  if (v === null || (typeof v === "string" && v.trim() === "")) return null;
+  return typeof v === "number" ? v : Number(v);
+};
 
 const effectiveTripShift = (trip, route) =>
   trip.shiftTiming || route?.shiftTiming;
@@ -131,6 +151,13 @@ const normalizeRoutePayload = async (payload = {}) => {
   const shiftVal = cleanString(payload.shiftTime || payload.shiftTiming);
   if (shiftVal) normalized.shiftTiming = shiftVal;
 
+  // Pickup point: coerce form values; "geocoded" is decided server-side only.
+  if ("pickupLatitude" in payload) normalized.pickupLatitude = toCoordinate(payload.pickupLatitude);
+  if ("pickupLongitude" in payload) normalized.pickupLongitude = toCoordinate(payload.pickupLongitude);
+  if ("pickupPointName" in payload) normalized.pickupPointName = cleanString(payload.pickupPointName) || null;
+  delete normalized.pickupPointGeocoded;
+  delete normalized.office; // read-only relation echoed back by the list API
+
   delete normalized.area;
   delete normalized.subArea;
   delete normalized.block;
@@ -164,6 +191,9 @@ const createRoute = async (req, res, next) => {
       pickupStartTime,
       dropTime,
       driverId,
+      pickupPointName,
+      pickupLatitude,
+      pickupLongitude,
     } = req.body;
 
     if (!routeName || !routeName.trim()) {
@@ -233,6 +263,34 @@ const createRoute = async (req, res, next) => {
         .replace(/[^A-Z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") + `-${Date.now().toString(36).toUpperCase()}`;
 
+    // ---- Pickup point: ONE common point per route ----
+    // Typed coordinates are validated and kept; otherwise they are looked up from the
+    // place name (the pickup point name, else the AREA - never the composite route
+    // name). Done BEFORE the transaction so no DB transaction waits on the network;
+    // time-boxed, and a failed lookup never blocks route creation (filled lazily).
+    let pickupData;
+    try {
+      const area = areaId
+        ? await prisma.area.findUnique({ where: { id: areaId }, select: { name: true } })
+        : null;
+      pickupData = await withGeocodedPickupPoint(
+        {
+          routeName: routeName.trim(),
+          pickupPointName: cleanString(pickupPointName) || area?.name || undefined,
+          pickupLatitude: toCoordinate(pickupLatitude),
+          pickupLongitude: toCoordinate(pickupLongitude),
+        },
+        null,
+        { deadlineMs: 4000 },
+      );
+    } catch (err) {
+      if (err?.statusCode === 400) {
+        const response = badRequestResponse(err.message);
+        return res.status(response.status.code).json(response);
+      }
+      throw err;
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       const route = await tx.route.create({
         data: {
@@ -245,6 +303,10 @@ const createRoute = async (req, res, next) => {
           shiftTiming: shiftTiming || undefined,
           pickupStartTime: pickupStartTime ? new Date(pickupStartTime) : undefined,
           dropTime: dropTime ? new Date(dropTime) : undefined,
+          pickupPointName: pickupData.pickupPointName ?? undefined,
+          pickupLatitude: pickupData.pickupLatitude ?? undefined,
+          pickupLongitude: pickupData.pickupLongitude ?? undefined,
+          pickupPointGeocoded: pickupData.pickupPointGeocoded ?? undefined,
         },
       });
 
@@ -261,6 +323,12 @@ const createRoute = async (req, res, next) => {
 
       return { route, trip };
     });
+
+    // Lookup was slow/failed: let it finish in the background and save the result.
+    // (never throws; the lazy fill on first ride read is the final safety net)
+    if (result.route.pickupLatitude == null && result.route.pickupPointName) {
+      void ensureRoutePickupPoint(prisma, result.route);
+    }
 
     // ---- Notify the assigned driver ----
     notifyDriverById(driverId, {
@@ -670,6 +738,7 @@ const getAllRoutes = async (req, res, next) => {
       where.OR = [
         { routeCode: { contains: search, mode: "insensitive" } },
         { routeName: { contains: search, mode: "insensitive" } },
+        { pickupPointName: { contains: search, mode: "insensitive" } },
       ];
     }
 
@@ -683,6 +752,7 @@ const getAllRoutes = async (req, res, next) => {
         include: {
           area: { select: { id: true, name: true } },
           subArea: { select: { id: true, name: true } },
+          office: ROUTE_OFFICE_SELECT,
           trips: {
             where: { status: "ACTIVE" },
             include: {
@@ -817,6 +887,7 @@ const getRouteById = async (req, res, next) => {
       include: {
         area: true,
         subArea: true,
+        office: ROUTE_OFFICE_SELECT,
         trips: {
           include: { driver: true, vehicle: true },
           orderBy: { tripNumber: "asc" },
@@ -862,13 +933,16 @@ const updateRoute = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const route = await prisma.route.findUnique({ where: { id } });
+    const route = await prisma.route.findUnique({
+      where: { id },
+      include: { area: { select: { name: true } } },
+    });
     if (!route) {
       const response = badRequestResponse("Route not found.");
       return res.status(response.status.code).json(response);
     }
 
-    const updateData = await normalizeRoutePayload(req.body);
+    let updateData = await normalizeRoutePayload(req.body);
     if (
       updateData.officeLocation != null &&
       !OFFICE_LOCATIONS.has(updateData.officeLocation)
@@ -887,12 +961,40 @@ const updateRoute = async (req, res, next) => {
       }
     }
 
+    // ---- Pickup point ----
+    // Manual coordinates are validated + kept (and never overwritten later); an
+    // unchanged name triggers no lookup; a changed name/area re-looks-up auto-filled
+    // points; sending both coordinates as null means "re-detect from the name".
+    try {
+      const areaChanged = updateData.areaId && updateData.areaId !== route.areaId;
+      const hasOwnPoint = isValidCoord(route.pickupLatitude, route.pickupLongitude);
+      if (
+        areaChanged &&
+        !("pickupPointName" in updateData) &&
+        (route.pickupPointGeocoded === true || !hasOwnPoint)
+      ) {
+        const newArea = await prisma.area.findUnique({
+          where: { id: updateData.areaId },
+          select: { name: true },
+        });
+        if (newArea) updateData.pickupPointName = newArea.name;
+      }
+      updateData = await withGeocodedPickupPoint(updateData, route, { deadlineMs: 4000 });
+    } catch (err) {
+      if (err?.statusCode === 400) {
+        const response = badRequestResponse(err.message);
+        return res.status(response.status.code).json(response);
+      }
+      throw err;
+    }
+
     const updated = await prisma.route.update({
       where: { id },
       data: updateData,
       include: {
         area: true,
         subArea: true,
+        office: ROUTE_OFFICE_SELECT,
         trips: {
           include: { driver: true, vehicle: true },
           orderBy: { tripNumber: "asc" },
@@ -915,7 +1017,15 @@ const updateRoute = async (req, res, next) => {
       "subAreaId",
       "officeLocation",
     ];
-    const notifyWorthy = NOTIFY_WORTHY_FIELDS.some((f) => f in updateData);
+    // Only a REAL move of the pickup point notifies (a form echoing the stored value back must not).
+    const pickupPointChanged = ["pickupLatitude", "pickupLongitude"].some(
+      (f) => f in updateData && updateData[f] !== route[f],
+    );
+    const notifyWorthy =
+      pickupPointChanged || NOTIFY_WORTHY_FIELDS.some((f) => f in updateData);
+    const updateHint = pickupPointChanged
+      ? "the pickup point changed — check the new location."
+      : "check pickup/drop times.";
 
     if (notifyWorthy) {
       const routeLabel = updated.routeName || updated.routeCode || "your route";
@@ -927,7 +1037,7 @@ const updateRoute = async (req, res, next) => {
       driverIds.forEach((driverId) => {
         notifyDriverById(driverId, {
           title: "Route updated",
-          body: `Route "${routeLabel}" was updated — check pickup/drop times.`,
+          body: `Route "${routeLabel}" was updated — ${updateHint}`,
           data: { type: "ROUTE_UPDATED", routeId: id },
           event: "schedule-updated",
         }).catch((err) =>
@@ -946,7 +1056,7 @@ const updateRoute = async (req, res, next) => {
         if (!employeeId) return;
         notifyEmployeeById(employeeId, {
           title: "Route updated",
-          body: `Your route "${routeLabel}" was updated — check pickup/drop times.`,
+          body: `Your route "${routeLabel}" was updated — ${updateHint}`,
           data: { type: "ROUTE_UPDATED", routeId: id },
           event: "schedule-updated",
         }).catch((err) =>

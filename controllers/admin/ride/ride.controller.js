@@ -1,6 +1,14 @@
 const { prisma } = require("../../../lib/prisma");
 const responses = require("../../../constants/responses");
 
+// Optional: auto-fills (and saves) a route's pickup coordinates from its name.
+let ensureRoutePickupPoint = null;
+try {
+  ({ ensureRoutePickupPoint } = require("../../../utils/routePickupPoint"));
+} catch (e) {
+  // util not available: we just use whatever coordinates the route already has
+}
+
 /* ------------------------------------------------------------------
  * Response shim.
  * Your real helpers RETURN an object ({ status: { code }, ... }); they do not send.
@@ -271,6 +279,137 @@ const withStale = (loc) =>
     ? { ...loc, isStale: Date.now() - new Date(loc.recordedAt).getTime() > STALE_AFTER_MS }
     : null;
 
+/* ------------------- pickup point / office / last location ------------------- */
+
+const OFFICE_SELECT = { id: true, name: true, location: true, latitude: true, longitude: true };
+const ROUTE_PLACE_SELECT = {
+  id: true,
+  routeCode: true,
+  routeName: true,
+  officeLocation: true,
+  pickupPointName: true,
+  pickupLatitude: true,
+  pickupLongitude: true,
+  pickupPointGeocoded: true,
+  office: { select: OFFICE_SELECT },
+};
+const MAX_FALLBACK_DRIVERS = 100;
+
+// Office.name is an enum (IBT_1, SKY_TOWER...): make it readable.
+const OFFICE_DISPLAY_NAMES = { IBT_1: "IBT 1", IBT_2: "IBT 2", IBT_3: "IBT 3", SKY_TOWER: "Sky Tower" };
+const formatOfficeName = (raw) => {
+  if (!raw) return null;
+  const key = String(raw).trim();
+  if (OFFICE_DISPLAY_NAMES[key]) return OFFICE_DISPLAY_NAMES[key];
+  return key
+    .split("_")
+    .filter(Boolean)
+    .map((w) => (/^(IBT|HQ)$/i.test(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()))
+    .join(" ");
+};
+
+// Valid, non-zero coordinates; fixes the common lat/lng swap (service area: Pakistan).
+const cleanCoords = (latValue, lngValue) => {
+  let lat = typeof latValue === "number" ? latValue : Number(latValue);
+  let lng = typeof lngValue === "number" ? lngValue : Number(lngValue);
+  if (latValue == null || lngValue == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if ((Math.abs(lat) > 90 && Math.abs(lng) <= 90) || (lat >= 60 && lat <= 78 && lng >= 23 && lng <= 37)) {
+    [lat, lng] = [lng, lat];
+  }
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+  if (lat === 0 && lng === 0) return null;
+  return { latitude: lat, longitude: lng };
+};
+
+const buildPickupPoint = (route) => {
+  if (!route) return null;
+  const coords = cleanCoords(route.pickupLatitude, route.pickupLongitude);
+  if (!route.pickupPointName && !coords) return null;
+  return {
+    name: route.pickupPointName ?? null,
+    latitude: coords?.latitude ?? null,
+    longitude: coords?.longitude ?? null,
+    geocoded: !!route.pickupPointGeocoded,
+  };
+};
+
+const buildOffice = (office, officeEnum) => {
+  const key = office?.name ?? officeEnum ?? null;
+  if (!key) return null;
+  const coords = cleanCoords(office?.latitude, office?.longitude);
+  return {
+    id: office?.id ?? null,
+    name: key,
+    displayName: formatOfficeName(key),
+    location: office?.location ?? null,
+    latitude: coords?.latitude ?? null,
+    longitude: coords?.longitude ?? null,
+  };
+};
+
+// Many routes only have the `officeLocation` enum filled in (no officeId), so
+// the office relation is empty. Look those offices up by name instead.
+const officesByEnum = async (routes) => {
+  const names = [
+    ...new Set(routes.filter((r) => r && !r.office && r.officeLocation).map((r) => r.officeLocation)),
+  ];
+  if (!names.length) return new Map();
+  const rows = await prisma.office.findMany({ where: { name: { in: names } }, select: OFFICE_SELECT });
+  return new Map(rows.map((o) => [o.name, o]));
+};
+
+const officeForRoute = (route, byEnum) =>
+  buildOffice(route?.office ?? byEnum.get(route?.officeLocation) ?? null, route?.officeLocation);
+
+// How many recent points to scan when the newest one has unusable coordinates.
+const LOCATION_SCAN_DEPTH = 10;
+
+// Validate a DriverLocation row (same coordinate rules as pickup points) and add
+// `isStale` + `ageSeconds`. Returns null when the point can't be drawn on a map.
+const normalizeLocation = (loc) => {
+  if (!loc) return null;
+  const coords = cleanCoords(loc.latitude, loc.longitude);
+  if (!coords) return null;
+  const ageMs = Date.now() - new Date(loc.recordedAt).getTime();
+  return {
+    ...loc,
+    ...coords,
+    isStale: ageMs > STALE_AFTER_MS,
+    ageSeconds: Math.max(0, Math.round(ageMs / 1000)),
+  };
+};
+
+// Ride has no usable GPS of its own: use the driver's most recent VALID position on ANY ride.
+const lastLocationsByDriver = async (driverIds) => {
+  const ids = [...new Set(driverIds.filter(Boolean))].slice(0, MAX_FALLBACK_DRIVERS);
+  const rows = await Promise.all(
+    ids.map(async (driverId) => {
+      try {
+        const recent = await prisma.driverLocation.findMany({
+          where: { driverId },
+          orderBy: { recordedAt: "desc" },
+          take: LOCATION_SCAN_DEPTH,
+        });
+        return recent.map(normalizeLocation).find(Boolean) ?? null;
+      } catch (e) {
+        // Don't hide this: a silent failure here is exactly what shows "Waiting for GPS".
+        console.error("[rides] lastLocationsByDriver failed for driver", driverId, e.message);
+        return null;
+      }
+    })
+  );
+  return new Map(ids.map((id, i) => [id, rows[i]]));
+};
+
+// Own latest valid point if there is one, otherwise the driver's previous one (flagged).
+// `previous` is already normalized by lastLocationsByDriver.
+const withLastKnown = (rideId, own, previous) => {
+  const current = normalizeLocation(own);
+  if (current) return { ...current, isLastKnown: false, fromPreviousRide: false };
+  if (!previous) return null;
+  return { ...previous, isLastKnown: true, fromPreviousRide: previous.rideId !== rideId };
+};
+
 const TIME_FIELDS = ["pickupTime", "officeArrivalTime", "dropTime"];
 const PLAIN_FIELDS = ["areaId", "subAreaId", "serviceType", "status"];
 
@@ -479,7 +618,7 @@ const getRideById = async (req, res) => {
         prisma.ride.findUnique({
           where: { id },
           include: {
-            route: true,
+            route: { include: { office: { select: OFFICE_SELECT } } },
             driver: true,
             vehicle: true,
             vendor: true,
@@ -500,6 +639,32 @@ const getRideById = async (req, res) => {
     if (!ride) return badRequestResponse(res, "Ride not found.");
 
     const { locations, ...rest } = ride;
+
+    // Pickup point (fill missing coordinates from the name when possible)
+    let route = ride.route;
+    if (route && ensureRoutePickupPoint) {
+      try {
+        route = (await ensureRoutePickupPoint(prisma, route)) ?? route;
+      } catch (e) {
+        console.warn("[rides] ensureRoutePickupPoint failed:", e.message);
+      }
+    }
+    const [byEnum, previousByDriver] = await Promise.all([
+      officesByEnum([route]),
+      normalizeLocation(locations[0]) || !ride.driverId ? new Map() : lastLocationsByDriver([ride.driverId]),
+    ]);
+
+    const latestDriverLocation = withLastKnown(ride.id, locations[0], previousByDriver.get(ride.driverId));
+    if (!latestDriverLocation && ACTIVE_STATUSES.includes(ride.status)) {
+      // Tells you in the server log WHY the admin shows no position.
+      const driverRows = ride.driverId
+        ? await prisma.driverLocation.count({ where: { driverId: ride.driverId } }).catch(() => -1)
+        : 0;
+      console.warn(
+        `[rides] no usable GPS for ride ${ride.id} (status ${ride.status}, driverId ${ride.driverId ?? "none"}, DriverLocation rows for that driver: ${driverRows})`
+      );
+    }
+
     return okResponse(
       res,
       {
@@ -507,7 +672,9 @@ const getRideById = async (req, res) => {
         passengerCount: ride.passengers.length,
         attendanceCount: ride.attendances.length,
         complaintCount: ride.complaints.length,
-        latestDriverLocation: withStale(locations[0]),
+        pickupPoint: buildPickupPoint(route),
+        office: officeForRoute(route, byEnum),
+        latestDriverLocation,
         _count: {
           passengers: ride.passengers.length,
           attendances: ride.attendances.length,
@@ -743,7 +910,7 @@ const getLiveRides = async (req, res) => {
           pickupTime: true,
           officeArrivalTime: true,
           dropTime: true,
-          route: { select: { id: true, routeCode: true, routeName: true } },
+          route: { select: ROUTE_PLACE_SELECT },
           driver: { select: DRIVER_SELECT },
           vehicle: { select: { id: true, vehicleNumber: true, type: true, capacity: true } },
           locations: { orderBy: { recordedAt: "desc" }, take: 1 },
@@ -752,11 +919,19 @@ const getLiveRides = async (req, res) => {
       })
     );
 
-    const counts = await passengerCountsFor(rides.map((r) => r.id));
+    const [counts, byEnum, previousByDriver] = await Promise.all([
+      passengerCountsFor(rides.map((r) => r.id)),
+      officesByEnum(rides.map((r) => r.route)),
+      // only rides with no GPS of their own need the driver's previous position
+      lastLocationsByDriver(rides.filter((r) => !normalizeLocation(r.locations[0])).map((r) => r.driver?.id)),
+    ]);
 
-    const data = rides.map(({ locations, ...r }) => ({
+    const data = rides.map(({ locations, route, ...r }) => ({
       ...formatRide(r),
-      latestDriverLocation: withStale(locations[0]),
+      route: route ? { id: route.id, routeCode: route.routeCode, routeName: route.routeName } : null,
+      pickupPoint: buildPickupPoint(route),
+      office: officeForRoute(route, byEnum),
+      latestDriverLocation: withLastKnown(r.id, locations[0], previousByDriver.get(r.driver?.id)),
       _count: { passengers: counts.get(r.id) ?? 0 },
     }));
 
@@ -787,11 +962,16 @@ const getRideDriverLocation = async (req, res) => {
       include: { driver: { select: DRIVER_SELECT } },
     });
 
+    const previous =
+      normalizeLocation(location) || !ride.driverId
+        ? null
+        : (await lastLocationsByDriver([ride.driverId])).get(ride.driverId);
+
     return okResponse(res, {
       rideId: id,
       rideStatus: ride.status,
       driverId: ride.driverId,
-      location: withStale(location),
+      location: withLastKnown(id, location, previous),
       serverTime: new Date(),
     });
   } catch (error) {
