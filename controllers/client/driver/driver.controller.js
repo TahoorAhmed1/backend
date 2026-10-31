@@ -19,6 +19,11 @@ const {
 const {
   normalizeVendorLateStatus,
 } = require("../../../utils/vendorLateStatus");
+const {
+  ROUTE_PICKUP_SELECT,
+  resolveRoutePickupPoint,
+  ensureRoutePickupPoint,
+} = require("../../../utils/routePickupPoint");
 
 // Roles that should be told about complaints, license submissions,
 // account deactivations, etc. — anything without one obvious recipient.
@@ -194,6 +199,7 @@ const getMyQrCode = async (req, res, next) => {
               id: true,
               routeName: true,
               routeCode: true,
+              ...ROUTE_PICKUP_SELECT,
               office: {
                 select: {
                   name: true,
@@ -296,6 +302,7 @@ const getTodayRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
+            ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
                 name: true,
@@ -624,6 +631,7 @@ const startTodayRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
+            ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
                 name: true,
@@ -814,6 +822,7 @@ const getRideDetails = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
+            ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
                 name: true,
@@ -847,10 +856,22 @@ const getRideDetails = async (req, res, next) => {
   }
 };
 
-// Replace the existing getRideStops in driver_controller.js with this version.
-// Changes: returns employee pickup coordinates, and de-duplicates employees that
-// have both a PICKUP and a DROP row on the same ride.
-
+// Driver stops for a ride.
+//
+// The driver does NOT get one pin per employee. A route has ONE common pickup point
+// (route.pickupPointName / pickupLatitude / pickupLongitude). The driver goes there,
+// picks up every employee of the route from that single point, and then drives to
+// the office (dropLocation).
+//
+// Response shape:
+//   pickupPoint   -> the single point to navigate to (use this for the map).
+//                    source "NOT_SET" means the route has no coordinates yet and
+//                    latitude/longitude are null - show the name only.
+//   passengers    -> who to pick up at that point (names/contacts/attendance only;
+//                    employee home coordinates are intentionally NOT returned)
+//   dropLocation  -> the office
+//   stops         -> kept for older app builds; every passenger row carries the
+//                    SAME pickup-point coordinates, so the map collapses to one pin.
 const getRideStops = async (req, res, next) => {
   try {
     const driver = await getDriverFromReq(req);
@@ -866,6 +887,9 @@ const getRideStops = async (req, res, next) => {
       include: {
         route: {
           select: {
+            routeName: true,
+            routeCode: true,
+            ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
                 name: true,
@@ -884,8 +908,6 @@ const getRideStops = async (req, res, next) => {
                 name: true,
                 contactNumber: true,
                 address: true,
-                pickupLatitude: true,
-                pickupLongitude: true,
                 area: { select: { id: true, name: true } },
               },
             },
@@ -908,6 +930,10 @@ const getRideStops = async (req, res, next) => {
       return res.status(errorResponse.status.code).json(errorResponse);
     }
 
+    // Auto-fills (and saves) the route's coordinates from its name if missing.
+    const route = await ensureRoutePickupPoint(prisma, ride.route);
+    const pickupPoint = resolveRoutePickupPoint(route);
+
     const attendanceByEmployee = Object.fromEntries(
       ride.attendances
         .filter((attendance) => attendance.leg === "PICKUP" || !attendance.leg)
@@ -916,7 +942,7 @@ const getRideStops = async (req, res, next) => {
 
     const seenEmployees = new Set();
 
-    const passengerStops = [...ride.passengers]
+    const passengers = [...ride.passengers]
       // PICKUP rows first, so they win when an employee has both legs
       .sort(
         (a, b) => (a.leg === "PICKUP" ? 0 : 1) - (b.leg === "PICKUP" ? 0 : 1),
@@ -938,18 +964,27 @@ const getRideStops = async (req, res, next) => {
           contact: p.contact || p.employee.contactNumber,
           address: p.address || p.employee.address,
           areaName: p.employee.area?.name ?? null,
-          latitude: p.employee.pickupLatitude ?? null,
-          longitude: p.employee.pickupLongitude ?? null,
           status: attendance?.status || "PENDING",
           vendorLateStatus: attendance?.vendorLateStatus || "UNCLASSIFIED",
           delayMinutes: attendance?.delayMinutes ?? null,
         };
       });
 
+    // Backward compatible `stops`: same coordinates for everyone = the route point.
+    const stops = passengers.map((p) => ({
+      ...p,
+      latitude: pickupPoint.latitude,
+      longitude: pickupPoint.longitude,
+    }));
+
     const response = okResponse(
       {
         rideId: ride.id,
-        stops: passengerStops,
+        routeName: ride.route?.routeName ?? null,
+        routeCode: ride.route?.routeCode ?? null,
+        pickupPoint,
+        passengers,
+        stops,
         dropLocation: ride.route?.office ?? null,
       },
       "Ride stops retrieved successfully.",
@@ -1258,6 +1293,7 @@ const getActiveRide = async (req, res, next) => {
             id: true,
             routeName: true,
             routeCode: true,
+            ...ROUTE_PICKUP_SELECT,
             office: {
               select: {
                 name: true,

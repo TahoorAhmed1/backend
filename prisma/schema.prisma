@@ -311,6 +311,15 @@ model Route {
 
   shiftTiming String?
 
+  // ONE common pickup point for the whole route (e.g. "Karsaz"). The driver goes to
+  // this point, every employee on the route gathers here, then the driver heads to
+  // the office. Employee home coordinates are NOT used as driver stops.
+  pickupPointName String?
+  pickupLatitude  Float?
+  pickupLongitude Float?
+  // true = coordinates were auto-looked-up from the name (worth a quick visual check)
+  pickupPointGeocoded Boolean @default(false)
+
   pickupStartTime   DateTime?
   officeArrivalTime DateTime?
   dropTime          DateTime?

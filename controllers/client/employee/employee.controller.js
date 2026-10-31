@@ -1,4 +1,9 @@
 const { prisma } = require("../../../lib/prisma");
+const {
+  ROUTE_PICKUP_SELECT,
+  resolveRoutePickupPoint,
+  ensureRoutePickupPoint,
+} = require("../../../utils/routePickupPoint");
 const { createRecord } = require("../../../utils/crudHelper");
 const {
   badRequestResponse,
@@ -393,6 +398,7 @@ const getTodayRide = async (req, res, next) => {
                 id: true,
                 routeName: true,
                 routeCode: true,
+                ...ROUTE_PICKUP_SELECT,
                 office: {
                   select: {
                     name: true,
@@ -619,6 +625,7 @@ const getRideDetails = async (req, res, next) => {
                 select: {
                   id: true,
                   routeName: true,
+                  ...ROUTE_PICKUP_SELECT,
                   office: {
                     select: {
                       name: true,
@@ -1607,6 +1614,7 @@ const getRideLocation = async (req, res, next) => {
               select: {
                 routeCode: true,
                 routeName: true,
+                ...ROUTE_PICKUP_SELECT,
                 office: {
                   select: {
                     name: true,
@@ -1683,8 +1691,27 @@ const getRideLocation = async (req, res, next) => {
     const hasOfficeCoords =
       office?.latitude != null && office?.longitude != null;
 
+    // ONE common pickup point per route. Employees walk to this point and the
+    // driver comes here. Falls back to the employee's own coordinates only if the
+    // route has no pickup point configured yet.
+    const routePoint = resolveRoutePickupPoint(
+      await ensureRoutePickupPoint(prisma, ride.route),
+    );
+
+    const pickupPoint =
+      routePoint.latitude != null
+        ? routePoint
+        : home.pickupLatitude != null && home.pickupLongitude != null
+          ? {
+              name: homeLabel,
+              latitude: home.pickupLatitude,
+              longitude: home.pickupLongitude,
+              source: "EMPLOYEE_HOME",
+            }
+          : routePoint;
+
     // Where the employee is heading on this ride:
-    // PICKUP leg -> office, DROP leg -> home.
+    // PICKUP leg -> office, DROP leg -> the route's common point.
     const dropoff =
       primary.leg === "PICKUP"
         ? hasOfficeCoords
@@ -1694,11 +1721,11 @@ const getRideLocation = async (req, res, next) => {
               label: office.location || office.name,
             }
           : null
-        : home.pickupLatitude != null && home.pickupLongitude != null
+        : pickupPoint.latitude != null
           ? {
-              latitude: home.pickupLatitude,
-              longitude: home.pickupLongitude,
-              label: homeLabel,
+              latitude: pickupPoint.latitude,
+              longitude: pickupPoint.longitude,
+              label: pickupPoint.name || homeLabel,
             }
           : null;
 
@@ -1709,10 +1736,11 @@ const getRideLocation = async (req, res, next) => {
         rideStatus: ride.status,
         rideDate: ride.rideDate,
 
-        // Employee's own pickup point (names match the app's parser)
-        pickupLatitude: home.pickupLatitude,
-        pickupLongitude: home.pickupLongitude,
-        pickupLabel: homeLabel,
+        // The route's common pickup point (names match the app's parser)
+        pickupLatitude: pickupPoint.latitude,
+        pickupLongitude: pickupPoint.longitude,
+        pickupLabel: pickupPoint.name || homeLabel,
+        pickupPointSource: pickupPoint.source,
 
         // Destination for ETA/route once the employee is on board
         dropoffLatitude: dropoff?.latitude ?? null,

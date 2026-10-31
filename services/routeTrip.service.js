@@ -12,6 +12,11 @@ const { parseShiftRange } = require("../utils/shiftTime");
 const { normalizeVehicleType } = require("../utils/xlsxParsing");
 const autoAssignmentService = require("./autoAssignment.service");
 const { normalizeShift } = require("../utils/shiftTime");
+// routePickupPoint has no dependency on this file, so destructuring is safe here.
+const {
+  pickupPointFromSibling,
+  ensureRoutePickupPoint,
+} = require("../utils/routePickupPoint");
 
 const slugify = (s) =>
   String(s || "")
@@ -214,6 +219,7 @@ const findOrCreateRouteAndTrip = async (
 
   let route = null;
   let routeCreated = false;
+  let areaRoutes = null; // routes already in this area (used to reuse their pickup point)
 
   if (areaRecord) {
     let candidates = caches?.routesByArea?.get(areaRecord.id);
@@ -225,6 +231,7 @@ const findOrCreateRouteAndTrip = async (
       });
       caches?.routesByArea?.set(areaRecord.id, candidates);
     }
+    areaRoutes = candidates;
 
     if (shiftTiming) {
       const shiftNorm = normalizeShift(shiftTiming);
@@ -265,6 +272,16 @@ const findOrCreateRouteAndTrip = async (
       );
     }
 
+    // ========== Pickup point (ONE common point per route) ==========
+    // The route NAME is a composite ("Karsaz - 9AM-6PM - IBT_1") and can't be
+    // geocoded, so the pickup point is named after the AREA ("Karsaz").
+    // A sibling route of the same area/sub-area already has the physical point -
+    // copy it instead of looking the same place up again. Otherwise the point is
+    // resolved from the area name right after creation (see below).
+    const sibling = pickupPointFromSibling(areaRoutes, subAreaId);
+    const pickupPointName = sibling?.pickupPointName || areaRecord?.name || undefined;
+    // ===============================================================
+
     const routeCreateData = {
       routeName: baseName,
       shiftTiming: shiftTiming || undefined,
@@ -276,6 +293,14 @@ const findOrCreateRouteAndTrip = async (
       pickupStartTime: pickupStartTime || undefined,
       officeArrivalTime: officeArrivalTime || undefined,
       dropTime: dropTime || undefined,
+      pickupPointName,
+      ...(sibling
+        ? {
+            pickupLatitude: sibling.pickupLatitude,
+            pickupLongitude: sibling.pickupLongitude,
+            pickupPointGeocoded: sibling.pickupPointGeocoded,
+          }
+        : {}),
     };
 
     const MAX_ROUTE_CODE_ATTEMPTS = 5;
@@ -306,11 +331,21 @@ const findOrCreateRouteAndTrip = async (
     }
     routeCreated = true;
     if (areaRecord) caches?.routesByArea?.delete(areaRecord.id);
+
+    // No sibling to copy from: look the area up in the BACKGROUND. Deliberately not
+    // awaited so a bulk import is never slowed by the (rate-limited) geocoder; the
+    // result is saved on the route, and anything that needs it sooner fills it lazily.
+    // ensureRoutePickupPoint never throws.
+    if (!sibling && route.pickupLatitude == null) {
+      void ensureRoutePickupPoint(prisma, route, { deadlineMs: 5000 });
+    }
+
     console.log(
       `[weeklySchedule] Created new route: "${route.routeCode}" ` +
         `for area "${areaRecord?.name || "unknown"}" shift "${shiftTiming}"` +
         ` location "${location}" (officeLocation: ${normalizedOfficeLocation ?? "unset"})` +
-        ` vehicleEntity "${vehicleEntity}"`,
+        ` vehicleEntity "${vehicleEntity}"` +
+        ` pickupPoint "${pickupPointName ?? "unset"}" (${sibling ? "copied from sibling route" : "looking up"})`,
     );
   }
 
