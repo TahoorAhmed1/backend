@@ -1,4 +1,10 @@
 const { prisma } = require("../../../lib/prisma");
+const {
+  ACTORS,
+  ingestLocation,
+  clearAccessCache,
+  removeDriverFromHeatmap,
+} = require("../../../services/location/location.service");
 const QRCode = require("qrcode");
 const {
   createRecord,
@@ -14,7 +20,6 @@ const {
   notifyUsers,
   notifyRoles,
   ADMIN_NOTIFY_ROLES,
-  triggerRideLocation,
 } = require("../../../services/notification.service");
 const {
   normalizeVendorLateStatus,
@@ -492,6 +497,20 @@ const applyRideStatusTransition = async ({
 
     return [updatedRide, updatedDriver];
   });
+
+  // Location pipeline housekeeping (fire-and-forget, never blocks the response):
+  //  - drop the cached "may this driver post locations for this ride" decision,
+  //  - once the driver has no active ride left, take them off the live heatmap now
+  //    instead of waiting for the 30 s silence expiry.
+  clearAccessCache(ACTORS.driver, driver.userId, rideId);
+  if (
+    ["COMPLETED", "CANCELLED"].includes(nextStatus) &&
+    updatedDriver.status === "AVAILABLE"
+  ) {
+    removeDriverFromHeatmap(driver.id).catch((err) =>
+      console.error("[driver_controller] heatmap remove failed:", err),
+    );
+  }
 
   notifyPassengersOfRideStatus({ ride, nextStatus }).catch((err) =>
     console.error(
@@ -2151,157 +2170,51 @@ const getDriverStats = async (req, res, next) => {
   }
 };
 
+/**
+ * Location authorisation for drivers: the ride must belong to the logged-in driver and be
+ * active. Only runs on a cache miss (see services/location.js, "access cache").
+ */
+const authorizeDriverForLocation = async (req, rideId) => {
+  const driver = await getDriverFromReq(req);
+  if (!driver) return { ok: false, message: "Driver profile not found." };
+
+  const ride = await prisma.ride.findFirst({
+    where: { id: rideId, driverId: driver.id },
+    select: { id: true, status: true },
+  });
+  if (!ride) return { ok: false, message: "Ride not found." };
+
+  if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+    return {
+      ok: false,
+      message: "Driver location can only be updated for an active ride.",
+    };
+  }
+
+  return { ok: true, actorId: driver.id };
+};
+
 const updateDriverLocation = async (req, res, next) => {
   try {
-    const driver = await getDriverFromReq(req);
-
-    if (!driver) {
-      const errorResponse = badRequestResponse("Driver profile not found.");
-
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
     const { id: rideId } = req.params;
 
-    const body = req.body ?? {};
-    const { latitude, longitude } = body;
-    // Devices report "unknown" as a negative number (iOS sends -1 for speed, heading
-    // and accuracy). Treat that as missing instead of rejecting the whole point.
-    const unknownIfNegative = (value) =>
-      typeof value === "number" && value < 0 ? null : value;
-    const accuracy = unknownIfNegative(body.accuracy);
-    const speed = unknownIfNegative(body.speed);
-    const heading = unknownIfNegative(body.heading);
-
-    // Validate coordinates before touching the database.
-    if (
-      typeof latitude !== "number" ||
-      typeof longitude !== "number" ||
-      !Number.isFinite(latitude) ||
-      !Number.isFinite(longitude)
-    ) {
-      const errorResponse = badRequestResponse(
-        "Valid latitude and longitude are required.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (latitude < -90 || latitude > 90) {
-      const errorResponse = badRequestResponse(
-        "Latitude must be between -90 and 90.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (longitude < -180 || longitude > 180) {
-      const errorResponse = badRequestResponse(
-        "Longitude must be between -180 and 180.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      accuracy !== undefined &&
-      accuracy !== null &&
-      (typeof accuracy !== "number" ||
-        !Number.isFinite(accuracy) ||
-        accuracy < 0)
-    ) {
-      const errorResponse = badRequestResponse("Invalid accuracy.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      speed !== undefined &&
-      speed !== null &&
-      (typeof speed !== "number" ||
-        !Number.isFinite(speed) ||
-        speed < 0)
-    ) {
-      const errorResponse = badRequestResponse("Invalid speed.");
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    if (
-      heading !== undefined &&
-      heading !== null &&
-      (typeof heading !== "number" ||
-        !Number.isFinite(heading) ||
-        heading < 0 ||
-        heading > 360)
-    ) {
-      const errorResponse = badRequestResponse(
-        "Heading must be between 0 and 360.",
-      );
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    // Make sure this ride belongs to the logged-in driver
-    const ride = await prisma.ride.findFirst({
-      where: {
-        id: rideId,
-        driverId: driver.id,
-      },
-      select: {
-        id: true,
-        status: true,
-        driverId: true,
-      },
+    const result = await ingestLocation({
+      actor: ACTORS.driver,
+      userId: req.user?.userId,
+      rideId,
+      body: req.body,
+      authorize: () => authorizeDriverForLocation(req, rideId),
     });
 
-    if (!ride) {
-      const errorResponse = badRequestResponse("Ride not found.");
-
+    if (!result.ok) {
+      const errorResponse = badRequestResponse(result.message);
       return res.status(errorResponse.status.code).json(errorResponse);
     }
-
-    // Only accept location while ride is active
-    if (!["STARTED", "ARRIVED"].includes(ride.status)) {
-      const errorResponse = badRequestResponse(
-        "Driver location can only be updated for an active ride.",
-      );
-
-      return res.status(errorResponse.status.code).json(errorResponse);
-    }
-
-    const location = await prisma.driverLocation.create({
-      data: {
-        driverId: driver.id,
-        rideId: ride.id,
-        latitude,
-        longitude,
-        accuracy: accuracy ?? null,
-        speed: speed ?? null,
-        heading: heading ?? null,
-      },
-    });
-
-    await triggerRideLocation(ride.id, {
-      rideId: ride.id,
-      driverId: driver.id,
-      latitude: location.latitude,
-      longitude: location.longitude,
-      accuracy: location.accuracy,
-      speed: location.speed,
-      heading: location.heading,
-      recordedAt: location.recordedAt,
-    });
 
     const response = okResponse(
-      {
-        id: location.id,
-        rideId: location.rideId,
-        driverId: location.driverId,
-        latitude: location.latitude,
-        longitude: location.longitude,
-        accuracy: location.accuracy,
-        speed: location.speed,
-        heading: location.heading,
-        recordedAt: location.recordedAt,
-      },
+      result.data,
       "Driver location updated successfully.",
     );
-
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);

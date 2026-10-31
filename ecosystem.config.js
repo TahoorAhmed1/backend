@@ -14,6 +14,19 @@ module.exports = {
       env: { NODE_ENV: "development" },
       env_production: { NODE_ENV: "production" },
     },
+    {
+      name: "myapp-location-worker",
+      script: "./worker/location.process.js",
+      env_file: ".env",
+      exec_mode: "fork",
+      instances: 1, // scale to 2-3: Kafka splits the partitions between instances
+      autorestart: true,
+      max_memory_restart: "400M",
+      kill_timeout: 10 * 1000, // short: lets consumers leave the group cleanly
+      source_map_support: false,
+      env: { NODE_ENV: "development" },
+      env_production: { NODE_ENV: "production" },
+    },
     ...[
       ["BULK_UPLOAD", "account-1"],
       ["UPDATE_SCHEDULE", "account-2"],

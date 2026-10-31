@@ -1,4 +1,5 @@
 const { prisma } = require("../../../lib/prisma");
+const { ACTORS, ingestLocation } = require("../../../services/location/location.service");
 const {
   ROUTE_PICKUP_SELECT,
   resolveRoutePickupPoint,
@@ -1872,127 +1873,51 @@ const getRideLocation = async (req, res, next) => {
   }
 };
 
+/**
+ * Location authorisation for employees: must be a passenger on the ride, and the ride must
+ * be active. Only runs on a cache miss (see services/location.js, "access cache").
+ */
+const authorizeEmployeeForLocation = async (req, rideId) => {
+  const employee = await getEmployeeFromReq(req);
+  if (!employee) return { ok: false, message: "Employee profile not found." };
+
+  const ridePassenger = await prisma.ridePassenger.findFirst({
+    where: { rideId, employeeId: employee.id },
+    select: { ride: { select: { id: true, status: true } } },
+  });
+  if (!ridePassenger) {
+    return { ok: false, message: "Ride not found or not assigned to you." };
+  }
+
+  const { status } = ridePassenger.ride;
+  if (!["STARTED", "ARRIVED"].includes(status)) {
+    return {
+      ok: false,
+      message: `Location tracking is not available while the ride is ${status.toLowerCase()}.`,
+    };
+  }
+
+  return { ok: true, actorId: employee.id };
+};
+
 const updateEmployeeLocation = async (req, res, next) => {
   try {
-    const employee = await getEmployeeFromReq(req);
-
-    if (!employee) {
-      return fail(res, "Employee profile not found.");
-    }
-
     const { id: rideId } = req.params;
-    const { latitude, longitude, accuracy, speed, heading } = req.body ?? {};
 
-    // Validate coordinates
-    if (
-      typeof latitude !== "number" ||
-      typeof longitude !== "number" ||
-      !Number.isFinite(latitude) ||
-      !Number.isFinite(longitude)
-    ) {
-      return fail(res, "Valid latitude and longitude are required.");
-    }
-
-    if (latitude < -90 || latitude > 90) {
-      return fail(res, "Latitude must be between -90 and 90.");
-    }
-
-    if (longitude < -180 || longitude > 180) {
-      return fail(res, "Longitude must be between -180 and 180.");
-    }
-
-    // Security:
-    // Employee can only submit location for a ride they are assigned to.
-    const ridePassenger = await prisma.ridePassenger.findFirst({
-      where: {
-        rideId,
-        employeeId: employee.id,
-      },
-      select: {
-        id: true,
-        rideId: true,
-        employeeId: true,
-        ride: {
-          select: {
-            id: true,
-            status: true,
-          },
-        },
-      },
+    const result = await ingestLocation({
+      actor: ACTORS.employee,
+      userId: req.user?.userId,
+      rideId,
+      body: req.body,
+      authorize: () => authorizeEmployeeForLocation(req, rideId),
     });
 
-    if (!ridePassenger) {
-      return fail(res, "Ride not found or not assigned to you.");
-    }
-
-    const ride = ridePassenger.ride;
-
-    // Only track while the ride is active.
-    if (!["STARTED", "ARRIVED"].includes(ride.status)) {
-      return fail(
-        res,
-        `Location tracking is not available while the ride is ${ride.status.toLowerCase()}.`,
-      );
-    }
-
-    // Validate optional GPS metadata.
-    if (
-      accuracy !== undefined &&
-      accuracy !== null &&
-      (typeof accuracy !== "number" ||
-        !Number.isFinite(accuracy) ||
-        accuracy < 0)
-    ) {
-      return fail(res, "Invalid accuracy.");
-    }
-
-    if (
-      speed !== undefined &&
-      speed !== null &&
-      (typeof speed !== "number" || !Number.isFinite(speed) || speed < 0)
-    ) {
-      return fail(res, "Invalid speed.");
-    }
-
-    if (
-      heading !== undefined &&
-      heading !== null &&
-      (typeof heading !== "number" ||
-        !Number.isFinite(heading) ||
-        heading < 0 ||
-        heading > 360)
-    ) {
-      return fail(res, "Heading must be between 0 and 360.");
-    }
-
-    const location = await prisma.employeeLocation.create({
-      data: {
-        employeeId: employee.id,
-        rideId: ride.id,
-        latitude,
-        longitude,
-        accuracy: accuracy ?? null,
-        speed: speed ?? null,
-        heading: heading ?? null,
-      },
-      select: {
-        id: true,
-        employeeId: true,
-        rideId: true,
-        latitude: true,
-        longitude: true,
-        accuracy: true,
-        speed: true,
-        heading: true,
-        recordedAt: true,
-      },
-    });
+    if (!result.ok) return fail(res, result.message);
 
     const response = okResponse(
-      location,
+      result.data,
       "Employee location updated successfully.",
     );
-
     return res.status(response.status.code).json(response);
   } catch (error) {
     console.error("[employee_controller] updateEmployeeLocation error:", error);

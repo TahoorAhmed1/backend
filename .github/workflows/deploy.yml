@@ -1,3 +1,4 @@
+
 name: Backend CI/CD Pipeline
 
 on:
@@ -9,23 +10,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout source code
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 2. Setup Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
+      # 3. Docker Hub Login
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # 4. Setup Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 5. Build and Push Docker Image
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -37,6 +43,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # 6. Deploy to EC2
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.0
         with:
@@ -47,88 +54,153 @@ jobs:
           script: |
             set -e
 
-            echo "======================================"
-            echo "Logging into Docker Hub"
-            echo "======================================"
+            echo "== Logging into Docker Hub =="
 
             echo "${{ secrets.DOCKER_PASSWORD }}" | docker login \
               -u "${{ secrets.DOCKER_USERNAME }}" \
               --password-stdin
 
-            echo "======================================"
-            echo "Pulling latest image"
-            echo "======================================"
+            echo "== Pulling latest image =="
 
             docker pull ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
-            echo "======================================"
-            echo "Preparing runtime env file"
-            echo "======================================"
+            echo "== Creating shared Docker network =="
+
+            docker network inspect appnet >/dev/null 2>&1 || \
+              docker network create appnet
+
+            echo "== Starting Kafka =="
+
+            if ! docker ps -a --format '{{.Names}}' | grep -qx kafka; then
+
+              docker run -d \
+                --name kafka \
+                --network appnet \
+                --restart unless-stopped \
+                -v kafka_data:/var/lib/kafka/data \
+                -e KAFKA_NODE_ID=1 \
+                -e KAFKA_PROCESS_ROLES=broker,controller \
+                -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+                -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
+                -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+                -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+                -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
+                -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+                -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+                -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+                -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+                -e KAFKA_HEAP_OPTS="-Xms256m -Xmx512m" \
+                apache/kafka:3.8.1
+
+            else
+              docker start kafka >/dev/null 2>&1 || true
+            fi
+
+            echo "== Waiting for Kafka =="
+
+            KAFKA_READY=false
+
+            for i in $(seq 1 30); do
+
+              if docker exec kafka \
+                /opt/kafka/bin/kafka-broker-api-versions.sh \
+                --bootstrap-server localhost:9092 >/dev/null 2>&1; then
+
+                echo "Kafka is ready"
+                KAFKA_READY=true
+                break
+              fi
+
+              echo "Waiting for Kafka ($i/30)..."
+              sleep 2
+            done
+
+            if [ "$KAFKA_READY" != "true" ]; then
+              echo "Kafka failed to become ready"
+              docker logs --tail 100 kafka
+              exit 1
+            fi
+
+            # 7. Prepare Environment File
+
+            echo "== Preparing runtime env file =="
 
             mkdir -p /home/${{ secrets.EC2_USER }}/backend
 
             cat > /home/${{ secrets.EC2_USER }}/backend/.env <<'EOF'
             PORT=8000
-            JWT_SECRET_KEY=!!@@$$!@13212@!
-            OTP_JWT_SECRET_KEY=!!@@$$!@13212@!verify
+
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            OTP_JWT_SECRET_KEY=${{ secrets.OTP_JWT_SECRET_KEY }}
+
             EMAIL_VERIFICATION=verify-email
             PRISMA_CLIENT_ENGINE_TYPE=accelerate
-            TEST_VAR='lIVE Mode'
-            DATABASE_URL=postgresql://neondb_owner:npg_prBitIZ1FM6g@ep-gentle-scene-ayvmssvq-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
-            HOST="localhost"
-            REDIS_URL=redis://default:rHXDMYYMiscLxoYtJyBbXL6uAR8ea6L5@redis-13717.c278.us-east-1-4.ec2.cloud.redislabs.com:13717
+            TEST_VAR='Live Mode'
+
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+
+            HOST=localhost
+
+            REDIS_URL=${{ secrets.REDIS_URL }}
+
+            REDIS_ACCOUNT_1_URL=${{ secrets.REDIS_ACCOUNT_1_URL }}
+            REDIS_ACCOUNT_2_URL=${{ secrets.REDIS_ACCOUNT_2_URL }}
+            REDIS_ACCOUNT_3_URL=${{ secrets.REDIS_ACCOUNT_3_URL }}
+
             WEB_CONCURRENCY=2
+
             REDIS_TLS=false
             REDIS_SSL=false
+
+            KAFKA_BROKERS=kafka:9092
+            KAFKA_RF=1
             EOF
 
             chmod 600 /home/${{ secrets.EC2_USER }}/backend/.env
 
-            echo "======================================"
-            echo "Stopping old container"
-            echo "======================================"
+            # 8. Replace Application Container
+
+            echo "== Replacing app container =="
 
             docker stop myapp || true
             docker rm -f myapp || true
 
-            echo "======================================"
-            echo "Starting new container"
-            echo "======================================"
-
             docker run -d \
               --name myapp \
+              --network appnet \
               -p 8000:8000 \
               --restart unless-stopped \
               --env-file /home/${{ secrets.EC2_USER }}/backend/.env \
               ${{ secrets.DOCKER_USERNAME }}/node-app:latest
 
-            echo "======================================"
-            echo "Container status"
-            echo "======================================"
+            # 9. Container Status
+
+            echo "== Container status =="
 
             docker ps
 
-            echo "======================================"
-            echo "Waiting for application"
-            echo "======================================"
+            # 10. Wait for Application
 
-            sleep 10
+            echo "== Waiting for application =="
 
-            echo "======================================"
-            echo "Application logs"
-            echo "======================================"
+            sleep 15
 
-            docker logs --tail 50 myapp
+            # 11. Application Logs
 
-            echo "======================================"
-            echo "Health check"
-            echo "======================================"
+            echo "== Application logs =="
 
-            curl -fsS http://localhost:8000 || true
+            docker logs --tail 80 myapp
 
-            echo "======================================"
-            echo "Deployment complete"
-            echo "======================================"
+            # 12. Health Check
 
+            echo "== Health check =="
 
-  
+            if ! curl -fsS --retry 5 --retry-delay 3 \
+              --retry-connrefused http://localhost:8000; then
+
+              echo "Application health check failed"
+              docker logs --tail 150 myapp
+              exit 1
+            fi
+
+            echo "== Deployment complete =="

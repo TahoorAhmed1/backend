@@ -1,4 +1,50 @@
+
 services:
+  # ==========================================
+  # KAFKA MESSAGE BROKER
+  # ==========================================
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: kafka
+    restart: unless-stopped
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+    networks:
+      - appnet
+
+  # ==========================================
+  # BACKEND APPLICATION
+  # ==========================================
   myapp:
     image: myapp:local
 
@@ -23,10 +69,43 @@ services:
       NODE_ENV: production
       PORT: ${PORT:-8000}
       DATABASE_URL: ${DATABASE_URL}
+
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       OTP_JWT_SECRET_KEY: ${OTP_JWT_SECRET_KEY}
+
       EMAIL_VERIFICATION: ${EMAIL_VERIFICATION}
       HOST: ${HOST}
+
+      REDIS_URL: ${REDIS_URL}
+      REDIS_ACCOUNT_1_URL: ${REDIS_ACCOUNT_1_URL}
+      REDIS_ACCOUNT_2_URL: ${REDIS_ACCOUNT_2_URL}
+      REDIS_ACCOUNT_3_URL: ${REDIS_ACCOUNT_3_URL}
+
       REDIS_TLS: ${REDIS_TLS:-true}
       REDIS_SSL: ${REDIS_SSL:-true}
+
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_RF: 1
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    networks:
+      - appnet
+
+# ==========================================
+# NETWORKS
+# ==========================================
+networks:
+  appnet:
+    driver: bridge
+
+# ==========================================
+# PERSISTENT VOLUMES
+# ==========================================
+volumes:
+  kafka_data:
+    driver: local
