@@ -2,7 +2,6 @@ const { prisma } = require("../../../lib/prisma");
 const {
   ACTORS,
   ingestLocation,
-  clearAccessCache,
   removeDriverFromHeatmap,
 } = require("../../../services/location/location.service");
 const QRCode = require("qrcode");
@@ -499,10 +498,8 @@ const applyRideStatusTransition = async ({
   });
 
   // Location pipeline housekeeping (fire-and-forget, never blocks the response):
-  //  - drop the cached "may this driver post locations for this ride" decision,
   //  - once the driver has no active ride left, take them off the live heatmap now
   //    instead of waiting for the 30 s silence expiry.
-  clearAccessCache(ACTORS.driver, driver.userId, rideId);
   if (
     ["COMPLETED", "CANCELLED"].includes(nextStatus) &&
     updatedDriver.status === "AVAILABLE"
@@ -528,7 +525,11 @@ const applyRideStatusTransition = async ({
 
   return {
     response: okResponse(
-      { ...updatedRide, driverStatus: updatedDriver.status },
+      {
+        ...updatedRide,
+        driverStatus: updatedDriver.status,
+        locationTrackingActive: updatedDriver.status === "ON_RIDE",
+      },
       `Ride status updated to ${nextStatus}`,
     ),
   };
@@ -1376,7 +1377,6 @@ const getActiveRide = async (req, res, next) => {
       where: {
         driverId: driver.id,
         status: { in: ACTIVE_RIDE_STATUSES },
-        rideDate: { gte: startOfDay(), lte: endOfDay() },
       },
       orderBy: { rideDate: "desc" },
       include: {
@@ -1405,7 +1405,11 @@ const getActiveRide = async (req, res, next) => {
 
     const response = okResponse(
       activeRide
-        ? { ...activeRide, passengerCount: activeRide.passengers.length }
+        ? {
+            ...activeRide,
+            passengerCount: activeRide.passengers.length,
+            locationTrackingActive: true,
+          }
         : null,
       activeRide
         ? "Active ride retrieved successfully."
@@ -2172,26 +2176,27 @@ const getDriverStats = async (req, res, next) => {
 
 /**
  * Location authorisation for drivers: the ride must belong to the logged-in driver and be
- * active. Only runs on a cache miss (see services/location.js, "access cache").
+ * active. Rechecked against the database for every location update.
  */
 const authorizeDriverForLocation = async (req, rideId) => {
-  const driver = await getDriverFromReq(req);
-  if (!driver) return { ok: false, message: "Driver profile not found." };
+  const userId = req.user?.userId;
+  if (!userId) return { ok: false, message: "Driver profile not found." };
 
   const ride = await prisma.ride.findFirst({
-    where: { id: rideId, driverId: driver.id },
-    select: { id: true, status: true },
+    where: {
+      id: rideId,
+      status: { in: ACTIVE_RIDE_STATUSES },
+      driver: { is: { userId } },
+    },
+    select: { driverId: true },
   });
-  if (!ride) return { ok: false, message: "Ride not found." };
-
-  if (!ACTIVE_RIDE_STATUSES.includes(ride.status)) {
+  if (!ride?.driverId) {
     return {
       ok: false,
-      message: "Driver location can only be updated for an active ride.",
+      message: "Location updates require a ride assigned to you that is active.",
     };
   }
-
-  return { ok: true, actorId: driver.id };
+  return { ok: true, actorId: ride.driverId };
 };
 
 const updateDriverLocation = async (req, res, next) => {
@@ -2200,7 +2205,6 @@ const updateDriverLocation = async (req, res, next) => {
 
     const result = await ingestLocation({
       actor: ACTORS.driver,
-      userId: req.user?.userId,
       rideId,
       body: req.body,
       authorize: () => authorizeDriverForLocation(req, rideId),

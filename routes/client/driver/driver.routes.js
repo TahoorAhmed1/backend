@@ -38,6 +38,10 @@ const {
 } = require("../../../controllers/client/driver/driver.controller");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
 const {
+  locationRateLimit,
+  locationRequestMetrics,
+} = require("../../../middlewares/locationRateLimit");
+const {
   listQuerySchema,
   updateDriverProfileSchema,
   updateRideStatusSchema,
@@ -106,7 +110,9 @@ router.patch("/complaints/:id", updateComplaint);
 router.delete("/complaints/:id", deleteComplaint);
 router.post(
   "/rides/:id/location",
+  locationRequestMetrics,
   validateRequest(updateDriverLocationSchema),
+  locationRateLimit("driver"),
   updateDriverLocation,
 );
 // Notifications

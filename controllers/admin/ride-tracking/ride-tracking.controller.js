@@ -7,7 +7,7 @@ const MAX_BATCH = 50; // apps may buffer points while offline and flush them tog
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_FUTURE_MS = 60 * 1000;
 
-const getUserId = (req) => req.user?.id;
+const getUserId = (req) => req.user?.userId ?? req.user?.id;
 
 const num = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
 
@@ -76,7 +76,7 @@ const postDriverLocation = async (req, res) => {
       return badRequestResponse(res, `Ride is ${ride.status}; tracking is only accepted while STARTED or ARRIVED`);
 
     const result = await prisma.driverLocation.createMany({
-      data: points.map((p) => ({ ...p, driverId: driver.id, rideId: id })),
+      data: points.map((p) => ({ ...p, driverId: driver.id, rideId: null })),
     });
 
     return okResponse(res, { saved: result.count, rideStatus: ride.status }, "Location recorded");

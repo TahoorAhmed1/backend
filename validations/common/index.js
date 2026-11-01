@@ -709,6 +709,7 @@ const updateDriverLocationSchema = Joi.object({
     heading: Joi.number().min(0).max(360).allow(null).optional(),
   }),
 });
+const updateEmployeeLocationSchema = updateDriverLocationSchema;
 
 const driverComplaintSchema = Joi.object({
   query: empty(),
@@ -859,5 +860,6 @@ module.exports = {
   listQuerySchema,
   employeeComplaintSchema,
   recentRidesQuerySchema,
-  updateDriverLocationSchema
+  updateDriverLocationSchema,
+  updateEmployeeLocationSchema,
 };

@@ -518,6 +518,7 @@ model Ride {
   @@index([routeId, rideDate])
   @@index([vendorId, rideDate])
   @@index([status, rideDate])
+  @@index([driverId, status])
   // Live map: status IN (STARTED, ARRIVED) ORDER BY pickupTime
   @@index([status, pickupTime])
   // Filters in getAllRides / FK lookups

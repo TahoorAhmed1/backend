@@ -999,10 +999,23 @@ const getRideDriverLocationHistory = async (req, res) => {
         return badRequestResponse(res, "since must be a valid ISO date-time");
     }
 
-    const ride = await prisma.ride.findUnique({ where: { id }, select: { id: true } });
+    const ride = await prisma.ride.findUnique({
+      where: { id },
+      select: { id: true, driverId: true },
+    });
     if (!ride) return badRequestResponse(res, "Ride not found.");
+    if (!ride.driverId) {
+      return okResponse(res, {
+        rideId: id,
+        locations: [],
+        pagination: pagination(page, limit, 0),
+      });
+    }
 
-    const where = { rideId: id, ...(since ? { recordedAt: { gt: since } } : {}) };
+    const where = {
+      driverId: ride.driverId,
+      ...(since ? { recordedAt: { gt: since } } : {}),
+    };
 
     const [locations, total] = await Promise.all([
       prisma.driverLocation.findMany({

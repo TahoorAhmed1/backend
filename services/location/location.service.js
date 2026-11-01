@@ -2,7 +2,7 @@
 /**
  * Location pipeline — shared core (API + worker). Driver and employee use ONE flow:
  *
- *   controller -> ingestLocation(): validate -> authorise (Redis cache, DB fallback)
+ *   controller -> ingestLocation(): validate -> authorise current ride state in the database
  *              -> Kafka  <actor>.location (key = actorId, ordered per actor)
  *   worker/location.process.js consumes it: heatmap (Redis H3) | realtime (Pusher) | persist (Postgres)
  *
@@ -13,8 +13,8 @@
  *   ride done           -> removed immediately
  * A Redis key TTL cannot do the expiry (an expired key never runs a DECR), hence ZSET + sweeper.
  *
- * Sections: 1 config · 2 actors · 3 clients · 4 validation · 5 codec · 6 access cache
- *           7 heatmap store · 8 ingest · 9 exports
+ * Sections: 1 config · 2 actors · 3 clients · 4 validation · 5 codec
+ *           6 heatmap store · 7 ingest · 8 exports
  */
 const h3 = require('h3-js');
 const Redis = require('ioredis');
@@ -55,7 +55,6 @@ const ACTORS = Object.freeze({
     key: 'driver',
     idField: 'driverId',
     topic: process.env.DRIVER_LOCATION_TOPIC || 'driver.location',
-    access: Object.freeze({ grantedTtlS: 60, deniedTtlS: 5 }),
     heatmap: true,
     realtime: true,
     persist: Object.freeze({ model: 'driverLocation', minIntervalMs: 10_000, onCellChange: true }),
@@ -64,7 +63,6 @@ const ACTORS = Object.freeze({
     key: 'employee',
     idField: 'employeeId',
     topic: process.env.EMPLOYEE_LOCATION_TOPIC || 'employee.location',
-    access: Object.freeze({ grantedTtlS: 20, deniedTtlS: 5 }),
     heatmap: false,
     realtime: false,
     persist: Object.freeze({ model: 'employeeLocation', minIntervalMs: 5_000, onCellChange: false }),
@@ -86,6 +84,22 @@ const kafka = new Kafka({
 });
 const producer = kafka.producer({ createPartitioner: Partitioners.DefaultPartitioner });
 let producerReady = null;
+const LOCATION_RATE_LIMIT = Object.freeze({ max: 10, windowMs: 10_000 });
+const consumeLocationRateLimit = async (actorKey, userId) => {
+  const key = `loc:rate:${actorKey}:${userId}`;
+  const [count, ttlMs] = await redis.eval(
+    `local count = redis.call('INCR', KEYS[1])
+     if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+     return { count, redis.call('PTTL', KEYS[1]) }`,
+    1,
+    key,
+    LOCATION_RATE_LIMIT.windowMs,
+  );
+  return {
+    allowed: Number(count) <= LOCATION_RATE_LIMIT.max,
+    retryAfterMs: Math.max(0, Number(ttlMs)),
+  };
+};
 
 // Lazy + memoised; a FAILED connect is not memoised, so the next ping retries.
 const connectProducer = () => {
@@ -181,46 +195,7 @@ async function publishLocation(actor, sample) {
   return ts;
 }
 
-/* ───────────────────────────── 6. access cache ───────────────────────────── */
-// Caches "may this user post locations for this ride?" so a ping costs 0 Postgres reads.
-// DENY is cached briefly too (an app pinging a finished ride must not hammer the DB).
-// Every op fails OPEN to the database: Redis down => slower, not broken.
-const grantKey = (a, userId, rideId) => `loc:access:${a.key}:${userId}:${rideId}`;
-const denyKey = (a, userId, rideId) => `${grantKey(a, userId, rideId)}:denied`;
-
-async function readAccess(actor, userId, rideId) {
-  if (!userId || !rideId) return null;
-  try {
-    const [granted, denied] = await redis.mget(grantKey(actor, userId, rideId), denyKey(actor, userId, rideId));
-    if (granted) return { ok: true, actorId: granted };
-    if (denied) return { ok: false, message: denied };
-  } catch (err) {
-    console.error('[location.access] read failed, using DB:', err.message);
-  }
-  return null;
-}
-
-async function rememberAccess(actor, userId, rideId, decision) {
-  if (!userId || !rideId) return;
-  try {
-    if (decision.ok) await redis.set(grantKey(actor, userId, rideId), decision.actorId, 'EX', actor.access.grantedTtlS);
-    else await redis.set(denyKey(actor, userId, rideId), decision.message, 'EX', actor.access.deniedTtlS);
-  } catch (err) {
-    console.error('[location.access] write failed:', err.message);
-  }
-}
-
-/** Call on ride status transitions. Never throws. */
-async function clearAccessCache(actor, userId, rideId) {
-  if (!userId || !rideId) return;
-  try {
-    await redis.del(grantKey(actor, userId, rideId), denyKey(actor, userId, rideId));
-  } catch (err) {
-    console.error('[location.access] clear failed:', err.message);
-  }
-}
-
-/* ───────────────────────────── 7. heatmap store ───────────────────────────── */
+/* ───────────────────────────── 6. heatmap store ───────────────────────────── */
 // {heat:<city>}:cell   HASH driverId -> last H3 cell      {heat:<city>}:counts ZSET cell     -> #drivers
 // {heat:<city>}:seen   ZSET driverId -> last ping ts      {heat:<city>}:pos    HASH driverId -> last position
 // The hash-tag keeps all four keys in one Redis-Cluster slot (required for Lua).
@@ -236,6 +211,8 @@ const lua = (cellVar) => `
 redis.defineCommand('heatPing', {
   numberOfKeys: 4,
   lua: `
+    local seen = redis.call('ZSCORE', KEYS[2], ARGV[1])
+    if seen and tonumber(ARGV[3]) <= tonumber(seen) then return -1 end
     local old = redis.call('HGET', KEYS[1], ARGV[1])
     redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
     redis.call('HSET', KEYS[4], ARGV[1], ARGV[4])
@@ -316,22 +293,19 @@ const heatmap = {
   neighbourhood: (lat, lng, k = 1) => h3.gridDisk(toCell(lat, lng), k),
 };
 
-/* ───────────────────────────── 8. ingest ───────────────────────────── */
+/* ───────────────────────────── 7. ingest ───────────────────────────── */
 /**
  * The ONE flow both controllers call. Controllers only pass the actor and an authorize()
  * callback holding their own DB rule; everything else is identical.
  * @param {() => Promise<{ok:true,actorId:string}|{ok:false,message:string}>} p.authorize
  * @returns {Promise<{ok:true,data:object}|{ok:false,message:string}>}
  */
-async function ingestLocation({ actor, userId, rideId, body, authorize, locationRideId }) {
+async function ingestLocation({ actor, rideId, body, authorize, locationRideId }) {
   const parsed = parseGpsSample(body); // reject garbage before touching Redis/DB
   if (!parsed.ok) return parsed;
 
-  let decision = await readAccess(actor, userId, rideId);
-  if (!decision) {
-    decision = await authorize();
-    await rememberAccess(actor, userId, rideId, decision);
-  }
+  // Authorization is checked on every ping so a just-ended ride cannot use a cached grant.
+  const decision = await authorize();
   if (!decision.ok) return decision;
 
   const ts = await publishLocation(actor, {
@@ -352,12 +326,12 @@ async function ingestLocation({ actor, userId, rideId, body, authorize, location
   };
 }
 
-/* ───────────────────────────── 9. exports ───────────────────────────── */
+/* ───────────────────────────── 8. exports ───────────────────────────── */
 module.exports = {
   // used by controllers
   ACTORS,
   ingestLocation,
-  clearAccessCache,
+  consumeLocationRateLimit,
   removeDriverFromHeatmap: heatmap.removeDriver,
   heatmap, // snapshot(), lastPosition(), neighbourhood()
   shutdownLocationProducer: disconnectProducer, // call from server.js SIGTERM handler

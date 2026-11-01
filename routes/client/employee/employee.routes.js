@@ -25,7 +25,20 @@ const {
   updateEmployeeLocation,
 } = require("../../../controllers/client/employee/employee.controller.js");
 const validateRequest = require("../../../middlewares/validateRequestJoi.middleware");
-const { updateEmployeeProfileSchema, confirmRideSchema, weeklyScheduleQuerySchema, markMyAttendanceSchema, listQuerySchema, employeeComplaintSchema, recentRidesQuerySchema } = require("../../../validations/common");
+const {
+  locationRateLimit,
+  locationRequestMetrics,
+} = require("../../../middlewares/locationRateLimit");
+const {
+  updateEmployeeProfileSchema,
+  confirmRideSchema,
+  weeklyScheduleQuerySchema,
+  markMyAttendanceSchema,
+  listQuerySchema,
+  employeeComplaintSchema,
+  recentRidesQuerySchema,
+  updateEmployeeLocationSchema,
+} = require("../../../validations/common");
 
 // Every route below requires a valid token AND the EMPLOYEE role.
 router.use(verifyUserByToken, requireRole("EMPLOYEE"));
@@ -90,5 +103,11 @@ router.patch("/notifications/:id/read", markNotificationAsRead);
 router.delete("/notifications/:id", deleteNotification);
 
 router.get("/rides/:id/location", getRideLocation);
-router.post("/rides/:id/location", updateEmployeeLocation);
+router.post(
+  "/rides/:id/location",
+  locationRequestMetrics,
+  validateRequest(updateEmployeeLocationSchema),
+  locationRateLimit("employee"),
+  updateEmployeeLocation,
+);
 module.exports = router;

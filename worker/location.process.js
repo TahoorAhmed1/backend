@@ -11,14 +11,52 @@ const loc = require('../services/location/location.service');
 const { config, ALL_ACTORS, kafka, redis, ensureTopics, decode } = loc.internals;
 
 const FK_VIOLATION = 'P2003';
+const ACTIVE_RIDE_STATUSES = ['STARTED', 'ARRIVED'];
 
 function latestLocationsByActor(messages, maxEventAgeMs, now = Date.now()) {
   const latest = new Map();
   for (const message of messages) {
     const event = decode(message);
-    if (event && now - event.ts <= maxEventAgeMs) latest.set(event.actorId, event);
+    if (!event || event.ts > now || now - event.ts > maxEventAgeMs) continue;
+    const previous = latest.get(event.actorId);
+    if (!previous || event.ts > previous.ts) latest.set(event.actorId, event);
   }
   return latest;
+}
+
+async function findActiveLocations(actor, events, prisma) {
+  if (!events.length) return [];
+
+  if (actor.key === 'driver') {
+    const driverIds = [...new Set(events.map((event) => event.actorId))];
+    const activeRides = await prisma.ride.findMany({
+      where: {
+        driverId: { in: driverIds },
+        status: { in: ACTIVE_RIDE_STATUSES },
+      },
+      select: { driverId: true },
+      distinct: ['driverId'],
+    });
+    const activeDriverIds = new Set(activeRides.map((ride) => ride.driverId));
+    return events.filter((event) => activeDriverIds.has(event.actorId));
+  }
+
+  const employeeIds = [...new Set(events.map((event) => event.actorId))];
+  const rideIds = [...new Set(events.map((event) => event.rideId).filter(Boolean))];
+  if (!rideIds.length) return [];
+
+  const activePassengers = await prisma.ridePassenger.findMany({
+    where: {
+      employeeId: { in: employeeIds },
+      rideId: { in: rideIds },
+      ride: { is: { status: { in: ACTIVE_RIDE_STATUSES } } },
+    },
+    select: { employeeId: true, rideId: true },
+  });
+  const activePairs = new Set(
+    activePassengers.map((passenger) => `${passenger.employeeId}:${passenger.rideId}`),
+  );
+  return events.filter((event) => activePairs.has(`${event.actorId}:${event.rideId}`));
 }
 
 /* Per-key write throttle with bounded memory (idle keys are pruned). */
@@ -35,7 +73,10 @@ function createThrottle({ minIntervalMs, pruneEveryMs = 60_000 }) {
     /** allow if: first time, interval elapsed, or `marker` changed (e.g. new H3 cell). */
     allow(key, ts, marker = null) {
       const prev = state.get(key);
-      const ok = !prev || ts - prev.ts >= minIntervalMs || (marker !== null && marker !== prev.marker);
+      const ok =
+        !prev ||
+        (ts > prev.ts &&
+          (ts - prev.ts >= minIntervalMs || (marker !== null && marker !== prev.marker)));
       if (ok) state.set(key, { ts, marker });
       return ok;
     },
@@ -46,24 +87,24 @@ function createThrottle({ minIntervalMs, pruneEveryMs = 60_000 }) {
 /* ── handlers: each returns an eachBatch(); each message is decoded safely, bad ones skipped ── */
 
 // Drivers: update H3 counters in Redis.
-const heatmapHandler = () => async ({ batch, resolveOffset, heartbeat }) => {
-  for (const message of batch.messages) {
-    const evt = decode(message);
-    if (evt && Date.now() - evt.ts <= config.maxEventAgeMs) await loc.heatmap.recordPing(evt, config.city);
-    resolveOffset(message.offset);
-    await heartbeat();
-  }
+const heatmapHandler = (prisma) => async ({ batch, resolveOffset, heartbeat }) => {
+  const latest = latestLocationsByActor(batch.messages, config.maxEventAgeMs);
+  const active = await findActiveLocations(loc.ACTORS.driver, [...latest.values()], prisma);
+  for (const evt of active) await loc.heatmap.recordPing(evt, config.city);
+  for (const message of batch.messages) resolveOffset(message.offset);
+  await heartbeat();
 };
 
 // Drivers: one live position event per driver, independent of how many rides are active.
-const realtimeHandler = () => {
+const realtimeHandler = (prisma) => {
   const { triggerDriverLocation } = require('../services/notification.service');
   const throttle = createThrottle({ minIntervalMs: 1_000 });
 
   const handler = async ({ batch, resolveOffset, heartbeat }) => {
     const latest = latestLocationsByActor(batch.messages, config.maxEventAgeMs);
+    const active = await findActiveLocations(loc.ACTORS.driver, [...latest.values()], prisma);
     const results = await Promise.allSettled(
-      [...latest.values()]
+      active
         .filter((e) => throttle.allow(e.actorId, e.ts))
         .map((e) =>
           triggerDriverLocation(e.actorId, {
@@ -116,9 +157,23 @@ const persistHandler = (actor, prisma) => {
 
   const handler = async ({ batch, resolveOffset, heartbeat }) => {
     const rows = [];
-    for (const message of batch.messages) {
-      const evt = decode(message);
-      if (!evt) continue;
+    const now = Date.now();
+    const decoded = batch.messages
+      .map(decode)
+      .filter((event) =>
+        event &&
+        event.ts <= now &&
+        now - event.ts <= config.maxEventAgeMs,
+      );
+    const active = await findActiveLocations(actor, decoded, prisma);
+    const latest = new Map();
+    for (const evt of active) {
+      const key = `${evt.actorId}:${evt.rideId ?? ''}`;
+      const previous = latest.get(key);
+      if (!previous || evt.ts > previous.ts) latest.set(key, evt);
+    }
+
+    for (const evt of latest.values()) {
       const marker = onCellChange ? loc.heatmap.toCell(evt.lat, evt.lng) : null;
       if (!throttle.allow(`${evt.actorId}:${evt.rideId ?? ''}`, evt.ts, marker)) continue;
       rows.push({
@@ -158,9 +213,9 @@ async function startLocationWorkers() {
   const stoppers = [];
 
   for (const actor of ALL_ACTORS) {
-    if (actor.heatmap) consumers.push(await startConsumer(`${actor.key}-location-heatmap`, actor.topic, heatmapHandler()));
+    if (actor.heatmap) consumers.push(await startConsumer(`${actor.key}-location-heatmap`, actor.topic, heatmapHandler(prisma)));
     if (actor.realtime) {
-      const realtime = realtimeHandler();
+      const realtime = realtimeHandler(prisma);
       stoppers.push(realtime.stop);
       consumers.push(await startConsumer(`${actor.key}-location-realtime`, actor.topic, realtime));
     }
@@ -186,7 +241,12 @@ async function startLocationWorkers() {
   console.log(`[location-worker] up: ${consumers.length} consumer groups, city=${config.city}, h3Res=${config.h3Res}`);
 }
 
-module.exports = { createThrottle, latestLocationsByActor, startLocationWorkers };
+module.exports = {
+  createThrottle,
+  findActiveLocations,
+  latestLocationsByActor,
+  startLocationWorkers,
+};
 
 if (require.main === module || process.env.pm_id !== undefined) {
   startLocationWorkers().catch((err) => {

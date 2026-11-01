@@ -1589,7 +1589,7 @@ const loadRoutePickupPoint = async (route) => {
 };
 
 // Driver GPS is stored once per driver, independently of active rides.
-const DRIVER_LOCATION_FALLBACK_MS = 15 * 60 * 1000;
+const DRIVER_LOCATION_FALLBACK_MS = 60 * 1000;
 
 const LOCATION_SELECT = {
   id: true,
@@ -1696,36 +1696,41 @@ const getRideLocation = async (req, res, next) => {
       return fail(res, "No driver is assigned to this ride.");
     }
 
+    const rideIsActive = ["STARTED", "ARRIVED"].includes(ride.status);
     const [location, employeeLocation, boardedAttendance, office, routePoint] =
       await Promise.all([
         // The driver has one global GPS stream, shared across their active rides.
-        prisma.driverLocation.findFirst({
-          where: {
-            driverId: ride.driverId,
-            recordedAt: {
-              gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
-            },
-          },
-          orderBy: { recordedAt: "desc" },
-          select: LOCATION_SELECT,
-        }),
+        rideIsActive
+          ? prisma.driverLocation.findFirst({
+              where: {
+                driverId: ride.driverId,
+                recordedAt: {
+                  gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
+                },
+              },
+              orderBy: { recordedAt: "desc" },
+              select: LOCATION_SELECT,
+            })
+          : null,
 
-        // Latest GPS point for the logged-in employee on this exact ride.
-        prisma.employeeLocation.findFirst({
-          where: { rideId: ride.id, employeeId: employee.id },
-          orderBy: { recordedAt: "desc" },
-          select: {
-            id: true,
-            employeeId: true,
-            rideId: true,
-            latitude: true,
-            longitude: true,
-            accuracy: true,
-            speed: true,
-            heading: true,
-            recordedAt: true,
-          },
-        }),
+        // Do not expose a live employee position once this ride has ended.
+        rideIsActive
+          ? prisma.employeeLocation.findFirst({
+              where: { rideId: ride.id, employeeId: employee.id },
+              orderBy: { recordedAt: "desc" },
+              select: {
+                id: true,
+                employeeId: true,
+                rideId: true,
+                latitude: true,
+                longitude: true,
+                accuracy: true,
+                speed: true,
+                heading: true,
+                recordedAt: true,
+              },
+            })
+          : null,
 
         // Has the employee checked in (QR / manual)? Drives "driver -> pickup"
         // vs "driver -> office" on the employee's map.
@@ -1864,29 +1869,27 @@ const getRideLocation = async (req, res, next) => {
 
 /**
  * Location authorisation for employees: must be a passenger on the ride, and the ride must
- * be active. Only runs on a cache miss (see services/location.js, "access cache").
+ * be active. Rechecked against the database for every location update.
  */
 const authorizeEmployeeForLocation = async (req, rideId) => {
-  const employee = await getEmployeeFromReq(req);
-  if (!employee) return { ok: false, message: "Employee profile not found." };
+  const userId = req.user?.userId;
+  if (!userId) return { ok: false, message: "Employee profile not found." };
 
   const ridePassenger = await prisma.ridePassenger.findFirst({
-    where: { rideId, employeeId: employee.id },
-    select: { ride: { select: { id: true, status: true } } },
+    where: {
+      rideId,
+      employee: { is: { userId } },
+      ride: { is: { status: { in: ["STARTED", "ARRIVED"] } } },
+    },
+    select: { employeeId: true },
   });
   if (!ridePassenger) {
-    return { ok: false, message: "Ride not found or not assigned to you." };
-  }
-
-  const { status } = ridePassenger.ride;
-  if (!["STARTED", "ARRIVED"].includes(status)) {
     return {
       ok: false,
-      message: `Location tracking is not available while the ride is ${status.toLowerCase()}.`,
+      message: "Location updates require an active ride assigned to you.",
     };
   }
-
-  return { ok: true, actorId: employee.id };
+  return { ok: true, actorId: ridePassenger.employeeId };
 };
 
 const updateEmployeeLocation = async (req, res, next) => {
@@ -1895,7 +1898,6 @@ const updateEmployeeLocation = async (req, res, next) => {
 
     const result = await ingestLocation({
       actor: ACTORS.employee,
-      userId: req.user?.userId,
       rideId,
       body: req.body,
       authorize: () => authorizeEmployeeForLocation(req, rideId),

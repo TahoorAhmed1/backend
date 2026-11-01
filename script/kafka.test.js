@@ -11,7 +11,11 @@ Module._load = function (request, ...rest) {
   return realLoad.call(this, request, ...rest);
 };
 const { ACTORS, internals } = require('../services/location/location.service');
-const { createThrottle, latestLocationsByActor } = require('../worker/location.process');
+const {
+  createThrottle,
+  findActiveLocations,
+  latestLocationsByActor,
+} = require('../worker/location.process');
 Module._load = realLoad;    
 
 const { parseGpsSample, encode, decode } = internals;
@@ -44,10 +48,11 @@ test('codec: round-trip, and garbage decodes to null without throwing', () => {
   for (const bad of ['not json', '{}', '{"v":99}', '{"v":1,"actorId":"x"}']) assert.equal(decode(msg(bad)), null);
 });
 
-test('realtime batches collapse to one latest location per driver', () => {
+test('realtime batches keep the newest valid location per driver', () => {
   const messages = [
-    { actorId: 'd1', latitude: 1, ts: 100 },
-    { actorId: 'd1', latitude: 2, ts: 110 },
+    { actorId: 'd1', latitude: 1, ts: 110 },
+    { actorId: 'd1', latitude: 2, ts: 115 },
+    { actorId: 'd1', latitude: 9, ts: 100 },
     { actorId: 'd2', latitude: 3, ts: 120 },
   ].map(({ actorId, latitude, ts }) =>
     msg(encode(ACTORS.driver, { actorId, latitude, longitude: 1, rideId: null }, ts)),
@@ -58,6 +63,47 @@ test('realtime batches collapse to one latest location per driver', () => {
   assert.equal(latest.get('d2').lat, 3);
 });
 
+test('stale and future location events are ignored', () => {
+  const messages = [
+    { actorId: 'd1', latitude: 1, ts: 1 },
+    { actorId: 'd2', latitude: 2, ts: 126 },
+  ].map(({ actorId, latitude, ts }) =>
+    msg(encode(ACTORS.driver, { actorId, latitude, longitude: 1, rideId: null }, ts)),
+  );
+  assert.equal(latestLocationsByActor(messages, 30, 125).size, 0);
+});
+
+test('inactive drivers and employee rides are filtered before processing', async () => {
+  const driverEvents = [
+    { actorId: 'active-driver', rideId: null },
+    { actorId: 'idle-driver', rideId: null },
+  ];
+  const activeDrivers = await findActiveLocations(ACTORS.driver, driverEvents, {
+    ride: {
+      findMany: async () => [{ driverId: 'active-driver' }],
+    },
+  });
+  assert.deepEqual(activeDrivers.map((event) => event.actorId), ['active-driver']);
+
+  const employeeEvents = [
+    { actorId: 'e1', rideId: 'active-ride' },
+    { actorId: 'e1', rideId: 'completed-ride' },
+  ];
+  const activeEmployees = await findActiveLocations(ACTORS.employee, employeeEvents, {
+    ridePassenger: {
+      findMany: async () => [{ employeeId: 'e1', rideId: 'active-ride' }],
+    },
+  });
+  assert.deepEqual(activeEmployees.map((event) => event.rideId), ['active-ride']);
+
+  assert.deepEqual(
+    await findActiveLocations(ACTORS.driver, [], {
+      ride: { findMany: async () => { throw new Error('must not query'); } },
+    }),
+    [],
+  );
+});
+
 test('throttle: interval, marker (new H3 cell) bypass, key isolation', () => {
   const t = createThrottle({ minIntervalMs: 10_000 });
   assert.equal(t.allow('d1', 1_000, 'A'), true);
@@ -65,5 +111,6 @@ test('throttle: interval, marker (new H3 cell) bypass, key isolation', () => {
   assert.equal(t.allow('d1', 3_000, 'B'), true);   // cell changed
   assert.equal(t.allow('d1', 14_000, 'B'), true);  // interval elapsed
   assert.equal(t.allow('d2', 14_001, 'B'), true);  // other key
+  assert.equal(t.allow('d1', 13_000, 'C'), false); // stale cell cannot overwrite newer position
   t.stop();
 });
