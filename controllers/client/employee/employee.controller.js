@@ -1588,8 +1588,7 @@ const loadRoutePickupPoint = async (route) => {
   }
 };
 
-// A driver app that posts GPS without a rideId would never match the exact-ride
-// query, so fall back to the driver's most recent point, but only if it is fresh.
+// Driver GPS is stored once per driver, independently of active rides.
 const DRIVER_LOCATION_FALLBACK_MS = 15 * 60 * 1000;
 
 const LOCATION_SELECT = {
@@ -1699,27 +1698,17 @@ const getRideLocation = async (req, res, next) => {
 
     const [location, employeeLocation, boardedAttendance, office, routePoint] =
       await Promise.all([
-        // Latest GPS point for this exact ride, else the driver's recent point.
-        prisma.driverLocation
-          .findFirst({
-            where: { rideId: ride.id, driverId: ride.driverId },
-            orderBy: { recordedAt: "desc" },
-            select: LOCATION_SELECT,
-          })
-          .then(
-            (exact) =>
-              exact ??
-              prisma.driverLocation.findFirst({
-                where: {
-                  driverId: ride.driverId,
-                  recordedAt: {
-                    gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
-                  },
-                },
-                orderBy: { recordedAt: "desc" },
-                select: LOCATION_SELECT,
-              }),
-          ),
+        // The driver has one global GPS stream, shared across their active rides.
+        prisma.driverLocation.findFirst({
+          where: {
+            driverId: ride.driverId,
+            recordedAt: {
+              gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
+            },
+          },
+          orderBy: { recordedAt: "desc" },
+          select: LOCATION_SELECT,
+        }),
 
         // Latest GPS point for the logged-in employee on this exact ride.
         prisma.employeeLocation.findFirst({

@@ -12,6 +12,15 @@ const { config, ALL_ACTORS, kafka, redis, ensureTopics, decode } = loc.internals
 
 const FK_VIOLATION = 'P2003';
 
+function latestLocationsByActor(messages, maxEventAgeMs, now = Date.now()) {
+  const latest = new Map();
+  for (const message of messages) {
+    const event = decode(message);
+    if (event && now - event.ts <= maxEventAgeMs) latest.set(event.actorId, event);
+  }
+  return latest;
+}
+
 /* Per-key write throttle with bounded memory (idle keys are pruned). */
 function createThrottle({ minIntervalMs, pruneEveryMs = 60_000 }) {
   const state = new Map(); // key -> { ts, marker }
@@ -46,31 +55,36 @@ const heatmapHandler = () => async ({ batch, resolveOffset, heartbeat }) => {
   }
 };
 
-// Drivers: push live position to passengers. Own group, so Pusher trouble never delays heatmap/DB.
-// Collapsed to the LATEST ping per driver per batch.
+// Drivers: one live position event per driver, independent of how many rides are active.
 const realtimeHandler = () => {
-  const { triggerRideLocation } = require('../services/notification.service');
-  return async ({ batch, resolveOffset, heartbeat }) => {
-    const latest = new Map();
-    for (const message of batch.messages) {
-      const e = decode(message);
-      if (e?.rideId && Date.now() - e.ts <= config.maxEventAgeMs) latest.set(`${e.actorId}:${e.rideId}`, e);
-    }
+  const { triggerDriverLocation } = require('../services/notification.service');
+  const throttle = createThrottle({ minIntervalMs: 1_000 });
+
+  const handler = async ({ batch, resolveOffset, heartbeat }) => {
+    const latest = latestLocationsByActor(batch.messages, config.maxEventAgeMs);
     const results = await Promise.allSettled(
-      [...latest.values()].map((e) =>
-        triggerRideLocation(e.rideId, {
-          rideId: e.rideId, driverId: e.actorId,
-          latitude: e.lat, longitude: e.lng,
-          accuracy: e.accuracy, speed: e.speed, heading: e.heading,
-          recordedAt: new Date(e.ts),
-        }),
-      ),
+      [...latest.values()]
+        .filter((e) => throttle.allow(e.actorId, e.ts))
+        .map((e) =>
+          triggerDriverLocation(e.actorId, {
+            rideId: null,
+            driverId: e.actorId,
+            latitude: e.lat,
+            longitude: e.lng,
+            accuracy: e.accuracy,
+            speed: e.speed,
+            heading: e.heading,
+            recordedAt: new Date(e.ts),
+          }),
+        ),
     );
     const failed = results.filter((r) => r.status === 'rejected').length;
     if (failed) console.error(`[location.realtime] ${failed}/${results.length} pusher triggers failed`);
     for (const message of batch.messages) resolveOffset(message.offset);
     await heartbeat();
   };
+  handler.stop = throttle.stop;
+  return handler;
 };
 
 // Bulk insert that survives a poison row: if a ride/driver was deleted while its pings were still in
@@ -145,7 +159,11 @@ async function startLocationWorkers() {
 
   for (const actor of ALL_ACTORS) {
     if (actor.heatmap) consumers.push(await startConsumer(`${actor.key}-location-heatmap`, actor.topic, heatmapHandler()));
-    if (actor.realtime) consumers.push(await startConsumer(`${actor.key}-location-realtime`, actor.topic, realtimeHandler()));
+    if (actor.realtime) {
+      const realtime = realtimeHandler();
+      stoppers.push(realtime.stop);
+      consumers.push(await startConsumer(`${actor.key}-location-realtime`, actor.topic, realtime));
+    }
     const persist = persistHandler(actor, prisma);
     stoppers.push(persist.stop);
     consumers.push(await startConsumer(`${actor.key}-location-persist`, actor.topic, persist));
@@ -168,7 +186,7 @@ async function startLocationWorkers() {
   console.log(`[location-worker] up: ${consumers.length} consumer groups, city=${config.city}, h3Res=${config.h3Res}`);
 }
 
-module.exports = { createThrottle, startLocationWorkers };
+module.exports = { createThrottle, latestLocationsByActor, startLocationWorkers };
 
 if (require.main === module || process.env.pm_id !== undefined) {
   startLocationWorkers().catch((err) => {

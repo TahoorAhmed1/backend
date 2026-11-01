@@ -1015,7 +1015,7 @@ const getRideStops = async (req, res, next) => {
     // Last known driver position for this ride, so the map shows the driver
     // right away (like the pickup point) instead of waiting for a live update.
     const lastLocation = await prisma.driverLocation.findFirst({
-      where: { rideId: ride.id, driverId: driver.id },
+      where: { driverId: driver.id },
       orderBy: { recordedAt: "desc" },
       select: {
         latitude: true,
@@ -2204,6 +2204,7 @@ const updateDriverLocation = async (req, res, next) => {
       rideId,
       body: req.body,
       authorize: () => authorizeDriverForLocation(req, rideId),
+      locationRideId: null,
     });
 
     if (!result.ok) {

@@ -21,10 +21,10 @@ const ADMIN_NOTIFY_ROLES = ["ADMIN", "MANAGER", "DISPATCHER"];
  * from being created or returned.
  */
 
-const triggerRideLocation = async (rideId, payload) => {
-  if (!rideId) return null;
+const triggerDriverLocation = async (driverId, payload) => {
+  if (!driverId) return null;
 
-  const channel = `ride-${rideId}`;
+  const channel = `driver-${driverId}`;
 
   try {
     await pusher.trigger(
@@ -36,7 +36,7 @@ const triggerRideLocation = async (rideId, payload) => {
     console.info("[Pusher] Driver location triggered:", {
       channel,
       event: "driver-location-updated",
-      rideId,
+      driverId,
     });
 
     return true;
@@ -454,5 +454,5 @@ module.exports = {
   notifyAdmins,
   ADMIN_NOTIFY_ROLES,
   triggerEventToRoles,
-  triggerRideLocation,
+  triggerDriverLocation,
 };

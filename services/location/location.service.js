@@ -323,7 +323,7 @@ const heatmap = {
  * @param {() => Promise<{ok:true,actorId:string}|{ok:false,message:string}>} p.authorize
  * @returns {Promise<{ok:true,data:object}|{ok:false,message:string}>}
  */
-async function ingestLocation({ actor, userId, rideId, body, authorize }) {
+async function ingestLocation({ actor, userId, rideId, body, authorize, locationRideId }) {
   const parsed = parseGpsSample(body); // reject garbage before touching Redis/DB
   if (!parsed.ok) return parsed;
 
@@ -334,7 +334,11 @@ async function ingestLocation({ actor, userId, rideId, body, authorize }) {
   }
   if (!decision.ok) return decision;
 
-  const ts = await publishLocation(actor, { actorId: decision.actorId, rideId, ...parsed.value });
+  const ts = await publishLocation(actor, {
+    actorId: decision.actorId,
+    rideId: locationRideId === undefined ? rideId : locationRideId,
+    ...parsed.value,
+  });
 
   return {
     ok: true,

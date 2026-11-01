@@ -407,7 +407,11 @@ const withLastKnown = (rideId, own, previous) => {
   const current = normalizeLocation(own);
   if (current) return { ...current, isLastKnown: false, fromPreviousRide: false };
   if (!previous) return null;
-  return { ...previous, isLastKnown: true, fromPreviousRide: previous.rideId !== rideId };
+  return {
+    ...previous,
+    isLastKnown: true,
+    fromPreviousRide: Boolean(previous.rideId && previous.rideId !== rideId),
+  };
 };
 
 const TIME_FIELDS = ["pickupTime", "officeArrivalTime", "dropTime"];
@@ -956,11 +960,13 @@ const getRideDriverLocation = async (req, res) => {
     });
     if (!ride) return badRequestResponse(res, "Ride not found.");
 
-    const location = await prisma.driverLocation.findFirst({
-      where: { rideId: id },
-      orderBy: { recordedAt: "desc" },
-      include: { driver: { select: DRIVER_SELECT } },
-    });
+    const location = ride.driverId
+      ? await prisma.driverLocation.findFirst({
+          where: { driverId: ride.driverId },
+          orderBy: { recordedAt: "desc" },
+          include: { driver: { select: DRIVER_SELECT } },
+        })
+      : null;
 
     const previous =
       normalizeLocation(location) || !ride.driverId
