@@ -2178,13 +2178,12 @@ const getDriverStats = async (req, res, next) => {
  * Location authorisation for drivers: the ride must belong to the logged-in driver and be
  * active. Rechecked against the database for every location update.
  */
-const authorizeDriverForLocation = async (req, rideId) => {
+const authorizeDriverForLocation = async (req) => {
   const userId = req.user?.userId;
   if (!userId) return { ok: false, message: "Driver profile not found." };
 
   const ride = await prisma.ride.findFirst({
     where: {
-      id: rideId,
       status: { in: ACTIVE_RIDE_STATUSES },
       driver: { is: { userId } },
     },
@@ -2201,13 +2200,11 @@ const authorizeDriverForLocation = async (req, rideId) => {
 
 const updateDriverLocation = async (req, res, next) => {
   try {
-    const { id: rideId } = req.params;
-
     const result = await ingestLocation({
       actor: ACTORS.driver,
-      rideId,
+      rideId: null,
       body: req.body,
-      authorize: () => authorizeDriverForLocation(req, rideId),
+      authorize: () => authorizeDriverForLocation(req),
       locationRideId: null,
     });
 

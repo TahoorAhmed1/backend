@@ -47,7 +47,7 @@ const {
   updateRideStatusSchema,
   markAttendanceSchema,
   driverComplaintSchema,
-  updateDriverLocationSchema,
+  updateGlobalDriverLocationSchema,
 } = require("../../../validations/common");
 
 router.use(verifyUserByToken, requireRole("DRIVER"));
@@ -109,9 +109,9 @@ router.get("/complaints/:id", getComplaintDetails);
 router.patch("/complaints/:id", updateComplaint);
 router.delete("/complaints/:id", deleteComplaint);
 router.post(
-  "/rides/:id/location",
+  "/location",
   locationRequestMetrics,
-  validateRequest(updateDriverLocationSchema),
+  validateRequest(updateGlobalDriverLocationSchema),
   locationRateLimit("driver"),
   updateDriverLocation,
 );

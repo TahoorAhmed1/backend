@@ -1,5 +1,5 @@
 const { prisma } = require("../../../lib/prisma");
-const { ACTORS, ingestLocation } = require("../../../services/location/location.service");
+const { heatmap } = require("../../../services/location/location.service");
 const {
   ROUTE_PICKUP_SELECT,
   resolveRoutePickupPoint,
@@ -15,6 +15,7 @@ const {
   notifyRoles,
   ADMIN_NOTIFY_ROLES,
 } = require("../../../services/notification.service");
+const { logger } = require("../../../configs/logger");
 
 // Roles that should be told about complaints — anything without
 // one obvious single recipient.
@@ -1603,6 +1604,55 @@ const LOCATION_SELECT = {
   recordedAt: true,
 };
 
+const getLatestDriverLocation = async (driverId) => {
+  try {
+    const live = await heatmap.lastPosition(driverId);
+    if (
+      live &&
+      Number.isFinite(live.ts) &&
+      Date.now() - live.ts >= 0 &&
+      Date.now() - live.ts <= DRIVER_LOCATION_FALLBACK_MS &&
+      Number.isFinite(live.lat) &&
+      Number.isFinite(live.lng)
+    ) {
+      return {
+        id: null,
+        rideId: null,
+        driverId,
+        latitude: live.lat,
+        longitude: live.lng,
+        accuracy: null,
+        speed: live.speed ?? null,
+        heading: live.heading ?? null,
+        recordedAt: new Date(live.ts),
+      };
+    }
+  } catch (error) {
+    console.error(
+      "[employee_controller] Redis driver location lookup failed; falling back to database:",
+      error.message,
+    );
+  }
+
+  return prisma.driverLocation.findFirst({
+    where: {
+      driverId,
+      recordedAt: {
+        gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
+      },
+    },
+    orderBy: { recordedAt: "desc" },
+    select: LOCATION_SELECT,
+  });
+};
+
+const getLastDriverLocation = async (driverId) =>
+  prisma.driverLocation.findFirst({
+    where: { driverId },
+    orderBy: { recordedAt: "desc" },
+    select: LOCATION_SELECT,
+  });
+
 const getRideLocation = async (req, res, next) => {
   try {
     const employee = await getEmployeeFromReq(req);
@@ -1697,40 +1747,12 @@ const getRideLocation = async (req, res, next) => {
     }
 
     const rideIsActive = ["STARTED", "ARRIVED"].includes(ride.status);
-    const [location, employeeLocation, boardedAttendance, office, routePoint] =
+    const [location, lastLocation, boardedAttendance, office, routePoint] =
       await Promise.all([
         // The driver has one global GPS stream, shared across their active rides.
-        rideIsActive
-          ? prisma.driverLocation.findFirst({
-              where: {
-                driverId: ride.driverId,
-                recordedAt: {
-                  gte: new Date(Date.now() - DRIVER_LOCATION_FALLBACK_MS),
-                },
-              },
-              orderBy: { recordedAt: "desc" },
-              select: LOCATION_SELECT,
-            })
-          : null,
+        rideIsActive ? getLatestDriverLocation(ride.driverId) : null,
 
-        // Do not expose a live employee position once this ride has ended.
-        rideIsActive
-          ? prisma.employeeLocation.findFirst({
-              where: { rideId: ride.id, employeeId: employee.id },
-              orderBy: { recordedAt: "desc" },
-              select: {
-                id: true,
-                employeeId: true,
-                rideId: true,
-                latitude: true,
-                longitude: true,
-                accuracy: true,
-                speed: true,
-                heading: true,
-                recordedAt: true,
-              },
-            })
-          : null,
+        getLastDriverLocation(ride.driverId),
 
         // Has the employee checked in (QR / manual)? Drives "driver -> pickup"
         // vs "driver -> office" on the employee's map.
@@ -1849,70 +1871,22 @@ const getRideLocation = async (req, res, next) => {
         // Driver live GPS. Keep this key unchanged for the existing app.
         location,
 
-        // Logged-in employee's latest live GPS.
-        employeeLocation,
+        // Most recent persisted GPS point, even when it is too old for live tracking.
+        lastLocation,
+
+        // Retained as null for compatibility; employee live location is not collected.
+        employeeLocation: null,
       },
       location
-        ? employeeLocation
-          ? "Driver and employee locations retrieved successfully."
-          : "Driver location retrieved successfully. Employee location is not available yet."
-        : employeeLocation
-          ? "Employee location retrieved successfully. Driver location is not available yet."
-          : "Driver and employee locations are not available yet.",
+        ? "Driver location retrieved successfully."
+        : lastLocation
+          ? "Live driver location is not available; last known location returned."
+          : "Driver location is not available yet.",
     );
 
+    logger.info(response);
     return res.status(response.status.code).json(response);
   } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * Location authorisation for employees: must be a passenger on the ride, and the ride must
- * be active. Rechecked against the database for every location update.
- */
-const authorizeEmployeeForLocation = async (req, rideId) => {
-  const userId = req.user?.userId;
-  if (!userId) return { ok: false, message: "Employee profile not found." };
-
-  const ridePassenger = await prisma.ridePassenger.findFirst({
-    where: {
-      rideId,
-      employee: { is: { userId } },
-      ride: { is: { status: { in: ["STARTED", "ARRIVED"] } } },
-    },
-    select: { employeeId: true },
-  });
-  if (!ridePassenger) {
-    return {
-      ok: false,
-      message: "Location updates require an active ride assigned to you.",
-    };
-  }
-  return { ok: true, actorId: ridePassenger.employeeId };
-};
-
-const updateEmployeeLocation = async (req, res, next) => {
-  try {
-    const { id: rideId } = req.params;
-
-    const result = await ingestLocation({
-      actor: ACTORS.employee,
-      rideId,
-      body: req.body,
-      authorize: () => authorizeEmployeeForLocation(req, rideId),
-    });
-
-    if (!result.ok) return fail(res, result.message);
-
-    const response = okResponse(
-      result.data,
-      "Employee location updated successfully.",
-    );
-    return res.status(response.status.code).json(response);
-  } catch (error) {
-    console.error("[employee_controller] updateEmployeeLocation error:", error);
-
     next(error);
   }
 };
@@ -2082,5 +2056,4 @@ module.exports = {
   getMyRides,
   markNotificationAsRead,
   deleteNotification,
-  updateEmployeeLocation,
 };

@@ -34,6 +34,4 @@ router.use("/users", require("./user/user.routes"));
 router.use("/audit-logs", require("./auditLog/auditLog.routes"));
 router.use("/search", require("./search/search.routes"));
 router.use("/exceptions", require("./exception/exception.routes"));
-router.use("/tracking", require("./ride-tracking/ride-tracking.routes"));
-
 module.exports = router;
