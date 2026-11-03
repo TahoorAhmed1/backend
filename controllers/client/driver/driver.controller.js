@@ -2,6 +2,7 @@ const { prisma } = require("../../../lib/prisma");
 const {
   ACTORS,
   ingestLocation,
+  heatmap,
   removeDriverFromHeatmap,
 } = require("../../../services/location/location.service");
 const QRCode = require("qrcode");
@@ -28,6 +29,7 @@ const {
   resolveRoutePickupPoint,
   ensureRoutePickupPoint,
 } = require("../../../utils/routePickupPoint");
+const { logger } = require("../../../configs/logger");
 
 // Roles that should be told about complaints, license submissions,
 // account deactivations, etc. — anything without one obvious recipient.
@@ -1013,18 +1015,25 @@ const getRideStops = async (req, res, next) => {
         }
       : null;
 
-    // Last known driver position for this ride, so the map shows the driver
-    // right away (like the pickup point) instead of waiting for a live update.
-    const lastLocation = await prisma.driverLocation.findFirst({
-      where: { driverId: driver.id },
-      orderBy: { recordedAt: "desc" },
-      select: {
-        latitude: true,
-        longitude: true,
-        heading: true,
-        recordedAt: true,
-      },
-    });
+    // Driver locations are global, not scoped to an individual ride.
+    const liveLocation = await heatmap.lastPosition(driver.id);
+    const lastLocation = liveLocation
+      ? {
+          latitude: liveLocation.lat,
+          longitude: liveLocation.lng,
+          heading: liveLocation.heading ?? null,
+          recordedAt: new Date(liveLocation.ts),
+        }
+      : await prisma.driverLocation.findFirst({
+          where: { driverId: driver.id },
+          orderBy: { recordedAt: "desc" },
+          select: {
+            latitude: true,
+            longitude: true,
+            heading: true,
+            recordedAt: true,
+          },
+        });
 
     const attendanceByEmployee = Object.fromEntries(
       ride.attendances
@@ -1082,6 +1091,8 @@ const getRideStops = async (req, res, next) => {
       },
       "Ride stops retrieved successfully.",
     );
+
+    logger.info(response, "[driver_controller] getRideStops response");
     return res.status(response.status.code).json(response);
   } catch (error) {
     next(error);
